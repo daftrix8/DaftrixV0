@@ -429,7 +429,7 @@ function safePoolQuery(sql_1, params_1) {
         throw new Error('safePoolQuery: should not reach here');
     });
 }
-exports.SCHEMA_VERSION = 72; // Bump this when adding new migrations
+exports.SCHEMA_VERSION = 74; // Bump this when adding new migrations
 function initDB() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c, _d;
@@ -666,6 +666,55 @@ function initDB() {
             // Subcategory support: optional child category under categoryId
             yield conn.query(`ALTER TABLE products ADD COLUMN subcategoryId VARCHAR(36)`).catch(() => { });
             yield conn.query(`CREATE INDEX IF NOT EXISTS idx_products_subcategoryId ON products(subcategoryId)`).catch(() => { });
+            // Product Variants & Templates
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS product_variants (
+            id VARCHAR(36) PRIMARY KEY,
+            productId VARCHAR(36) NOT NULL,
+            sku VARCHAR(100) NULL,
+            barcode VARCHAR(100) NULL,
+            attributes JSON NOT NULL,
+            price DECIMAL(10,2) NULL,
+            cost DECIMAL(10,2) NULL,
+            isActive BOOLEAN DEFAULT TRUE,
+            image LONGTEXT NULL,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_product_variants_product (productId)
+        )
+    `).catch(() => { });
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS product_variant_templates (
+            id VARCHAR(36) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            attributes JSON NOT NULL,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+    `).catch(() => { });
+            yield conn.query(`ALTER TABLE product_variants ADD COLUMN isActive BOOLEAN DEFAULT TRUE`).catch(() => { });
+            yield conn.query(`ALTER TABLE product_variants ADD COLUMN image LONGTEXT NULL`).catch(() => { });
+            // Price Lists
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS price_lists (
+            id VARCHAR(36) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            type ENUM('FIXED', 'PERCENTAGE') DEFAULT 'FIXED',
+            percentage DECIMAL(10, 2) DEFAULT 0,
+            status VARCHAR(50) DEFAULT 'ACTIVE',
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    `).catch(() => { });
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS product_prices (
+            id VARCHAR(36) PRIMARY KEY,
+            priceListId VARCHAR(36) NOT NULL,
+            productId VARCHAR(36) NOT NULL,
+            price DECIMAL(10, 2) NOT NULL,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY unique_product_price (priceListId, productId)
+        )
+    `).catch(() => { });
             // Partners Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS partners (
@@ -1012,6 +1061,77 @@ function initDB() {
             // Migration: Widen paymentMethod from ENUM to VARCHAR(50) — the ENUM was too narrow
             // (CASH, BANK, CHEQUE, MIXED, CREDIT) and silently truncated DEFERRED/TREASURY inserts
             yield conn.query(`ALTER TABLE pos_cash_movements MODIFY COLUMN paymentMethod VARCHAR(50) DEFAULT 'CASH'`).catch(() => { });
+            // Add remaining pos_shifts columns (migrated from controllers)
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN treasuryId VARCHAR(36) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmount DECIMAL(15,2) NOT NULL DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmountSetBy VARCHAR(36) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmountSetAt DATETIME NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN shortageEmployeeId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN approvalStatus ENUM('pending','approved','flagged') NOT NULL DEFAULT 'pending'`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN approvedBy VARCHAR(36) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN approvedAt DATETIME NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN actualCashReceived DECIMAL(15,2) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN discrepancyAmount DECIMAL(15,2) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN discrepancyNotes TEXT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminNotes TEXT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminShortageEmployeeId VARCHAR(36) NULL`).catch(() => { });
+            // POS Settings
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_settings (
+            id INT PRIMARY KEY DEFAULT 1,
+            receiptPrinterId VARCHAR(255) NULL,
+            kitchenPrinterId VARCHAR(255) NULL,
+            autoPrintReceipt TINYINT(1) DEFAULT 1,
+            printKitchenTickets TINYINT(1) DEFAULT 0,
+            perInvoiceAccounting TINYINT(1) NOT NULL DEFAULT 0,
+            printAfterConfirm TINYINT(1) NOT NULL DEFAULT 1,
+            useNumpad TINYINT(1) NOT NULL DEFAULT 1,
+            allowedCategories JSON NULL,
+            autoCloseEnabled TINYINT(1) NOT NULL DEFAULT 0,
+            autoCloseTime VARCHAR(5) NOT NULL DEFAULT '23:59',
+            editCutoffDate DATE NULL,
+            editCutoffDays INT NOT NULL DEFAULT 0,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+    `).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN perInvoiceAccounting TINYINT(1) NOT NULL DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN printAfterConfirm TINYINT(1) NOT NULL DEFAULT 1`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN useNumpad TINYINT(1) NOT NULL DEFAULT 1`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN allowedCategories JSON NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN autoCloseEnabled TINYINT(1) NOT NULL DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN autoCloseTime VARCHAR(5) NOT NULL DEFAULT '23:59'`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN editCutoffDate DATE NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN editCutoffDays INT NOT NULL DEFAULT 0`).catch(() => { });
+            // POS Expenses
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_expense_categories (
+            id VARCHAR(36) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            description TEXT NULL,
+            isActive BOOLEAN DEFAULT TRUE,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+    `).catch(() => { });
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_expenses (
+            id VARCHAR(36) PRIMARY KEY,
+            shiftId VARCHAR(36) NOT NULL,
+            categoryId VARCHAR(36) NOT NULL,
+            amount DECIMAL(15,2) NOT NULL,
+            paymentMethod VARCHAR(50) DEFAULT 'CASH',
+            notes TEXT NULL,
+            entityId VARCHAR(36) NULL,
+            entityType ENUM('EMPLOYEE', 'SUPPLIER', 'MISC') NULL,
+            createdBy VARCHAR(36) NOT NULL,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_pos_expenses_shift (shiftId),
+            INDEX idx_pos_expenses_category (categoryId)
+        )
+    `).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN entityId VARCHAR(36) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN entityType ENUM('EMPLOYEE', 'SUPPLIER', 'MISC') NULL`).catch(() => { });
             // ========================================
             // LOYALTY SYSTEM TABLES (نظام الولاء)
             // ========================================
@@ -1422,6 +1542,11 @@ function initDB() {
             // Branch isolation: link each treasury/bank to a branch
             yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) COMMENT 'الفرع المالك للخزينة'`).catch(() => { });
             yield conn.query(`CREATE INDEX IF NOT EXISTS idx_banks_branchId ON banks(branchId)`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN bankType VARCHAR(20) DEFAULT 'BANK'`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN isActive BOOLEAN DEFAULT TRUE`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN isPrimary BOOLEAN DEFAULT FALSE`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN depositPermissions JSON`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN withdrawPermissions JSON`).catch(() => { });
             // Payment Fees: per-bank fee configuration (رسوم الدفع)
             yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeEnabled BOOLEAN DEFAULT FALSE COMMENT 'تفعيل رسوم الدفع'`).catch(() => { });
             yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeType VARCHAR(20) DEFAULT 'PERCENTAGE' COMMENT 'نوع الرسوم: PERCENTAGE / FIXED / BOTH'`).catch(() => { });
@@ -1637,6 +1762,8 @@ function initDB() {
             // ═══════════════════════════════════════════════════════════
             yield conn.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS branchId VARCHAR(36)`).catch(() => { });
             yield conn.query(`CREATE INDEX IF NOT EXISTS idx_users_branchId ON users(branchId)`).catch(() => { });
+            yield conn.query(`ALTER TABLE users ADD COLUMN plain_password VARCHAR(255) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE users ADD COLUMN defaultTreasuryId VARCHAR(36) NULL DEFAULT NULL`).catch(() => { });
             // Smart Attendance: Link users to employees for login-based attendance
             yield conn.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employeeId VARCHAR(36)`).catch(() => { });
             yield conn.query(`CREATE INDEX IF NOT EXISTS idx_users_employeeId ON users(employeeId)`).catch(() => { });
@@ -4411,6 +4538,9 @@ function initDB() {
     `).catch(() => { });
             // Migration: upgrade stock from INT to DECIMAL for existing databases
             yield conn.query(`ALTER TABLE product_variants MODIFY COLUMN stock DECIMAL(18, 8) DEFAULT 0`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_pv_productId ON product_variants(productId)`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_pv_sku ON product_variants(sku)`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_pv_barcode ON product_variants(barcode)`).catch(() => { });
             // ── product_variant_stocks: warehouse-level stock for individual variants ──
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS product_variant_stocks (
@@ -4425,6 +4555,24 @@ function initDB() {
         INDEX idx_pvs_variant (variantId)
       )
     `).catch(() => { });
+            // Migration: Populate cache if empty
+            try {
+                const [rows] = yield conn.query('SELECT 1 FROM product_variant_stocks LIMIT 1');
+                if (rows.length === 0) {
+                    yield conn.query(`
+                INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                SELECT UUID(), variant_id, product_id, warehouse_id, SUM(qty_change)
+                FROM stock_movements
+                WHERE variant_id IS NOT NULL AND warehouse_id IS NOT NULL
+                GROUP BY variant_id, product_id, warehouse_id
+                HAVING SUM(qty_change) != 0
+            `);
+                    console.log('✅ Populated product_variant_stocks cache from stock_movements.');
+                }
+            }
+            catch (e) {
+                console.error('Failed to populate product_variant_stocks:', e);
+            }
             // ── WhatsApp Cloud API tables (v71) ──
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS whatsapp_settings (

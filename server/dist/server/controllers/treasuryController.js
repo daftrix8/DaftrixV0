@@ -17,29 +17,12 @@ const errorHandler_1 = require("../utils/errorHandler");
 const eventBus_1 = require("../utils/eventBus");
 const policyEnforcement_1 = require("../utils/policyEnforcement");
 const branchFilter_1 = require("../utils/branchFilter");
-let _bankTypeColReady = false;
-const ensureBankTypeColumn = () => __awaiter(void 0, void 0, void 0, function* () {
-    if (_bankTypeColReady)
-        return;
-    try {
-        yield db_1.pool.query('SELECT bankType, isActive, isPrimary, depositPermissions, withdrawPermissions FROM banks LIMIT 0');
-    }
-    catch (_a) {
-        yield db_1.pool.query("ALTER TABLE banks ADD COLUMN bankType VARCHAR(20) DEFAULT 'BANK'").catch(() => { });
-        yield db_1.pool.query("ALTER TABLE banks ADD COLUMN isActive BOOLEAN DEFAULT TRUE").catch(() => { });
-        yield db_1.pool.query("ALTER TABLE banks ADD COLUMN isPrimary BOOLEAN DEFAULT FALSE").catch(() => { });
-        yield db_1.pool.query("ALTER TABLE banks ADD COLUMN depositPermissions JSON").catch(() => { });
-        yield db_1.pool.query("ALTER TABLE banks ADD COLUMN withdrawPermissions JSON").catch(() => { });
-        console.log('✅ Added missing columns to banks table');
-    }
-    _bankTypeColReady = true;
-});
 /**
  * Create a treasury receipt from mobile app
  * POST /api/treasury/receipts
  */
 const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d;
+    var _a, _b, _c;
     console.log('📱💰 Treasury Receipt Request Received:', JSON.stringify(req.body, null, 2));
     const connection = yield (0, db_1.getConnection)();
     try {
@@ -172,15 +155,8 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             console.log(`📝 Created journal entry: ${journalId}`);
         }
         // 5. Update bank balance for BANK method (separate from GL account)
-        if (paymentMethod === 'BANK' && bankAccountId) {
-            // Get the actual bank ID (might be the GL account ID passed in)
-            const [bankIdRows] = yield connection.query(`SELECT id FROM banks WHERE id = ? OR accountId = ? LIMIT 1`, [bankAccountId, bankAccountId]);
-            const bankId = (_d = bankIdRows[0]) === null || _d === void 0 ? void 0 : _d.id;
-            if (bankId) {
-                yield connection.query('UPDATE banks SET balance = COALESCE(balance, 0) + ? WHERE id = ?', [amount, bankId]);
-                console.log(`🏦 Updated bank ${bankId} balance by +${amount}`);
-            }
-        }
+        // REMOVED: Banks balance is now calculated live from GL/journal lines
+        // to prevent drift and ensure single source of truth.
         yield connection.commit();
         // Log audit trail
         yield (0, auditController_1.logAction)((user === null || user === void 0 ? void 0 : user.name) || 'Mobile', 'RECEIPT', 'CREATE', `تحصيل من ${partnerName || 'عميل'}`, `المبلغ: ${amount}`);
@@ -314,12 +290,10 @@ const createBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         }
         // 1.5 Handle isPrimary (only one primary per bankType)
         const isPrimary = bank.isPrimary ? 1 : 0;
-        if (isPrimary) {
-            yield ensureBankTypeColumn();
+        if (bank.isPrimary) {
             yield connection.query('UPDATE banks SET isPrimary = 0 WHERE bankType = ?', [bank.bankType || 'BANK']);
         }
         // 2. Create Bank record (include branchId for branch isolation + fee config + bankType + new fields)
-        yield ensureBankTypeColumn();
         yield connection.query(`INSERT INTO banks (id, name, accountNumber, currency, balance, accountId, iban, color, branchId,
              feeEnabled, feeType, feePercentage, feeFixedAmount, feeMinAmount, feeTaxRate, bankType,
              isActive, isPrimary, depositPermissions, withdrawPermissions)
@@ -355,7 +329,7 @@ const createBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
 });
 exports.createBank = createBank;
 const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
@@ -372,12 +346,11 @@ const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             yield connection.query('UPDATE banks SET isPrimary = 0 WHERE bankType = ?', [bank.bankType || oldBank.bankType || 'BANK']);
         }
         // 2. Update Bank (preserve branchId for branch isolation + fee config + bankType)
-        yield ensureBankTypeColumn();
-        yield connection.query(`UPDATE banks SET name=?, accountNumber=?, currency=?, balance=?, accountId=?, iban=?, color=?, branchId=?,
+        yield connection.query(`UPDATE banks SET name=?, accountNumber=?, currency=?, accountId=?, iban=?, color=?, branchId=?,
              feeEnabled=?, feeType=?, feePercentage=?, feeFixedAmount=?, feeMinAmount=?, feeTaxRate=?, bankType=?,
              isActive=?, isPrimary=?, depositPermissions=?, withdrawPermissions=?
              WHERE id=?`, [
-            bank.name, bank.accountNumber, bank.currency, bank.balance, bank.accountId, bank.iban, bank.color,
+            bank.name, bank.accountNumber, bank.currency, bank.accountId, bank.iban, bank.color,
             bank.branchId !== undefined ? bank.branchId : oldBank.branchId,
             bank.feeEnabled !== undefined ? (bank.feeEnabled ? 1 : 0) : (oldBank.feeEnabled ? 1 : 0),
             bank.feeType || oldBank.feeType || 'PERCENTAGE',
@@ -407,17 +380,27 @@ const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             const currentGLOpeningBalance = Number((_e = glAccounts[0]) === null || _e === void 0 ? void 0 : _e.openingBalance) || 0;
             const diff = intendedOpeningBalance - currentGLOpeningBalance;
             if (diff !== 0) {
-                // Set openingBalance directly to the user's intended value (idempotent)
-                yield connection.query('UPDATE accounts SET openingBalance = ?, balance = ? WHERE id = ?', [intendedOpeningBalance, intendedOpeningBalance, bank.accountId]);
+                // Adjust openingBalance and live balance by the diff
+                yield connection.query('UPDATE accounts SET openingBalance = ?, balance = balance + ? WHERE id = ?', [intendedOpeningBalance, diff, bank.accountId]);
+                // REMOVED: Banks balance is now calculated live from GL/journal lines
             }
         }
         else if (bank.accountId && bank.accountId !== oldBank.accountId) {
             // GL account switched — zero out old account's opening balance, apply to new
+            let oldGLOpening = 0;
             if (oldBank.accountId) {
-                yield connection.query('UPDATE accounts SET openingBalance = 0, balance = 0 WHERE id = ?', [oldBank.accountId]);
+                const [oldGlAccounts] = yield connection.query('SELECT openingBalance FROM accounts WHERE id = ?', [oldBank.accountId]);
+                oldGLOpening = Number((_f = oldGlAccounts[0]) === null || _f === void 0 ? void 0 : _f.openingBalance) || 0;
+                if (oldGLOpening !== 0) {
+                    yield connection.query('UPDATE accounts SET openingBalance = 0, balance = balance - ? WHERE id = ?', [oldGLOpening, oldBank.accountId]);
+                }
             }
             if (intendedOpeningBalance !== 0) {
-                yield connection.query('UPDATE accounts SET openingBalance = ?, balance = ? WHERE id = ?', [intendedOpeningBalance, intendedOpeningBalance, bank.accountId]);
+                yield connection.query('UPDATE accounts SET openingBalance = ?, balance = balance + ? WHERE id = ?', [intendedOpeningBalance, intendedOpeningBalance, bank.accountId]);
+            }
+            const bankDiff = intendedOpeningBalance - oldGLOpening;
+            if (bankDiff !== 0) {
+                // REMOVED: Banks balance is now calculated live from GL/journal lines
             }
         }
         // 3.5. Sync Currency + subType to GL Account (Crucial for Multi-Currency + classification)
@@ -436,7 +419,7 @@ const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         }
         yield connection.commit();
         // Log audit trail
-        const user = ((_f = req.user) === null || _f === void 0 ? void 0 : _f.name) || ((_g = req.user) === null || _g === void 0 ? void 0 : _g.username) || req.body.user || 'System';
+        const user = ((_g = req.user) === null || _g === void 0 ? void 0 : _g.name) || ((_h = req.user) === null || _h === void 0 ? void 0 : _h.username) || req.body.user || 'System';
         yield (0, auditController_1.logAction)(user, 'BANK', 'UPDATE', `تحديث بنك - ${bank.name}`, `الرصيد الجديد: ${bank.balance}`);
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'banks', updatedBy: user });
@@ -501,8 +484,8 @@ const resyncBankGL = (req, res) => __awaiter(void 0, void 0, void 0, function* (
         const diff = calculatedBalance - oldBankBalance;
         // 4. Update banks.balance to match the calculated value
         if (diff !== 0) {
-            yield connection.query('UPDATE banks SET balance = ? WHERE id = ?', [calculatedBalance, id]);
-            console.log(`🏦 Fixed bank ${bank.name}: ${oldBankBalance} → ${calculatedBalance} (diff: ${diff})`);
+            // REMOVED: Banks balance is now calculated live from GL/journal lines
+            console.log(`🏦 Bank ${bank.name} GL checked: ${oldBankBalance} → ${calculatedBalance} (diff: ${diff})`);
         }
         // 5. Also fix the accounts.balance to match (prevents future discrepancy alerts)
         const accountBalance = Number(account.balance) || 0;
@@ -539,7 +522,7 @@ const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         yield connection.beginTransaction();
         const { id } = req.params;
         // 1. Get bank data including linked account
-        const [banks] = yield connection.query('SELECT id, name, accountId, balance FROM banks WHERE id = ?', [id]);
+        const [banks] = yield connection.query('SELECT id, name, accountId, balance, bankType FROM banks WHERE id = ?', [id]);
         const bank = banks[0];
         if (!bank) {
             connection.release();
@@ -791,8 +774,8 @@ const recalculateBankBalances = (req, res) => __awaiter(void 0, void 0, void 0, 
             const diff = calculatedBalance - oldBalance;
             console.log(`${bank.name}: opening=${openingBalance}, debit=${totals.totalDebit}, credit=${totals.totalCredit}, calculated=${calculatedBalance}, old=${oldBalance}`);
             if (Math.abs(diff) > 0.01) {
-                // Update bank balance
-                yield connection.query('UPDATE banks SET balance = ROUND(?, 2) WHERE id = ?', [calculatedBalance, bank.id]);
+                // REMOVED: Banks balance is now calculated live from GL/journal lines
+                // We no longer physically write the balance to banks table
                 results.push({
                     bankId: bank.id,
                     name: bank.name,

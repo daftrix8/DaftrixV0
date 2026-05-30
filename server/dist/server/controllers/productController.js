@@ -921,55 +921,6 @@ const refreshCostsFromPurchases = (req, res) => __awaiter(void 0, void 0, void 0
 });
 exports.refreshCostsFromPurchases = refreshCostsFromPurchases;
 // ─── Product Variants (embedded within a single product) ──────────
-let _variantsTableReady = false;
-const ensureProductVariantsTable = (conn) => __awaiter(void 0, void 0, void 0, function* () {
-    // Skip DDL after first successful check — these queries are expensive on shared hosting
-    if (_variantsTableReady)
-        return;
-    yield conn.query(`
-        CREATE TABLE IF NOT EXISTS product_variants (
-            id VARCHAR(36) PRIMARY KEY,
-            productId VARCHAR(36) NOT NULL,
-            name VARCHAR(255) NOT NULL,
-            sku VARCHAR(100) NULL,
-            barcode VARCHAR(100) NULL,
-            purchasePrice DECIMAL(12,2) DEFAULT 0,
-            sellingPrice DECIMAL(12,2) DEFAULT 0,
-            attributes JSON COMMENT 'e.g. {"المقاس":"XL","اللون":"أحمر"}',
-            stock INT DEFAULT 0,
-            isActive BOOLEAN DEFAULT TRUE,
-            image LONGTEXT NULL,
-            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            INDEX idx_pv_product (productId),
-            INDEX idx_pv_sku (sku),
-            INDEX idx_pv_barcode (barcode)
-        )
-    `);
-    yield conn.query(`
-        CREATE TABLE IF NOT EXISTS product_variant_templates (
-            id VARCHAR(36) PRIMARY KEY,
-            name VARCHAR(255) NOT NULL UNIQUE,
-            attributes JSON NOT NULL,
-            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    `);
-    try {
-        yield conn.query(`ALTER TABLE product_variants ADD COLUMN isActive BOOLEAN DEFAULT TRUE`);
-    }
-    catch (e) {
-        if (e.code !== 'ER_DUP_FIELDNAME')
-            throw e;
-    }
-    try {
-        yield conn.query(`ALTER TABLE product_variants ADD COLUMN image LONGTEXT NULL`);
-    }
-    catch (e) {
-        if (e.code !== 'ER_DUP_FIELDNAME')
-            throw e;
-    }
-    _variantsTableReady = true;
-});
 /**
  * GET /api/products/:id/variants
  * Returns all variants embedded within a product
@@ -977,7 +928,6 @@ const ensureProductVariantsTable = (conn) => __awaiter(void 0, void 0, void 0, f
 const getProductVariants = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureProductVariantsTable(conn);
         const { id } = req.params;
         const [rows] = yield conn.query(`SELECT id, productId, name, sku, barcode, purchasePrice, sellingPrice, attributes, stock, isActive, image
              FROM product_variants WHERE productId = ? ORDER BY name ASC`, [id]);
@@ -1001,7 +951,6 @@ const saveProductVariants = (req, res) => __awaiter(void 0, void 0, void 0, func
     const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        yield ensureProductVariantsTable(conn);
         const { id: productId } = req.params;
         const { variants } = req.body;
         if (!Array.isArray(variants)) {
@@ -1079,7 +1028,6 @@ exports.saveProductVariants = saveProductVariants;
 const getVariantTemplates = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureProductVariantsTable(conn);
         const [rows] = yield conn.query(`SELECT * FROM product_variant_templates ORDER BY createdAt DESC`);
         res.json(rows);
     }
@@ -1099,7 +1047,6 @@ exports.getVariantTemplates = getVariantTemplates;
 const saveVariantTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureProductVariantsTable(conn);
         const { name, attributes } = req.body;
         if (!name || !attributes) {
             return res.status(400).json({ message: 'الاسم والسمات مطلوبة' });
@@ -1129,7 +1076,6 @@ exports.saveVariantTemplate = saveVariantTemplate;
 const deleteVariantTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureProductVariantsTable(conn);
         const { id } = req.params;
         yield conn.query(`DELETE FROM product_variant_templates WHERE id = ?`, [id]);
         res.json({ success: true });

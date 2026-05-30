@@ -20,56 +20,6 @@ const crypto_1 = require("crypto");
 const db_1 = require("../db");
 const dateUtils_1 = require("../../utils/dateUtils");
 // ── Schema helpers ─────────────────────────────────────────────────────────
-function ensureExpenseTables(conn) {
-    return __awaiter(this, void 0, void 0, function* () {
-        yield conn.query(`
-        CREATE TABLE IF NOT EXISTS pos_expense_categories (
-            id        VARCHAR(36)  NOT NULL,
-            name      VARCHAR(255) NOT NULL,
-            isActive  TINYINT(1)   NOT NULL DEFAULT 1,
-            sortOrder INT          NOT NULL DEFAULT 0,
-            createdAt DATETIME     DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-        yield conn.query(`
-        CREATE TABLE IF NOT EXISTS pos_expenses (
-            id          VARCHAR(36)                              NOT NULL,
-            shiftId     VARCHAR(36)                              NOT NULL,
-            categoryId  VARCHAR(36)                              NOT NULL,
-            description TEXT                                     NULL,
-            amount      DECIMAL(15,2)                            NOT NULL,
-            sourceType  ENUM('daily_takings','prior_balance')    NOT NULL,
-            entityId    VARCHAR(36)                              NULL,
-            entityType  ENUM('EMPLOYEE', 'SUPPLIER', 'MISC')     NULL,
-            createdBy   VARCHAR(36)                              NOT NULL,
-            createdAt   DATETIME                                 DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            CONSTRAINT fk_expense_shift FOREIGN KEY (shiftId) REFERENCES pos_shifts(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-        // Retrofit existing tables
-        try {
-            yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN entityId VARCHAR(36) NULL`);
-            yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN entityType ENUM('EMPLOYEE', 'SUPPLIER', 'MISC') NULL`);
-        }
-        catch (_a) {
-            // Columns likely exist
-        }
-        // Seed default categories once
-        const [cats] = yield conn.query(`SELECT COUNT(*) AS cnt FROM pos_expense_categories`);
-        if (cats[0].cnt === 0) {
-            const seeds = [
-                { id: (0, crypto_1.randomUUID)(), name: 'سلف موظفين', sortOrder: 1 },
-                { id: (0, crypto_1.randomUUID)(), name: 'دفعات موردين', sortOrder: 2 },
-                { id: (0, crypto_1.randomUUID)(), name: 'مصروفات مختلفة', sortOrder: 3 },
-            ];
-            for (const s of seeds) {
-                yield conn.query(`INSERT INTO pos_expense_categories (id, name, sortOrder) VALUES (?, ?, ?)`, [s.id, s.name, s.sortOrder]);
-            }
-        }
-    });
-}
 // ── Helpers ────────────────────────────────────────────────────────────────
 function computeAvailableBalance(conn, shiftId, sourceType, shift) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -102,7 +52,6 @@ function computeAvailableBalance(conn, shiftId, sourceType, shift) {
 const getExpenseCategories = (_req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureExpenseTables(conn);
         const [rows] = yield conn.query(`SELECT id, name, sortOrder FROM pos_expense_categories
              WHERE isActive = 1 ORDER BY sortOrder ASC, name ASC`);
         res.json({ categories: rows });
@@ -124,7 +73,6 @@ const addExpense = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
     var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureExpenseTables(conn);
         const { shiftId } = req.params;
         const { categoryId, description, amount, sourceType, entityId, entityType } = req.body;
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
@@ -193,7 +141,6 @@ exports.addExpense = addExpense;
 const getShiftExpenses = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureExpenseTables(conn);
         const { shiftId } = req.params;
         const [expenses] = yield conn.query(`SELECT e.*, c.name AS categoryName
              FROM pos_expenses e

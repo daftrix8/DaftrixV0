@@ -222,10 +222,7 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 yield conn.query('UPDATE partners SET balance = openingBalance');
             }
             catch ( /* column might not exist */_a) { /* column might not exist */ }
-            try {
-                yield conn.query('UPDATE banks SET balance = 0');
-            }
-            catch ( /* table might not exist */_b) { /* table might not exist */ }
+            // REMOVED: Banks balance is now calculated live from GL/journal lines
             yield conn.query('UPDATE products SET stock = 0');
             console.log('✅ Balances reset successfully');
         }

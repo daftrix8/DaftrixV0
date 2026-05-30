@@ -1697,8 +1697,8 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         if (bankId) {
                             // For RECEIPT: money comes IN (positive), for PAYMENT: money goes OUT (negative)
                             const balanceChange = paymentType === 'RECEIPT' ? paymentCollected : -paymentCollected;
-                            yield conn.query(`UPDATE banks SET balance = COALESCE(balance, 0) + ? WHERE id = ?`, [balanceChange, bankId]);
-                            console.log(`🏦 Updated bank ${bankId} balance by ${balanceChange} (partial payment)`);
+                            // REMOVED: Banks balance is now calculated live from GL/journal lines
+                            console.log(`🏦 Bank ${bankId} GL updated by ${balanceChange} (partial payment)`);
                         }
                     }
                 }
@@ -1902,8 +1902,8 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 // Update bank balance if we have bankId
                 if (transfer.bankId) {
                     const balanceChange = transferPaymentType === 'RECEIPT' ? transfer.amount : -transfer.amount;
-                    yield conn.query(`UPDATE banks SET balance = balance + ? WHERE id = ?`, [balanceChange, transfer.bankId]);
-                    console.log(`🏦 Updated bank ${transfer.bankId} balance by ${balanceChange}`);
+                    // REMOVED: Banks balance is now calculated live from GL/journal lines
+                    console.log(`🏦 Bank ${transfer.bankId} GL updated by ${balanceChange}`);
                 }
                 console.log(`✅ Bank transfer payment ${transferNumber} created for ${transfer.amount}`);
                 // Log audit trail for bank transfer
@@ -3018,8 +3018,8 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                             if (bankId) {
                                 // For RECEIPT: money comes IN (positive), for PAYMENT: money goes OUT (negative)
                                 const balanceChange = paymentType === 'RECEIPT' ? paymentCollected : -paymentCollected;
-                                yield conn.query(`UPDATE banks SET balance = COALESCE(balance, 0) + ? WHERE id = ?`, [balanceChange, bankId]);
-                                console.log(`🏦 Updated bank ${bankId} balance by ${balanceChange} (partial payment)`);
+                                // REMOVED: Banks balance is now calculated live from GL/journal lines
+                                console.log(`🏦 Bank ${bankId} GL updated by ${balanceChange} (partial payment)`);
                             }
                         }
                     }
@@ -3223,8 +3223,8 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     // Update bank balance if we have bankId
                     if (transfer.bankId) {
                         const balanceChange = transferPaymentType === 'RECEIPT' ? transfer.amount : -transfer.amount;
-                        yield conn.query(`UPDATE banks SET balance = balance + ? WHERE id = ?`, [balanceChange, transfer.bankId]);
-                        console.log(`🏦 Updated bank ${transfer.bankId} balance by ${balanceChange}`);
+                        // REMOVED: Banks balance is now calculated live from GL/journal lines
+                        console.log(`🏦 Bank ${transfer.bankId} GL updated by ${balanceChange}`);
                     }
                     console.log(`✅ Bank transfer payment ${transferNumber} created for ${transfer.amount}`);
                     // Log audit trail for bank transfer

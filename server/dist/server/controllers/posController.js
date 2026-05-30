@@ -215,90 +215,6 @@ function getBranchBanks(conn, branchId) {
 // POS SETTINGS & SCHEMA HELPERS
 // ============================================
 /**
- * Create pos_settings singleton row if it doesn't exist yet.
- * Safe to call every time — uses INSERT IGNORE.
- */
-function ensurePosSettings(conn) {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            yield conn.query(`
-            CREATE TABLE IF NOT EXISTS pos_settings (
-                id VARCHAR(36) NOT NULL DEFAULT '1',
-                adminPassword VARCHAR(255) NULL,
-                discountLockEnabled TINYINT(1) NOT NULL DEFAULT 1,
-                discountFreeLimit DECIMAL(5,2) NOT NULL DEFAULT 5.00,
-                perInvoiceAccounting TINYINT(1) NOT NULL DEFAULT 0,
-                printAfterConfirm TINYINT(1) NOT NULL DEFAULT 1,
-                useNumpad TINYINT(1) NOT NULL DEFAULT 1,
-                allowedCategories JSON NULL,
-                autoCloseEnabled TINYINT(1) NOT NULL DEFAULT 0,
-                autoCloseTime VARCHAR(5) NOT NULL DEFAULT '23:59',
-                updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                PRIMARY KEY (id)
-            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        `);
-            yield conn.query(`INSERT IGNORE INTO pos_settings (id) VALUES ('1')`);
-            // Migration for existing pos_settings table
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN perInvoiceAccounting TINYINT(1) NOT NULL DEFAULT 0`);
-            }
-            catch (_a) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN printAfterConfirm TINYINT(1) NOT NULL DEFAULT 1`);
-            }
-            catch (_b) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN useNumpad TINYINT(1) NOT NULL DEFAULT 1`);
-            }
-            catch (_c) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN allowedCategories JSON NULL`);
-            }
-            catch (_d) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN autoCloseEnabled TINYINT(1) NOT NULL DEFAULT 0`);
-            }
-            catch (_e) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN autoCloseTime VARCHAR(5) NOT NULL DEFAULT '23:59'`);
-            }
-            catch (_f) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN editCutoffDate DATE NULL`);
-            }
-            catch (_g) { }
-            try {
-                yield conn.query(`ALTER TABLE pos_settings ADD COLUMN editCutoffDays INT NOT NULL DEFAULT 0`);
-            }
-            catch (_h) { }
-        }
-        catch (err) {
-            // Non-fatal — log and continue
-            console.warn('[POS] ensurePosSettings warning:', err.message);
-        }
-    });
-}
-/**
- * Add Phase 1 columns to pos_shifts if they don't exist.
- * Each ALTER is wrapped in try/catch so it's safe on already-migrated DBs.
- */
-function ensurePhase1ShiftColumns(conn) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const migrations = [
-            `ALTER TABLE pos_shifts ADD COLUMN treasuryId VARCHAR(36) NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmount DECIMAL(15,2) NOT NULL DEFAULT 0`,
-            `ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmountSetBy VARCHAR(36) NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmountSetAt DATETIME NULL`,
-        ];
-        for (const sql of migrations) {
-            try {
-                yield conn.query(sql);
-            }
-            catch ( /* column already exists */_a) { /* column already exists */ }
-        }
-    });
-}
-/**
  * Get all cash/treasury accounts available for POS selection.
  * GET /api/pos/treasuries
  *
@@ -392,7 +308,6 @@ const getPOSSettings = (_req, res) => __awaiter(void 0, void 0, void 0, function
     var _a, _b, _c, _d, _e, _f, _g;
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensurePosSettings(conn);
         const [rows] = yield conn.query(`SELECT discountLockEnabled, discountFreeLimit,
                     perInvoiceAccounting, printAfterConfirm, useNumpad, allowedCategories,
                     (adminPassword IS NOT NULL AND adminPassword != '') AS adminPasswordConfigured,
@@ -442,7 +357,6 @@ exports.getPOSSettings = getPOSSettings;
 const updatePOSSettings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensurePosSettings(conn);
         const { discountLockEnabled, discountFreeLimit, adminPassword, perInvoiceAccounting, printAfterConfirm, useNumpad, allowedCategories, autoCloseEnabled, autoCloseTime, editCutoffDate, editCutoffDays, } = req.body;
         const updates = [];
         const params = [];
@@ -522,7 +436,6 @@ const verifyAdminPassword = (req, res) => __awaiter(void 0, void 0, void 0, func
     var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensurePosSettings(conn);
         const { password } = req.body;
         if (!password) {
             return res.status(400).json({ error: 'كلمة المرور مطلوبة' });
@@ -590,8 +503,6 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             if (!adminOpeningAmountPassword) {
                 return res.status(400).json({ error: 'كلمة مرور المشرف مطلوبة لتحديد المبلغ الافتتاحي للمشرف' });
             }
-            // Ensure pos_settings exists and read adminPassword
-            yield ensurePosSettings(conn);
             const [settingsRows] = yield conn.query(`SELECT adminPassword FROM pos_settings LIMIT 1`);
             const storedHash = ((_a = settingsRows[0]) === null || _a === void 0 ? void 0 : _a.adminPassword) || null;
             if (!storedHash) {
@@ -618,8 +529,6 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         const shiftDefinitionId = reqShiftDefId || defaults.shiftDefinitionId;
         const deviceId = reqDeviceId || defaults.deviceId;
         const shiftId = (0, crypto_1.randomUUID)();
-        // Ensure pos_shifts has the Phase 1 columns (safe for older DB schemas)
-        yield ensurePhase1ShiftColumns(conn);
         // Both INSERTs must succeed atomically — shift without its opening
         // movement would produce a 0-balance expectedCash calculation
         yield conn.query('START TRANSACTION');
@@ -840,34 +749,6 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         // Auto-escalate to PENDING_VALIDATION if variance exceeds threshold
         const isOverThreshold = posVarianceThreshold !== null && Math.abs(variance) > posVarianceThreshold;
         let newStatus = (posValidationRequired || isOverThreshold) ? 'PENDING_VALIDATION' : 'CLOSED';
-        // Ensure ENUM contains PENDING_VALIDATION before we try to write it.
-        // ALTER TABLE causes an implicit COMMIT in MySQL, so this must run BEFORE START TRANSACTION.
-        if (newStatus === 'PENDING_VALIDATION') {
-            try {
-                yield conn.query(`ALTER TABLE pos_shifts MODIFY COLUMN status ENUM('OPEN', 'CLOSED', 'PENDING_VALIDATION', 'VALIDATED', 'SUSPENDED') DEFAULT 'OPEN'`);
-            }
-            catch (err) {
-                console.warn('⚠️ [POS] Could not modify ENUM for PENDING_VALIDATION, falling back to CLOSED:', err.message);
-                newStatus = 'CLOSED';
-            }
-        }
-        // Ensure shortageEmployeeId and card columns exist
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN shortageEmployeeId VARCHAR(36)`, []);
-        }
-        catch (_) { /* column may already exist */ }
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN closingCard DECIMAL(15, 2) DEFAULT 0`, []);
-        }
-        catch (_) { }
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN expectedCard DECIMAL(15, 2) DEFAULT 0`, []);
-        }
-        catch (_) { }
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN varianceCard DECIMAL(15, 2) DEFAULT 0`, []);
-        }
-        catch (_) { }
         // === BEGIN TRANSACTION ===
         // Held order cleanup + shift status update must succeed or fail atomically
         yield conn.query('START TRANSACTION');
@@ -1059,18 +940,6 @@ const validateShift = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (!shiftId) {
             return res.status(400).json({ error: 'معرف الوردية مطلوب' });
         }
-        // Ensure validation columns exist (safe for pre-migration databases)
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN validatedBy VARCHAR(36)`, []);
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN validatedAt DATETIME`, []);
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN validationNotes TEXT`, []);
-        }
-        catch (_) { /* columns may already exist */ }
-        // Ensure VALIDATED and PENDING_VALIDATION values exist in the ENUM
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts MODIFY COLUMN status ENUM('OPEN', 'CLOSED', 'PENDING_VALIDATION', 'VALIDATED', 'SUSPENDED') DEFAULT 'OPEN'`);
-        }
-        catch (_) { /* ENUM may already contain VALIDATED */ }
         // Verify shift exists and is PENDING_VALIDATION (only pending shifts can be validated)
         const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
         if (shifts.length === 0) {
@@ -1510,13 +1379,14 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             const invoiceLines = items.map((item) => {
                 const qty = Number(item.quantity) || 0;
                 const price = Number(item.price) || 0;
-                const discount = Number(item.discount) || 0;
+                const discountAmount = Number(item.discount) || 0;
+                const discountValue = Number(item.discountValue) || 0;
                 const discountType = item.discountType || 'FIXED';
                 // Recompute line total in piasters
                 const grossP = Math.round(toPiasters(price) * qty);
                 const discountP = discountType === 'PERCENT'
-                    ? Math.round((grossP * discount) / 100)
-                    : toPiasters(discount);
+                    ? Math.round((grossP * discountValue) / 100)
+                    : toPiasters(discountAmount);
                 const recomputedTotalP = Math.max(0, grossP - discountP);
                 const recomputedTotal = fromPiasters(recomputedTotalP);
                 return {
@@ -1526,7 +1396,8 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     quantity: qty,
                     price,
                     cost: Number(item.cost) || 0,
-                    discount,
+                    discount: discountAmount,
+                    discountValue: discountValue,
                     discountType,
                     total: recomputedTotal,
                     unitId: item.unitId,
@@ -1686,7 +1557,9 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             if (effectiveWarehouseId) {
                 // 1. Update warehouse-level stock (sequential due to WHERE clause)
                 const stockUpdateLines = invoiceLines.filter((l) => l.tradeInAction !== 'CUSTOM_TRADE_IN');
-                for (const line of stockUpdateLines) {
+                // SORT BY PRODUCT ID TO PREVENT DEADLOCKS
+                const sortedLines = [...stockUpdateLines].sort((a, b) => String(a.productId).localeCompare(String(b.productId)));
+                for (const line of sortedLines) {
                     yield conn.query(`UPDATE product_stocks 
                          SET stock = stock - ?
                          WHERE productId = ? AND warehouseId = ?`, [line.baseQuantity, line.productId, effectiveWarehouseId]);
@@ -1870,11 +1743,31 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 ]);
                 const drAccount = isPayout ? partnerAccount : paymentAccount;
                 const crAccount = isPayout ? paymentAccount : partnerAccount;
+                const feePortion = (!isPayout && payment.applyFee) ? (Number(payment.feeTotal) || 0) : 0;
+                const principalPortion = absAmount - feePortion;
+                const journalLines = [
+                    [treasuryJournalId, drAccount.id, drAccount.name, absAmount, 0, 'EGP', 1, absAmount, 0]
+                ];
+                if (feePortion > 0) {
+                    journalLines.push([treasuryJournalId, crAccount.id, crAccount.name, 0, principalPortion, 'EGP', 1, 0, principalPortion]);
+                    let [feeRevAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE type = 'REVENUE' AND subType = 'OTHER_REVENUE' LIMIT 1`);
+                    let feeRevenueAccount = feeRevAccRows[0];
+                    if (!feeRevenueAccount) {
+                        const feeAccountId = (0, crypto_1.randomUUID)();
+                        const feeAccountCode = `4099${Math.floor(Math.random() * 1000)}`;
+                        const feeAccountName = 'إيرادات رسوم بنكية وإضافية';
+                        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance) VALUES (?, ?, ?, 'REVENUE', 'OTHER_REVENUE', 0, 0)`, [feeAccountId, feeAccountCode, feeAccountName]);
+                        feeRevenueAccount = { id: feeAccountId, name: feeAccountName };
+                    }
+                    journalLines.push([treasuryJournalId, feeRevenueAccount.id, feeRevenueAccount.name, 0, feePortion, 'EGP', 1, 0, feePortion]);
+                    if (!affectedAccountIds.includes(feeRevenueAccount.id))
+                        affectedAccountIds.push(feeRevenueAccount.id);
+                }
+                else {
+                    journalLines.push([treasuryJournalId, crAccount.id, crAccount.name, 0, absAmount, 'EGP', 1, 0, absAmount]);
+                }
                 // Journal Lines: Dr Payment Account (treasury/bank), Cr Receivables (flipped for payout)
-                yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
-                        [treasuryJournalId, drAccount.id, drAccount.name, absAmount, 0, 'EGP', 1, absAmount, 0],
-                        [treasuryJournalId, crAccount.id, crAccount.name, 0, absAmount, 'EGP', 1, 0, absAmount]
-                    ]]);
+                yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [journalLines]);
                 if (!affectedAccountIds.includes(paymentAccount.id))
                     affectedAccountIds.push(paymentAccount.id);
                 if (!affectedAccountIds.includes(partnerAccount.id))
@@ -1989,7 +1882,9 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 }
                 const scrapJournalId = (0, crypto_1.randomUUID)();
                 let totalScrapCost = 0;
-                for (const item of writeOffItems) {
+                // SORT BY PRODUCT ID TO PREVENT DEADLOCKS
+                const sortedWriteOffItems = [...writeOffItems].sort((a, b) => String(a.productId).localeCompare(String(b.productId)));
+                for (const item of sortedWriteOffItems) {
                     const scrapQty = Math.abs(Number(item.quantity)); // Positive value for the deduction amount
                     // Average Cost logic
                     let [costRows] = yield conn.query(`SELECT averageCost FROM products WHERE id = ?`, [item.productId]);
@@ -2038,9 +1933,15 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             yield conn.query('COMMIT');
             // === LOYALTY: Record EARN after commit (non-fatal) ===
             let loyaltyResult = null;
-            if (customerId) {
-                const loyaltyDiscount = loyaltyRedeemSuccess ? ((loyaltyRedeem === null || loyaltyRedeem === void 0 ? void 0 : loyaltyRedeem.discountAmount) || 0) : 0;
-                loyaltyResult = yield (0, loyaltyController_1.recordLoyaltyEarn)(conn, customerId, invoiceId, total, userName, items);
+            try {
+                if (customerId) {
+                    const loyaltyDiscount = loyaltyRedeemSuccess ? ((loyaltyRedeem === null || loyaltyRedeem === void 0 ? void 0 : loyaltyRedeem.discountAmount) || 0) : 0;
+                    loyaltyResult = yield (0, loyaltyController_1.recordLoyaltyEarn)(conn, customerId, invoiceId, total, userName, items);
+                }
+            }
+            catch (loyaltyErr) {
+                console.error('Non-fatal loyalty error:', loyaltyErr);
+                // DO NOT throw. Allow the response to send.
             }
             // Calculate change (cash portion only)
             const cashPayment = resolvedPayments.find(p => p.method === 'CASH');
@@ -2671,37 +2572,12 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
 });
 exports.getPOSProducts = getPOSProducts;
 /**
- * Ensure variant columns exist on products table.
- * Called lazily on first variant-related request — zero-downtime migration.
- */
-const ensureVariantSchema = (conn) => __awaiter(void 0, void 0, void 0, function* () {
-    const [cols] = yield conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS
-         WHERE TABLE_NAME = 'products' AND COLUMN_NAME IN ('variantGroupId', 'variantAttributes')`);
-    const existingCols = new Set(cols.map((r) => r.COLUMN_NAME));
-    if (!existingCols.has('variantGroupId')) {
-        yield conn.query(`ALTER TABLE products ADD COLUMN variantGroupId VARCHAR(36) NULL DEFAULT NULL`);
-    }
-    if (!existingCols.has('variantAttributes')) {
-        yield conn.query(`ALTER TABLE products ADD COLUMN variantAttributes JSON NULL DEFAULT NULL`);
-    }
-    yield conn.query(`
-        CREATE TABLE IF NOT EXISTS variant_groups (
-            id VARCHAR(36) PRIMARY KEY,
-            name VARCHAR(255) NOT NULL,
-            attributeKeys JSON COMMENT 'Ordered dimension names e.g. ["Size","Color"]',
-            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        )
-    `);
-});
-/**
  * Get all variant groups
  * GET /api/pos/variant-groups
  */
 const getVariantGroups = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureVariantSchema(conn);
         const [groups] = yield conn.query(`SELECT vg.*, COUNT(p.id) AS productCount
              FROM variant_groups vg
              LEFT JOIN products p ON p.variantGroupId = vg.id
@@ -2726,7 +2602,6 @@ exports.getVariantGroups = getVariantGroups;
 const createVariantGroup = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureVariantSchema(conn);
         const { name, attributeKeys = [] } = req.body;
         if (!(name === null || name === void 0 ? void 0 : name.trim()))
             return res.status(400).json({ error: 'اسم المجموعة مطلوب' });
@@ -2786,7 +2661,6 @@ exports.updateVariantGroup = updateVariantGroup;
 const assignProductToVariantGroup = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureVariantSchema(conn);
         const { groupId, productId } = req.params;
         const { attributes } = req.body;
         if (attributes === null || attributes === undefined) {
@@ -2817,7 +2691,6 @@ const getVariantGroupProducts = (req, res) => __awaiter(void 0, void 0, void 0, 
     try {
         const { groupId } = req.params;
         const { warehouseId, priceListId } = req.query;
-        yield ensureVariantSchema(conn);
         const priceExpr = priceListId
             ? `COALESCE(NULLIF(pp.price, 0), p.price) AS price`
             : `p.price AS price`;
@@ -2861,7 +2734,6 @@ const deleteVariantGroup = (req, res) => __awaiter(void 0, void 0, void 0, funct
     const conn = yield (0, db_1.getConnection)();
     try {
         const { groupId } = req.params;
-        yield ensureVariantSchema(conn);
         // Unlink products from the group
         yield conn.query(`UPDATE products SET variantGroupId = NULL, variantAttributes = NULL WHERE variantGroupId = ?`, [groupId]);
         yield conn.query(`DELETE FROM variant_groups WHERE id = ?`, [groupId]);
@@ -3401,12 +3273,6 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
             return res.status(404).json({ error: 'الفاتورة الأصلية غير موجودة' });
         }
         const now = (0, dateUtils_1.getEgyptianISOString)();
-        // Ensure refund columns exist BEFORE transaction (ALTER TABLE causes implicit COMMIT in MySQL)
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN IF NOT EXISTS totalRefunds DECIMAL(15,2) DEFAULT 0`, []);
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN IF NOT EXISTS refundsCount INT DEFAULT 0`, []);
-        }
-        catch (_) { /* columns may already exist */ }
         yield conn.query('START TRANSACTION');
         try {
             // Create refund invoice (credit note)
@@ -3432,19 +3298,23 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
             const effectiveWarehouseId = shift.warehouseId;
             const refundLineValues = items.map((item) => [
                 refundId, item.productId, item.productName,
-                item.quantity, item.price, item.quantity * item.price,
+                item.quantity, item.price, item.cost || 0,
+                item.discount || 0, item.discountType || 'FIXED',
+                (item.quantity * item.price) - (item.discount || 0),
                 effectiveWarehouseId,
                 item.unitId || null, item.unitName || null,
                 item.conversionFactor || 1, item.baseQuantity || item.quantity
             ]);
             yield conn.query(`INSERT INTO invoice_lines (
-                    invoiceId, productId, productName, quantity, price, total, warehouseId,
+                    invoiceId, productId, productName, quantity, price, cost, discount, discountType, total, warehouseId,
                     unitId, unitName, conversionFactor, baseQuantity
                 ) VALUES ?`, [refundLineValues]);
             // === PERF: BATCH stock restore ===
             if (effectiveWarehouseId) {
                 // 1. Update warehouse stock (sequential due to WHERE clause)
-                for (const item of items) {
+                // SORT BY PRODUCT ID TO PREVENT DEADLOCKS
+                const sortedItems = [...items].sort((a, b) => String(a.productId).localeCompare(String(b.productId)));
+                for (const item of sortedItems) {
                     const baseQty = item.baseQuantity || item.quantity;
                     yield conn.query(`UPDATE product_stocks SET stock = stock + ? WHERE productId = ? AND warehouseId = ?`, [baseQty, item.productId, effectiveWarehouseId]);
                 }
@@ -3562,8 +3432,14 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
             // === LOYALTY: Clawback earned points after refund (non-fatal) ===
             const refundPartnerId = origInvoices[0].partnerId;
             let loyaltyClawbackPoints = 0;
-            if (refundPartnerId) {
-                loyaltyClawbackPoints = yield (0, loyaltyController_1.recordLoyaltyClawback)(conn, refundPartnerId, originalInvoiceId, refundTotal, userName);
+            try {
+                if (refundPartnerId) {
+                    loyaltyClawbackPoints = yield (0, loyaltyController_1.recordLoyaltyClawback)(conn, refundPartnerId, originalInvoiceId, refundTotal, userName);
+                }
+            }
+            catch (loyaltyErr) {
+                console.error('Non-fatal loyalty clawback error:', loyaltyErr);
+                // DO NOT throw. Allow the response to send.
             }
             res.json({
                 success: true,
@@ -4307,7 +4183,6 @@ const updatePOSInvoice = (req, res) => __awaiter(void 0, void 0, void 0, functio
             return res.status(400).json({ error: 'هذه ليست فاتورة نقطة بيع' });
         }
         // 2. Check cutoff date
-        yield ensurePosSettings(conn);
         const [settingsRows] = yield conn.query('SELECT editCutoffDate, editCutoffDays FROM pos_settings LIMIT 1');
         const settingsData = settingsRows[0] || {};
         const cutoffDate = settingsData.editCutoffDate;

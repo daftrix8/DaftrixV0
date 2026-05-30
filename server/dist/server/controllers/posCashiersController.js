@@ -52,52 +52,6 @@ const crypto_1 = require("crypto");
 const db_1 = require("../db");
 const dateUtils_1 = require("../../utils/dateUtils");
 // ── Schema helpers ─────────────────────────────────────────────────────────
-function ensureCashierTables(conn) {
-    return __awaiter(this, void 0, void 0, function* () {
-        yield conn.query(`
-        CREATE TABLE IF NOT EXISTS pos_cashiers (
-            id         VARCHAR(36)  NOT NULL,
-            name       VARCHAR(255) NOT NULL,
-            username   VARCHAR(100) NOT NULL,
-            pinHash    VARCHAR(255) NOT NULL,
-            employeeId VARCHAR(36)  NULL,
-            isActive   TINYINT(1)   NOT NULL DEFAULT 1,
-            failedAttempts INT      NOT NULL DEFAULT 0,
-            lockoutUntil DATETIME   NULL,
-            createdAt  DATETIME     DEFAULT CURRENT_TIMESTAMP,
-            updatedAt  DATETIME     DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            PRIMARY KEY (id),
-            UNIQUE KEY uq_cashier_username (username)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-        yield conn.query(`
-        CREATE TABLE IF NOT EXISTS pos_cashier_shifts (
-            id        VARCHAR(36) NOT NULL,
-            shiftId   VARCHAR(36) NOT NULL,
-            cashierId VARCHAR(36) NOT NULL,
-            startedAt DATETIME    NOT NULL,
-            endedAt   DATETIME    NULL,
-            PRIMARY KEY (id),
-            CONSTRAINT fk_cs_shift    FOREIGN KEY (shiftId)   REFERENCES pos_shifts(id),
-            CONSTRAINT fk_cs_cashier  FOREIGN KEY (cashierId) REFERENCES pos_cashiers(id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-    `);
-        // Ensure currentCashierId column on pos_shifts
-        try {
-            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN currentCashierId VARCHAR(36) NULL`);
-        }
-        catch ( /* already exists */_a) { /* already exists */ }
-        // Ensure lockout columns exist
-        try {
-            yield conn.query(`ALTER TABLE pos_cashiers ADD COLUMN failedAttempts INT NOT NULL DEFAULT 0`);
-        }
-        catch ( /* already exists */_b) { /* already exists */ }
-        try {
-            yield conn.query(`ALTER TABLE pos_cashiers ADD COLUMN lockoutUntil DATETIME NULL`);
-        }
-        catch ( /* already exists */_c) { /* already exists */ }
-    });
-}
 // ── Controllers ────────────────────────────────────────────────────────────
 /**
  * GET /api/pos/cashiers
@@ -105,7 +59,6 @@ function ensureCashierTables(conn) {
 const getCashiers = (_req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureCashierTables(conn);
         const [rows] = yield conn.query(`SELECT id, name, username, employeeId, isActive, createdAt
              FROM pos_cashiers ORDER BY name ASC`);
         res.json({ cashiers: rows });
@@ -126,7 +79,6 @@ exports.getCashiers = getCashiers;
 const createCashier = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureCashierTables(conn);
         const { name, username, pin, employeeId } = req.body;
         if (!name || !username || !pin) {
             return res.status(400).json({ error: 'الاسم واسم المستخدم والرقم السري مطلوبة' });
@@ -236,7 +188,6 @@ exports.deleteCashier = deleteCashier;
 const endCashierSession = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureCashierTables(conn);
         const { shiftId } = req.params;
         const now = (0, dateUtils_1.getEgyptianISOString)();
         // Verify shift is still open
@@ -274,7 +225,6 @@ exports.endCashierSession = endCashierSession;
 const posCashierLogin = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureCashierTables(conn);
         const { username, pin } = req.body;
         if (!username || !pin) {
             return res.status(400).json({ error: 'اسم المستخدم والرقم السري مطلوبان' });
@@ -340,7 +290,6 @@ exports.posCashierLogin = posCashierLogin;
 const switchCashier = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureCashierTables(conn);
         const { shiftId } = req.params;
         const { username, pin } = req.body;
         if (!username || !pin) {

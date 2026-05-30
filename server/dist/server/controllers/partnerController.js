@@ -437,15 +437,6 @@ const createPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
     try {
         yield conn.beginTransaction();
         const { name, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, ceramicPriceListId, ceramicDiscountListId, gender, dateOfBirth } = req.body;
-        // Auto-migrate: add gender + dateOfBirth columns if missing
-        try {
-            yield conn.query('SELECT gender FROM partners LIMIT 0');
-        }
-        catch (_d) {
-            yield conn.query("ALTER TABLE partners ADD COLUMN gender VARCHAR(10) DEFAULT NULL").catch(() => { });
-            yield conn.query("ALTER TABLE partners ADD COLUMN dateOfBirth DATE DEFAULT NULL").catch(() => { });
-            console.log('✅ Added gender and dateOfBirth columns to partners table');
-        }
         // Default values for mobile app compatibility
         let { type, isCustomer, isSupplier } = req.body;
         // PERF: console.log('DEBUG CREATE PARTNER - RAW:', { type, isCustomer, isSupplier, body: req.body });

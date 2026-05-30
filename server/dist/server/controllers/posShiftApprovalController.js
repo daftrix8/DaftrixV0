@@ -59,29 +59,6 @@ function getOrCreateExpenseAccount(conn, entityType) {
     });
 }
 // ── Schema helpers ─────────────────────────────────────────────────────────
-function ensureApprovalColumns(conn) {
-    return __awaiter(this, void 0, void 0, function* () {
-        const columns = [
-            `ALTER TABLE pos_shifts ADD COLUMN approvalStatus ENUM('pending','approved','flagged') NOT NULL DEFAULT 'pending'`,
-            `ALTER TABLE pos_shifts ADD COLUMN approvedBy VARCHAR(36) NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN approvedAt DATETIME NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN actualCashReceived DECIMAL(15,2) NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN discrepancyAmount DECIMAL(15,2) NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN discrepancyNotes TEXT NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN adminNotes TEXT NULL`,
-            // Phase 1 columns — may not exist if no shift was opened with the new code yet
-            `ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmount DECIMAL(15,2) NOT NULL DEFAULT 0`,
-            `ALTER TABLE pos_shifts ADD COLUMN treasuryId VARCHAR(36) NULL`,
-            `ALTER TABLE pos_shifts ADD COLUMN adminShortageEmployeeId VARCHAR(36) NULL`,
-        ];
-        for (const sql of columns) {
-            try {
-                yield conn.query(sql);
-            }
-            catch ( /* column already exists */_a) { /* column already exists */ }
-        }
-    });
-}
 // ── Controllers ────────────────────────────────────────────────────────────
 /**
  * GET /api/pos/shifts/review
@@ -91,7 +68,6 @@ const getShiftsForReview = (req, res) => __awaiter(void 0, void 0, void 0, funct
     var _a, _b;
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureApprovalColumns(conn);
         const { approvalStatus, cashierId, from, to, page = 1, pageSize = 20 } = req.query;
         const offset = (Number(page) - 1) * Number(pageSize);
         const filters = [`s.status != 'OPEN'`];
@@ -204,7 +180,6 @@ exports.getShiftsForReview = getShiftsForReview;
 const getShiftSummary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureApprovalColumns(conn);
         const { shiftId } = req.params;
         const [shiftRows] = yield conn.query(`SELECT s.*,
                     u.name AS cashierName,
@@ -532,7 +507,6 @@ const approveShift = (req, res) => __awaiter(void 0, void 0, void 0, function* (
     var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureApprovalColumns(conn);
         const { shiftId } = req.params;
         const { actualCashReceived, adminNotes, discrepancyNotes, adminShortageEmployeeId } = req.body;
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
@@ -602,7 +576,6 @@ const forceApproveShift = (req, res) => __awaiter(void 0, void 0, void 0, functi
     var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
-        yield ensureApprovalColumns(conn);
         const { shiftId } = req.params;
         const { actualCashReceived, adminNotes, discrepancyNotes, adminShortageEmployeeId } = req.body;
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;

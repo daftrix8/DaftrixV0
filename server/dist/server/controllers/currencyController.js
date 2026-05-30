@@ -471,10 +471,10 @@ function createCurrencyTransaction(req, res) {
                 fromBankId || null, toBankId || null, gainLossAmount, notes || null, user]);
             // Update bank balances if banks are specified
             if (fromBankId) {
-                yield connection.query('UPDATE banks SET balance = balance - ? WHERE id = ?', [fromAmount, fromBankId]);
+                // REMOVED: Banks balance is now calculated live from GL/journal lines
             }
             if (toBankId) {
-                yield connection.query('UPDATE banks SET balance = balance + ? WHERE id = ?', [toAmount, toBankId]);
+                // REMOVED: Banks balance is now calculated live from GL/journal lines
             }
             yield connection.commit();
             yield (0, auditController_1.logAction)(user, 'CURRENCY_TRANSACTIONS', 'CREATE', `Currency exchange: ${fromAmount} ${fromCurrency} → ${toAmount.toFixed(2)} ${toCurrency}`, JSON.stringify({ fromAmount, fromCurrency, toAmount, toCurrency, exchangeRate }));

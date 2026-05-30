@@ -8,34 +8,20 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-const promise_1 = __importDefault(require("mysql2/promise"));
-const dotenv_1 = __importDefault(require("dotenv"));
-dotenv_1.default.config();
-function checkEntry() {
+const db_js_1 = require("./db.js");
+function checkDb() {
     return __awaiter(this, void 0, void 0, function* () {
-        const conn = yield promise_1.default.createConnection({
-            host: 'localhost',
-            user: 'root',
-            password: 'admin123',
-            database: 'cloud_erp'
-        });
         try {
-            const id = '3c35f43a-9afd-46d4-a40c-c356e4d9d5e3';
-            const [entries] = yield conn.query('SELECT * FROM journal_entries WHERE id = ?', [id]);
-            console.log('Entries:', entries);
-            const [lines] = yield conn.query('SELECT * FROM journal_lines WHERE journalId = ?', [id]);
-            console.log('Lines:', lines);
+            const [rows] = yield db_js_1.pool.query("SELECT id, date, type, partnerName FROM invoices WHERE type = 'INVOICE_PURCHASE' ORDER BY date ASC LIMIT 10");
+            console.log("Oldest invoices:");
+            console.table(rows);
+            process.exit(0);
         }
         catch (e) {
             console.error(e);
-        }
-        finally {
-            conn.end();
+            process.exit(1);
         }
     });
 }
-checkEntry();
+checkDb();

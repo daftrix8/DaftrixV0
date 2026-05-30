@@ -19,53 +19,8 @@ const auditController_1 = require("./auditController");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const errorHandler_1 = require("../utils/errorHandler");
 const eventBus_1 = require("../utils/eventBus");
-// Run-once migration: ensure plain_password column exists
-let _plainPwColReady = false;
-const ensurePlainPasswordColumn = () => __awaiter(void 0, void 0, void 0, function* () {
-    if (_plainPwColReady)
-        return;
-    try {
-        yield db_1.pool.query('SELECT plain_password FROM users LIMIT 0');
-    }
-    catch (_a) {
-        yield db_1.pool.query('ALTER TABLE users ADD COLUMN plain_password VARCHAR(255) NULL');
-        console.log('✅ Added plain_password column to users table');
-    }
-    _plainPwColReady = true;
-});
-// Run-once migration: ensure branchId column exists
-let _branchIdColReady = false;
-const ensureBranchIdColumn = () => __awaiter(void 0, void 0, void 0, function* () {
-    if (_branchIdColReady)
-        return;
-    try {
-        yield db_1.pool.query('SELECT branchId FROM users LIMIT 0');
-    }
-    catch (_a) {
-        yield db_1.pool.query('ALTER TABLE users ADD COLUMN branchId VARCHAR(36) NULL DEFAULT NULL');
-        console.log('✅ Added branchId column to users table');
-    }
-    _branchIdColReady = true;
-});
-// Run-once migration: ensure defaultTreasuryId column exists
-let _defaultTreasuryIdColReady = false;
-const ensureDefaultTreasuryIdColumn = () => __awaiter(void 0, void 0, void 0, function* () {
-    if (_defaultTreasuryIdColReady)
-        return;
-    try {
-        yield db_1.pool.query('SELECT defaultTreasuryId FROM users LIMIT 0');
-    }
-    catch (_a) {
-        yield db_1.pool.query('ALTER TABLE users ADD COLUMN defaultTreasuryId VARCHAR(36) NULL DEFAULT NULL');
-        console.log('✅ Added defaultTreasuryId column to users table');
-    }
-    _defaultTreasuryIdColReady = true;
-});
 const getUsers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        yield ensurePlainPasswordColumn();
-        yield ensureBranchIdColumn();
-        yield ensureDefaultTreasuryIdColumn();
         // Include plain_password and branchId for admin visibility
         const [rows] = yield db_1.pool.query('SELECT id, name, email, username, plain_password, role, status, permissions, lastLogin, avatar, salesmanId, preferences, branchId, defaultTreasuryId, isHidden FROM users WHERE isHidden = FALSE OR isHidden IS NULL');
         const users = rows.map(row => (Object.assign(Object.assign({}, row), { permissions: row.permissions ? JSON.parse(row.permissions) : [], preferences: row.preferences ? (typeof row.preferences === 'string' ? JSON.parse(row.preferences) : row.preferences) : {} })));
@@ -81,8 +36,6 @@ const createUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
     var _a;
     const connection = yield (0, db_1.getConnection)();
     try {
-        yield ensurePlainPasswordColumn();
-        yield ensureBranchIdColumn();
         yield connection.beginTransaction();
         const user = req.body;
         const id = user.id || (0, crypto_1.randomUUID)();
@@ -148,8 +101,6 @@ const updateUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
     var _a;
     const connection = yield (0, db_1.getConnection)();
     try {
-        yield ensurePlainPasswordColumn();
-        yield ensureBranchIdColumn();
         yield connection.beginTransaction();
         const { id } = req.params;
         const user = req.body;

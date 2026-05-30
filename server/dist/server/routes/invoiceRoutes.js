@@ -62,7 +62,7 @@ router.get('/report-stats', (req, res) => __awaiter(void 0, void 0, void 0, func
             whereClause += ` AND i.paymentMethod = ?`;
             params.push(paymentMethod);
         }
-        const [rows] = yield conn.query(`
+        const [qtyRows] = yield conn.query(`
             SELECT 
                 COALESCE(SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN il.quantity ELSE 0 END), 0) as qtySold,
                 COALESCE(SUM(CASE WHEN i.type = 'INVOICE_PURCHASE' THEN il.quantity ELSE 0 END), 0) as qtyPurchased,
@@ -74,15 +74,39 @@ router.get('/report-stats', (req, res) => __awaiter(void 0, void 0, void 0, func
             INNER JOIN invoices i ON il.invoiceId = i.id
             ${whereClause}
         `, params);
+        const [finRows] = yield conn.query(`
+            SELECT 
+                COUNT(*) as count,
+                COALESCE(SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN i.total ELSE 0 END), 0) as totalSales,
+                COALESCE(SUM(CASE WHEN i.type = 'INVOICE_PURCHASE' THEN i.total ELSE 0 END), 0) as totalPurchases,
+                COALESCE(SUM(CASE WHEN i.type = 'RETURN_SALE' THEN i.total ELSE 0 END), 0) as totalSalesReturns,
+                COALESCE(SUM(CASE WHEN i.type = 'RETURN_PURCHASE' THEN i.total ELSE 0 END), 0) as totalPurchaseReturns,
+                SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN 1 ELSE 0 END) as salesCount,
+                SUM(CASE WHEN i.type = 'INVOICE_PURCHASE' THEN 1 ELSE 0 END) as purchaseCount,
+                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN 1 ELSE 0 END) as salesReturnCount,
+                SUM(CASE WHEN i.type = 'RETURN_PURCHASE' THEN 1 ELSE 0 END) as purchaseReturnCount
+            FROM invoices i
+            ${whereClause}
+        `, params);
         conn.release();
-        const stats = rows[0] || {};
+        const stats = qtyRows[0] || {};
+        const finStats = finRows[0] || {};
         res.json({
             qtySold: Number(stats.qtySold) || 0,
             qtyPurchased: Number(stats.qtyPurchased) || 0,
             qtyReturnedSale: Number(stats.qtyReturnedSale) || 0,
             qtyReturnedPurchase: Number(stats.qtyReturnedPurchase) || 0,
             uniqueProductsSold: Number(stats.uniqueProductsSold) || 0,
-            uniqueProductsPurchased: Number(stats.uniqueProductsPurchased) || 0
+            uniqueProductsPurchased: Number(stats.uniqueProductsPurchased) || 0,
+            count: Number(finStats.count) || 0,
+            totalSales: Number(finStats.totalSales) || 0,
+            totalPurchases: Number(finStats.totalPurchases) || 0,
+            totalSalesReturns: Number(finStats.totalSalesReturns) || 0,
+            totalPurchaseReturns: Number(finStats.totalPurchaseReturns) || 0,
+            salesCount: Number(finStats.salesCount) || 0,
+            purchaseCount: Number(finStats.purchaseCount) || 0,
+            salesReturnCount: Number(finStats.salesReturnCount) || 0,
+            purchaseReturnCount: Number(finStats.purchaseReturnCount) || 0,
         });
     }
     catch (error) {

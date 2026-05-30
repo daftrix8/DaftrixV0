@@ -1364,7 +1364,7 @@ const createAdvanceAccountingEntry = (connection, advanceId, amount, employeeId,
         if (banks[0]) {
             creditAccountId = banks[0].accountId;
             creditAccountName = banks[0].name;
-            yield connection.query('UPDATE banks SET balance = balance - ? WHERE id = ?', [amount, financialAccountId]);
+            // REMOVED: Banks balance is now calculated live from GL/journal lines
         }
     }
     else {
@@ -1504,7 +1504,7 @@ const deleteAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     for (const cl of creditLines) {
                         const [bankRows] = yield conn.query('SELECT id FROM banks WHERE accountId = ?', [cl.accountId]);
                         if (bankRows.length > 0) {
-                            yield conn.query('UPDATE banks SET balance = balance + ? WHERE id = ?', [advAmount, bankRows[0].id]);
+                            // REMOVED: Banks balance is now calculated live from GL/journal lines
                             // PERF: console.log(`🏦 Restored ${advAmount} to bank ${bankRows[0].id}`);
                         }
                     }
