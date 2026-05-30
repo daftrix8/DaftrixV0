@@ -1,0 +1,1 @@
+function i(r,n){if(Array.isArray(r))return r;if(r&&typeof r=="object"){const t=r;if(n&&Array.isArray(t[n]))return t[n];if(Array.isArray(t.data))return t.data}return[]}function A(r){return Array.isArray(r)?r:[]}export{A as e,i as t};

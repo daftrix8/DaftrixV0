@@ -11,7 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deleteSuggestion = exports.convertToOrders = exports.updateSuggestion = exports.getSuggestions = exports.generateSuggestions = exports.calculateMRP = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
 /**
  * GET /api/mrp/calculate
@@ -36,8 +36,7 @@ const calculateMRP = (req, res) => __awaiter(void 0, void 0, void 0, function* (
                 b.name as bom_name
             FROM products p
             LEFT JOIN bom b ON b.finished_product_id = p.id AND b.is_active = 1
-            WHERE p.type = 'FINISHED' 
-              AND p.is_manufactured = 1
+            WHERE (p.type = 'FINISHED' OR p.type = 'PRODUCT' OR p.type IS NULL OR p.is_manufactured = 1)
               AND b.id IS NOT NULL
             ORDER BY p.name
         `);
@@ -154,7 +153,7 @@ exports.calculateMRP = calculateMRP;
  */
 const generateSuggestions = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b, _c;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { requirements, createdBy } = req.body;
@@ -165,7 +164,7 @@ const generateSuggestions = (req, res) => __awaiter(void 0, void 0, void 0, func
         yield connection.query(`UPDATE mrp_suggestions SET status = 'REJECTED' WHERE status = 'PENDING'`);
         const suggestions = [];
         for (const req of requirements) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             yield connection.query(`
                 INSERT INTO mrp_suggestions (
                     id, product_id, product_name, product_sku, bom_id, bom_name,
@@ -282,7 +281,7 @@ exports.updateSuggestion = updateSuggestion;
  * Convert approved MRP suggestions to production orders
  */
 const convertToOrders = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { suggestionIds, warehouseId, createdBy } = req.body;
@@ -308,7 +307,7 @@ const convertToOrders = (req, res) => __awaiter(void 0, void 0, void 0, function
                 orderNum = parseInt(match[1]) + 1;
         }
         for (const suggestion of suggestions) {
-            const orderId = (0, uuid_1.v4)();
+            const orderId = (0, crypto_1.randomUUID)();
             const orderNumber = `PO-${String(orderNum++).padStart(5, '0')}`;
             // Create production order
             yield connection.query(`
@@ -351,7 +350,7 @@ const convertToOrders = (req, res) => __awaiter(void 0, void 0, void 0, function
                             work_center_id, operation_name, status
                         ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING')
                     `, [
-                        (0, uuid_1.v4)(),
+                        (0, crypto_1.randomUUID)(),
                         orderId,
                         step.id,
                         step.sequence_number,

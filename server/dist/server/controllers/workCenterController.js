@@ -87,7 +87,7 @@ const createWorkCenter = (req, res) => __awaiter(void 0, void 0, void 0, functio
             warehouseId || null,
             status || 'ACTIVE'
         ]);
-        const [result] = yield db_1.pool.query('SELECT * FROM work_centers WHERE id = ?', [id]);
+        const [result] = yield db_1.pool.query('SELECT id, code, name, description, type, capacity_per_hour, cost_per_hour, warehouse_id, status FROM work_centers WHERE id = ?', [id]);
         res.json(result[0]);
     }
     catch (error) {
@@ -128,7 +128,7 @@ const updateWorkCenter = (req, res) => __awaiter(void 0, void 0, void 0, functio
             status,
             id
         ]);
-        const [result] = yield db_1.pool.query('SELECT * FROM work_centers WHERE id = ?', [id]);
+        const [result] = yield db_1.pool.query('SELECT id, code, name, description, type, capacity_per_hour, cost_per_hour, warehouse_id, status FROM work_centers WHERE id = ?', [id]);
         res.json(result[0]);
     }
     catch (error) {

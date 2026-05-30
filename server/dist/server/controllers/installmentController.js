@@ -11,9 +11,10 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getPartnerInstallments = exports.cancelInstallmentPlan = exports.getInstallmentStats = exports.getUpcomingInstallments = exports.getOverdueInstallments = exports.payInstallment = exports.createInstallmentPlan = exports.getInstallmentPlan = exports.getInstallmentPlans = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const auditController_1 = require("./auditController");
 const errorHandler_1 = require("../utils/errorHandler");
+const eventBus_1 = require("../utils/eventBus");
 // ============================================
 // INSTALLMENT PLANS - خطط التقسيط
 // ============================================
@@ -22,6 +23,7 @@ const errorHandler_1 = require("../utils/errorHandler");
  */
 const getInstallmentPlans = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
+        const authReq = req;
         const { status, partnerId, startDate, endDate } = req.query;
         let query = `
             SELECT 
@@ -36,6 +38,13 @@ const getInstallmentPlans = (req, res) => __awaiter(void 0, void 0, void 0, func
             WHERE 1=1
         `;
         const params = [];
+        // ═══════════════════════════════════════════
+        // MANDATORY: Fiscal Year Hard Boundary
+        // ═══════════════════════════════════════════
+        if (authReq.fiscalYearFilter) {
+            query += ' AND ip.startDate >= ? AND ip.startDate <= ?';
+            params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         if (status) {
             query += ' AND ip.status = ?';
             params.push(status);
@@ -90,7 +99,7 @@ exports.getInstallmentPlan = getInstallmentPlan;
  * Create a new installment plan
  */
 const createInstallmentPlan = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         const { invoiceId, partnerId, partnerName, totalAmount, downPayment = 0, numberOfInstallments, intervalDays = 30, startDate, notes, createdBy } = req.body;
@@ -98,7 +107,7 @@ const createInstallmentPlan = (req, res) => __awaiter(void 0, void 0, void 0, fu
         if (!invoiceId || !partnerId || !totalAmount || !numberOfInstallments || !startDate) {
             return res.status(400).json({ message: 'يرجى ملء جميع الحقول المطلوبة' });
         }
-        const planId = (0, uuid_1.v4)();
+        const planId = (0, crypto_1.randomUUID)();
         const remainingAmount = totalAmount - downPayment;
         const installmentAmount = Math.round((remainingAmount / numberOfInstallments) * 100) / 100;
         // Create the plan
@@ -108,7 +117,7 @@ const createInstallmentPlan = (req, res) => __awaiter(void 0, void 0, void 0, fu
         // Create individual installments
         let currentDate = new Date(startDate);
         for (let i = 1; i <= numberOfInstallments; i++) {
-            const installmentId = (0, uuid_1.v4)();
+            const installmentId = (0, crypto_1.randomUUID)();
             // Last installment gets any rounding difference
             let amount = installmentAmount;
             if (i === numberOfInstallments) {
@@ -125,10 +134,7 @@ const createInstallmentPlan = (req, res) => __awaiter(void 0, void 0, void 0, fu
         // Log action
         yield (0, auditController_1.logAction)(createdBy || 'System', 'INSTALLMENT', 'CREATE', `إنشاء خطة تقسيط جديدة`, `الفاتورة: ${invoiceId}, المبلغ: ${totalAmount}, عدد الأقساط: ${numberOfInstallments}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'installments', updatedBy: createdBy });
-        }
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'installments', updatedBy: createdBy });
         res.status(201).json({
             message: 'تم إنشاء خطة التقسيط بنجاح',
             planId
@@ -148,7 +154,7 @@ exports.createInstallmentPlan = createInstallmentPlan;
  * Pay an installment (full or partial)
  */
 const payInstallment = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         const { id } = req.params;
@@ -186,10 +192,7 @@ const payInstallment = (req, res) => __awaiter(void 0, void 0, void 0, function*
         // Log action
         yield (0, auditController_1.logAction)(paidBy || 'System', 'INSTALLMENT', 'PAYMENT', `دفع قسط`, `رقم القسط: ${installment.installmentNumber}, المبلغ: ${amount}, الطريقة: ${paymentMethod || 'نقدي'}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'installments', updatedBy: paidBy });
-        }
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'installments', updatedBy: paidBy });
         res.json({
             message: 'تم تسجيل الدفعة بنجاح',
             newStatus,
@@ -325,7 +328,7 @@ exports.getInstallmentStats = getInstallmentStats;
  * Cancel an installment plan
  */
 const cancelInstallmentPlan = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         const { id } = req.params;

@@ -12,7 +12,8 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.calculateBOMRequirements = exports.deleteBOM = exports.updateBOM = exports.createBOM = exports.getBOMById = exports.getBOMs = void 0;
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
+const eventBus_1 = require("../utils/eventBus");
 /**
  * BOM Controller
  * Handles Bill of Materials operations
@@ -79,7 +80,15 @@ const getBOMs = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             SELECT b.*, 
                    p.name as finished_product_name,
                    p.sku as finished_product_sku,
-                   COUNT(bi.id) as items_count
+                   COUNT(bi.id) as items_count,
+                   (
+                       SELECT COALESCE(SUM(
+                           bi2.quantity_per_unit * (1 + COALESCE(bi2.waste_percent, 0) / 100) * COALESCE(p2.cost, 0)
+                       ), 0) + COALESCE(b.labor_cost, 0) + COALESCE(b.overhead_cost, 0)
+                       FROM bom_items bi2
+                       LEFT JOIN products p2 ON bi2.raw_product_id = p2.id
+                       WHERE bi2.bom_id = b.id
+                   ) as total_cost
             FROM bom b
             LEFT JOIN products p ON b.finished_product_id = p.id
             LEFT JOIN bom_items bi ON b.id = bi.bom_id
@@ -109,6 +118,7 @@ const getBOMs = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             overheadCost: row.overhead_cost,
             notes: row.notes,
             itemsCount: parseInt(row.items_count) || 0,
+            totalCost: parseFloat(row.total_cost) || 0,
             createdAt: row.created_at,
             updatedAt: row.updated_at
         }));
@@ -145,9 +155,11 @@ const getBOMById = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                    p.sku as raw_product_sku,
                    p.unit as raw_product_unit,
                    p.stock as current_stock,
-                   p.cost as unit_cost
+                   p.cost as unit_cost,
+                   sup.name as supplier_name
             FROM bom_items bi
             LEFT JOIN products p ON bi.raw_product_id = p.id
+            LEFT JOIN partners sup ON bi.supplier_id = sup.id
             WHERE bi.bom_id = ?
             ORDER BY bi.id
         `, [id]);
@@ -177,7 +189,9 @@ const getBOMById = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 wastePercent: parseFloat(item.waste_percent) || 0,
                 currentStock: parseFloat(item.current_stock) || 0,
                 unitCost: parseFloat(item.unit_cost) || 0,
-                notes: item.notes
+                notes: item.notes,
+                supplierId: item.supplier_id || null,
+                supplierName: item.supplier_name || null
             }))
         };
         res.json(bom);
@@ -190,20 +204,26 @@ const getBOMById = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
 exports.getBOMById = getBOMById;
 // Create new BOM
 const createBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id: reqId, finishedProductId, name, laborCost, overheadCost, notes, items } = req.body;
         // Generate ID if not provided
-        const id = reqId || (0, uuid_1.v4)();
-        // Validate finished product exists and is type FINISHED
-        const [productRows] = yield connection.query('SELECT id, type FROM products WHERE id = ?', [finishedProductId]);
+        const id = reqId || (0, crypto_1.randomUUID)();
+        // Validate finished product exists and is a manufacturable type
+        // Accepts: FINISHED, PRODUCT (default type), null/empty type, or isManufactured flag
+        // This mirrors the frontend filter: p.type === 'FINISHED' || p.type === 'PRODUCT' || p.isManufactured || !p.type
+        const [productRows] = yield connection.query('SELECT id, type, isManufactured FROM products WHERE id = ?', [finishedProductId]);
         if (productRows.length === 0) {
             throw new Error('Finished product not found');
         }
         const product = productRows[0];
-        if (product.type !== 'FINISHED') {
-            throw new Error('Product must be of type FINISHED');
+        const isManufacturable = !product.type || // null/empty type (default products)
+            product.type === 'FINISHED' ||
+            product.type === 'PRODUCT' ||
+            product.isManufactured;
+        if (!isManufacturable) {
+            throw new Error('هذا المنتج لا يمكن تصنيعه. يرجى تحديد نوع المنتج كـ "منتج نهائي" من إدارة المنتجات.');
         }
         // Insert BOM header
         yield connection.query(`
@@ -219,14 +239,15 @@ const createBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
                     throw new Error(`Raw product ${item.rawProductId} not found`);
                 }
                 yield connection.query(`
-                    INSERT INTO bom_items (bom_id, raw_product_id, quantity_per_unit, waste_percent, notes)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO bom_items (bom_id, raw_product_id, quantity_per_unit, waste_percent, notes, supplier_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 `, [
                     id,
                     item.rawProductId,
                     item.quantityPerUnit,
                     item.wastePercent || 0,
-                    item.notes || null
+                    item.notes || null,
+                    item.supplierId || null
                 ]);
             }
         }
@@ -235,22 +256,19 @@ const createBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         const costUpdate = yield calculateAndUpdateProductCost(id);
         // Broadcast real-time update via WebSocket if cost was updated
         if (costUpdate) {
-            const io = req.app.get('io');
-            if (io) {
-                io.emit('product:cost_updated', {
-                    productId: costUpdate.productId,
-                    materialCost: costUpdate.materialCost,
-                    laborCost: costUpdate.laborCost,
-                    overheadCost: costUpdate.overheadCost,
-                    totalCost: costUpdate.totalCost,
-                    bomId: id,
-                    updatedAt: new Date().toISOString()
-                });
-                io.emit('entity:changed', {
-                    entityType: 'products',
-                    updatedBy: 'BOM Auto-Cost'
-                });
-            }
+            eventBus_1.eventBus.broadcast('product:cost_updated', {
+                productId: costUpdate.productId,
+                materialCost: costUpdate.materialCost,
+                laborCost: costUpdate.laborCost,
+                overheadCost: costUpdate.overheadCost,
+                totalCost: costUpdate.totalCost,
+                bomId: id,
+                updatedAt: new Date().toISOString()
+            });
+            eventBus_1.eventBus.broadcast('entity:changed', {
+                entityType: 'products',
+                updatedBy: 'BOM Auto-Cost'
+            });
         }
         // Return created BOM with items
         const [result] = yield db_1.pool.query(`
@@ -274,7 +292,7 @@ const createBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
 exports.createBOM = createBOM;
 // Update BOM
 const updateBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
@@ -301,14 +319,15 @@ const updateBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             // Insert new items
             for (const item of items) {
                 yield connection.query(`
-                    INSERT INTO bom_items (bom_id, raw_product_id, quantity_per_unit, waste_percent, notes)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO bom_items (bom_id, raw_product_id, quantity_per_unit, waste_percent, notes, supplier_id)
+                    VALUES (?, ?, ?, ?, ?, ?)
                 `, [
                     id,
                     item.rawProductId,
                     item.quantityPerUnit,
                     item.wastePercent || 0,
-                    item.notes || null
+                    item.notes || null,
+                    item.supplierId || null
                 ]);
             }
         }
@@ -317,22 +336,19 @@ const updateBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         const costUpdate = yield calculateAndUpdateProductCost(id);
         // Broadcast real-time update via WebSocket if cost was updated
         if (costUpdate) {
-            const io = req.app.get('io');
-            if (io) {
-                io.emit('product:cost_updated', {
-                    productId: costUpdate.productId,
-                    materialCost: costUpdate.materialCost,
-                    laborCost: costUpdate.laborCost,
-                    overheadCost: costUpdate.overheadCost,
-                    totalCost: costUpdate.totalCost,
-                    bomId: id,
-                    updatedAt: new Date().toISOString()
-                });
-                io.emit('entity:changed', {
-                    entityType: 'products',
-                    updatedBy: 'BOM Auto-Cost'
-                });
-            }
+            eventBus_1.eventBus.broadcast('product:cost_updated', {
+                productId: costUpdate.productId,
+                materialCost: costUpdate.materialCost,
+                laborCost: costUpdate.laborCost,
+                overheadCost: costUpdate.overheadCost,
+                totalCost: costUpdate.totalCost,
+                bomId: id,
+                updatedAt: new Date().toISOString()
+            });
+            eventBus_1.eventBus.broadcast('entity:changed', {
+                entityType: 'products',
+                updatedBy: 'BOM Auto-Cost'
+            });
         }
         // Return updated BOM
         const [result] = yield db_1.pool.query('SELECT * FROM bom WHERE id = ?', [id]);
@@ -350,23 +366,60 @@ const updateBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
 exports.updateBOM = updateBOM;
 // Delete BOM
 const deleteBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const connection = yield (0, db_1.getConnection)();
     try {
         const { id } = req.params;
-        // Check if BOM is used in production orders
-        const [orderRows] = yield db_1.pool.query('SELECT COUNT(*) as count FROM production_orders WHERE bom_id = ?', [id]);
-        const count = orderRows[0].count;
-        if (count > 0) {
-            // Can't delete, just deactivate
-            yield db_1.pool.query('UPDATE bom SET is_active = 0 WHERE id = ?', [id]);
-            return res.json({ message: 'BOM deactivated (used in production orders)', deactivated: true });
+        const force = req.query.force === 'true';
+        yield connection.beginTransaction();
+        // Check if BOM is used in ACTIVE production orders (not draft/cancelled)
+        let hasActiveOrders = false;
+        let activeOrderCount = 0;
+        try {
+            const [orderRows] = yield connection.query(`SELECT COUNT(*) as count FROM production_orders 
+                 WHERE bom_id = ? AND status NOT IN ('DRAFT', 'CANCELLED')`, [id]);
+            activeOrderCount = orderRows[0].count;
+            hasActiveOrders = activeOrderCount > 0;
         }
-        // Safe to delete
-        yield db_1.pool.query('DELETE FROM bom WHERE id = ?', [id]);
-        res.json({ message: 'BOM deleted successfully' });
+        catch (_b) {
+            // production_orders table might not exist — safe to delete
+        }
+        if (hasActiveOrders && !force) {
+            yield connection.rollback();
+            return res.status(409).json({
+                message: `لا يمكن حذف هذه القائمة - مرتبطة بـ ${activeOrderCount} أمر تصنيع نشط. استخدم الحذف القسري أو احذف أوامر التصنيع أولاً.`,
+                message_en: `Cannot delete BOM — it is used in ${activeOrderCount} active production orders. Use force delete or remove production orders first.`,
+                hasActiveOrders: true
+            });
+        }
+        // Clear BOM reference from ALL production orders before deletion
+        // This prevents FK constraint errors regardless of order status
+        try {
+            yield connection.query('UPDATE production_orders SET bom_id = NULL WHERE bom_id = ?', [id]);
+        }
+        catch ( /* table might not exist */_c) { /* table might not exist */ }
+        // Clear bomId reference from products table
+        yield connection.query('UPDATE products SET bomId = NULL WHERE bomId = ?', [id]).catch(() => { });
+        // Delete BOM items first (foreign key), then BOM
+        yield connection.query('DELETE FROM bom_items WHERE bom_id = ?', [id]);
+        yield connection.query('DELETE FROM bom WHERE id = ?', [id]);
+        yield connection.commit();
+        res.json({ message: 'تم حذف قائمة المواد بنجاح', deleted: true });
     }
     catch (error) {
+        yield connection.rollback();
         console.error('Error deleting BOM:', error);
+        // User-friendly FK constraint error
+        if (error.code === 'ER_ROW_IS_REFERENCED_2' || ((_a = error.message) === null || _a === void 0 ? void 0 : _a.includes('foreign key constraint'))) {
+            return res.status(409).json({
+                message: 'لا يمكن حذف قائمة المواد - مرتبطة بسجلات أخرى (أوامر تصنيع أو منتجات). يرجى حذف السجلات المرتبطة أولاً.',
+                message_en: 'Cannot delete BOM — it is referenced by other records. Delete related production orders first.'
+            });
+        }
         return (0, errorHandler_1.handleControllerError)(res, error, 'operation');
+    }
+    finally {
+        connection.release();
     }
 });
 exports.deleteBOM = deleteBOM;

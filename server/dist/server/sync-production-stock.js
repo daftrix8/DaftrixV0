@@ -20,7 +20,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.syncProductionStock = syncProductionStock;
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 function syncProductionStock() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
@@ -78,7 +78,7 @@ function syncProductionStock() {
                     const globalStock = ((_a = productRow[0]) === null || _a === void 0 ? void 0 : _a.stock) || 0;
                     // Create product_stocks entry with current global stock
                     // (The production changes are already reflected in global stock)
-                    yield connection.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, uuid_1.v4)(), productId, warehouseId, globalStock]);
+                    yield connection.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), productId, warehouseId, globalStock]);
                     console.log(`   ➕ Created stock record: Product ${productId.substring(0, 8)}... @ Warehouse ${warehouseId.substring(0, 8)}... = ${globalStock}`);
                     created++;
                 }

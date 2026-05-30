@@ -11,7 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.rejectAdjustment = exports.approveAdjustment = exports.getPendingAdjustments = exports.applyAdjustmentToPayroll = exports.createRetroactiveAdjustment = exports.calculateRetroactiveAdjustment = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 /**
  * Calculate retroactive adjustment for salary change
  * When an employee's salary is increased/decreased effective from a past date,
@@ -86,7 +86,7 @@ exports.calculateRetroactiveAdjustment = calculateRetroactiveAdjustment;
  * Create a retroactive adjustment record and optionally apply to current payroll
  */
 const createRetroactiveAdjustment = (calculation_1, currentPayrollCycleId_1, createdBy_1, ...args_1) => __awaiter(void 0, [calculation_1, currentPayrollCycleId_1, createdBy_1, ...args_1], void 0, function* (calculation, currentPayrollCycleId, createdBy, applyImmediately = false) {
-    const id = (0, uuid_1.v4)();
+    const id = (0, crypto_1.randomUUID)();
     yield db_1.pool.query(`
     INSERT INTO payroll_adjustments 
     (id, employeeId, payrollCycleId, adjustmentType, reason, amount, affectedMonths, breakdown, status, createdBy)

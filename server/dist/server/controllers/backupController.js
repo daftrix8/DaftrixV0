@@ -65,13 +65,20 @@ const schedule = __importStar(require("node-schedule"));
 const nodemailer = __importStar(require("nodemailer"));
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
+const fsSync = __importStar(require("fs"));
 const execAsync = (0, util_1.promisify)(child_process_1.exec);
+const execFileAsync = (0, util_1.promisify)(child_process_1.execFile);
+// Validate filename to prevent path traversal (H9 security fix)
+const SAFE_FILENAME_REGEX = /^[a-zA-Z0-9_\-]+\.sql\.gz$/;
+function isValidBackupFilename(filename) {
+    return SAFE_FILENAME_REGEX.test(filename) && !filename.includes('..');
+}
 // Configuration
 const BACKUP_DIR = path.join(__dirname, '../../backups');
 const DB_HOST = process.env.DB_HOST || 'localhost';
 const DB_PORT = process.env.DB_PORT || '3306';
 const DB_USER = process.env.DB_USER || 'root';
-const DB_PASSWORD = process.env.DB_PASSWORD || 'admin123';
+const DB_PASSWORD = process.env.DB_PASSWORD || '';
 const DB_NAME = process.env.DB_NAME || 'cloud_erp';
 const MAX_BACKUPS = 10; // Keep last 10 backups
 // Cache backup directory from settings
@@ -161,12 +168,14 @@ function getMySQLCommand(command) {
 // Ensure backup directory exists
 function ensureBackupDir() {
     return __awaiter(this, void 0, void 0, function* () {
-        const backupDir = yield getBackupDir();
+        const rawDir = yield getBackupDir();
+        // Normalize: resolve UNC/relative artifacts from __dirname on Windows hosting
+        const backupDir = path.resolve(rawDir);
         try {
             yield fs.mkdir(backupDir, { recursive: true });
         }
         catch (err) {
-            console.error('Failed to create backup directory:', err);
+            console.error(`Failed to create backup directory "${backupDir}" (raw: "${rawDir}"):`, err);
         }
         return backupDir;
     });
@@ -176,7 +185,256 @@ function getBackupFilename() {
     const timestamp = new Date().toISOString().replace(/[:.]/g, '-').split('T');
     return `${DB_NAME}-${timestamp[0]}_${timestamp[1].split('Z')[0]}.sql.gz`;
 }
-// Create backup
+// ═══════════════════════════════════════════════════════════════════════════════
+// PURE-JS SQL DUMP — works on Hostinger & any hosting without mysqldump binary
+// ═══════════════════════════════════════════════════════════════════════════════
+// Check if mysqldump binary is available
+function isMySQLDumpAvailable() {
+    try {
+        const cmd = getMySQLCommand('mysqldump');
+        if (process.platform === 'win32') {
+            (0, child_process_1.execSync)(`where "${cmd}"`, { stdio: 'ignore' });
+        }
+        else {
+            (0, child_process_1.execSync)(`which "${cmd}"`, { stdio: 'ignore' });
+        }
+        return true;
+    }
+    catch (_a) {
+        return false;
+    }
+}
+// Escape a SQL value for safe insertion
+function escapeSQLValue(val, columnType) {
+    if (val === null || val === undefined)
+        return 'NULL';
+    if (typeof val === 'number')
+        return String(val);
+    if (typeof val === 'boolean')
+        return val ? '1' : '0';
+    if (val instanceof Date) {
+        return `'${val.toISOString().slice(0, 19).replace('T', ' ')}'`;
+    }
+    if (Buffer.isBuffer(val)) {
+        return `X'${val.toString('hex')}'`;
+    }
+    // JSON columns — stringify objects
+    if (typeof val === 'object') {
+        const jsonStr = JSON.stringify(val);
+        return `'${jsonStr.replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+    }
+    // String values — escape special chars
+    const str = String(val);
+    return `'${str
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "\\'")
+        .replace(/\n/g, '\\n')
+        .replace(/\r/g, '\\r')
+        .replace(/\x00/g, '\\0')
+        .replace(/\x1a/g, '\\Z')}'`;
+}
+const BATCH_SIZE = 1000; // Rows per SELECT batch
+// Generate a complete SQL dump using only the MySQL connection pool
+function generatePureJSDump(sqlFilePath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b, _c;
+        const conn = yield (0, db_1.getConnection)();
+        const writeStream = fsSync.createWriteStream(sqlFilePath, { encoding: 'utf8' });
+        const writeLine = (line) => {
+            writeStream.write(line + '\n');
+        };
+        try {
+            // Header
+            writeLine('-- Cloud ERP Pure-JS Database Backup');
+            writeLine(`-- Generated: ${new Date().toISOString()}`);
+            writeLine(`-- Database: ${DB_NAME}`);
+            writeLine('');
+            writeLine('SET NAMES utf8mb4;');
+            writeLine('SET FOREIGN_KEY_CHECKS = 0;');
+            writeLine('SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";');
+            writeLine('SET AUTOCOMMIT = 0;');
+            writeLine('START TRANSACTION;');
+            writeLine('');
+            writeLine(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
+            writeLine(`USE \`${DB_NAME}\`;`);
+            writeLine('');
+            // Get all tables
+            const [tableRows] = yield conn.query('SHOW TABLES');
+            const tables = tableRows.map(row => Object.values(row)[0]);
+            console.log(`📦 Pure-JS backup: ${tables.length} tables to dump`);
+            for (const tableName of tables) {
+                console.log(`  📄 Dumping: ${tableName}`);
+                // Get CREATE TABLE statement
+                const [createRows] = yield conn.query(`SHOW CREATE TABLE \`${tableName}\``);
+                const createStatement = ((_a = createRows[0]) === null || _a === void 0 ? void 0 : _a['Create Table'])
+                    || ((_b = createRows[0]) === null || _b === void 0 ? void 0 : _b['Create View']);
+                if (!createStatement)
+                    continue;
+                const isView = !!((_c = createRows[0]) === null || _c === void 0 ? void 0 : _c['Create View']);
+                writeLine('-- -------------------------------------------');
+                writeLine(`-- Table: ${tableName}`);
+                writeLine('-- -------------------------------------------');
+                writeLine('');
+                if (isView) {
+                    writeLine(`DROP VIEW IF EXISTS \`${tableName}\`;`);
+                    writeLine(`${createStatement};`);
+                }
+                else {
+                    writeLine(`DROP TABLE IF EXISTS \`${tableName}\`;`);
+                    writeLine(`${createStatement};`);
+                    // Get column info for type-aware escaping
+                    const [colRows] = yield conn.query(`SHOW COLUMNS FROM \`${tableName}\``);
+                    const columns = colRows.map(c => ({
+                        name: c.Field,
+                        type: c.Type
+                    }));
+                    const columnNames = columns.map(c => `\`${c.name}\``).join(', ');
+                    // Dump data in batches
+                    let offset = 0;
+                    let hasData = true;
+                    while (hasData) {
+                        const [rows] = yield conn.query(`SELECT * FROM \`${tableName}\` LIMIT ${BATCH_SIZE} OFFSET ${offset}`);
+                        const dataRows = rows;
+                        if (dataRows.length === 0) {
+                            hasData = false;
+                            break;
+                        }
+                        // Build INSERT statement with multiple value tuples
+                        const valueSets = [];
+                        for (const row of dataRows) {
+                            const values = columns.map(col => escapeSQLValue(row[col.name], col.type));
+                            valueSets.push(`(${values.join(', ')})`);
+                        }
+                        writeLine(`INSERT INTO \`${tableName}\` (${columnNames}) VALUES`);
+                        writeLine(valueSets.join(',\n') + ';');
+                        offset += BATCH_SIZE;
+                        if (dataRows.length < BATCH_SIZE) {
+                            hasData = false;
+                        }
+                    }
+                }
+                writeLine('');
+            }
+            // Footer
+            writeLine('COMMIT;');
+            writeLine('SET FOREIGN_KEY_CHECKS = 1;');
+            writeLine('');
+            writeLine('-- End of backup');
+            // Close the write stream
+            yield new Promise((resolve, reject) => {
+                writeStream.end(() => resolve());
+                writeStream.on('error', reject);
+            });
+            console.log(`✅ Pure-JS backup SQL written to: ${sqlFilePath}`);
+        }
+        finally {
+            conn.release();
+        }
+    });
+}
+// Restore a SQL dump file using the connection pool (no mysql binary needed)
+function restorePureJS(sqlContent) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const conn = yield (0, db_1.getConnection)();
+        try {
+            // Split into individual statements
+            // Handle multi-line statements by splitting on ;\n boundaries
+            const statements = splitSQLStatements(sqlContent);
+            console.log(`🔄 Pure-JS restore: ${statements.length} statements to execute`);
+            let executed = 0;
+            let skipped = 0;
+            for (const stmt of statements) {
+                const trimmed = stmt.trim();
+                if (!trimmed || trimmed.startsWith('--')) {
+                    skipped++;
+                    continue;
+                }
+                try {
+                    yield conn.query(trimmed);
+                    executed++;
+                    // Log progress every 100 statements
+                    if (executed % 100 === 0) {
+                        console.log(`  📊 Restored ${executed}/${statements.length} statements...`);
+                    }
+                }
+                catch (err) {
+                    // Skip non-fatal errors (duplicate key, table exists, etc.)
+                    const isFatal = err.code === 'ER_SYNTAX_ERROR';
+                    if (isFatal) {
+                        console.error(`❌ Fatal SQL error at statement ${executed}:`, err.message);
+                        console.error(`   Statement: ${trimmed.substring(0, 200)}...`);
+                        throw err;
+                    }
+                    // Non-fatal: log and continue
+                    console.warn(`⚠️ Non-fatal: ${err.message.substring(0, 100)}`);
+                    skipped++;
+                }
+            }
+            console.log(`✅ Pure-JS restore complete: ${executed} executed, ${skipped} skipped`);
+        }
+        finally {
+            conn.release();
+        }
+    });
+}
+// Split SQL content into individual statements, respecting string literals
+function splitSQLStatements(sql) {
+    const statements = [];
+    let current = '';
+    let inString = false;
+    let stringChar = '';
+    let escaped = false;
+    for (let i = 0; i < sql.length; i++) {
+        const char = sql[i];
+        if (escaped) {
+            current += char;
+            escaped = false;
+            continue;
+        }
+        if (char === '\\') {
+            current += char;
+            escaped = true;
+            continue;
+        }
+        if (inString) {
+            current += char;
+            if (char === stringChar) {
+                inString = false;
+            }
+            continue;
+        }
+        if (char === "'" || char === '"') {
+            inString = true;
+            stringChar = char;
+            current += char;
+            continue;
+        }
+        // Skip single-line comments
+        if (char === '-' && sql[i + 1] === '-') {
+            const newlineIdx = sql.indexOf('\n', i);
+            if (newlineIdx === -1)
+                break;
+            i = newlineIdx;
+            continue;
+        }
+        if (char === ';') {
+            const trimmed = current.trim();
+            if (trimmed) {
+                statements.push(trimmed);
+            }
+            current = '';
+            continue;
+        }
+        current += char;
+    }
+    // Don't forget the last statement if no trailing semicolon
+    const lastTrimmed = current.trim();
+    if (lastTrimmed) {
+        statements.push(lastTrimmed);
+    }
+    return statements;
+}
+// Create backup (mysqldump with automatic pure-JS fallback)
 function createBackup(req, res) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
@@ -184,20 +442,34 @@ function createBackup(req, res) {
             const filename = getBackupFilename();
             const sqlFile = path.join(backupDir, filename.replace('.gz', ''));
             const gzFile = path.join(backupDir, filename);
-            // Get mysqldump command path
-            const mysqldumpCmd = getMySQLCommand('mysqldump');
-            // Build mysqldump command
-            const cmd = `"${mysqldumpCmd}" -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p"${DB_PASSWORD}" ` +
-                `--single-transaction --routines --triggers --events ` +
-                `--add-drop-database --add-drop-table --complete-insert ` +
-                `--hex-blob --set-charset --databases ${DB_NAME} > "${sqlFile}"`;
-            // Execute mysqldump
-            yield execAsync(cmd, {
-                env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
-                maxBuffer: 50 * 1024 * 1024 // 50MB buffer
-            });
-            // Compress the SQL file
-            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)(), (0, fs_1.createWriteStream)(gzFile));
+            // Try mysqldump first, fall back to pure-JS if unavailable
+            const hasMysqlDump = isMySQLDumpAvailable();
+            if (hasMysqlDump) {
+                console.log('📦 Using mysqldump for backup');
+                const mysqldumpCmd = getMySQLCommand('mysqldump');
+                const dumpArgs = [
+                    '-h', DB_HOST,
+                    '-P', DB_PORT,
+                    '-u', DB_USER,
+                    '--single-transaction', '--routines', '--triggers', '--events',
+                    '--add-drop-database', '--add-drop-table',
+                    '--quick', '--extended-insert',
+                    '--net-buffer-length=1048576', '--max-allowed-packet=512M',
+                    '--hex-blob', '--set-charset', '--skip-comments',
+                    '--result-file', sqlFile,
+                    '--databases', DB_NAME
+                ];
+                yield execFileAsync(mysqldumpCmd, dumpArgs, {
+                    env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
+                    maxBuffer: 50 * 1024 * 1024
+                });
+            }
+            else {
+                console.log('📦 mysqldump not found — using pure-JS backup');
+                yield generatePureJSDump(sqlFile);
+            }
+            // Compress the SQL file (level 9 = max compression)
+            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)({ level: 9 }), (0, fs_1.createWriteStream)(gzFile));
             // Delete uncompressed SQL file
             yield fs.unlink(sqlFile);
             // Get file stats
@@ -213,7 +485,8 @@ function createBackup(req, res) {
                 success: true,
                 filename,
                 size: stats.size,
-                created: stats.mtime
+                created: stats.mtime,
+                method: hasMysqlDump ? 'mysqldump' : 'pure-js'
             });
         }
         catch (error) {
@@ -255,22 +528,29 @@ function downloadBackup(req, res) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
             const { filename } = req.params;
-            // Validate filename (prevent path traversal)
-            if (!filename || filename.includes('..') || !filename.endsWith('.sql.gz')) {
+            // Strict filename validation (H9 security fix)
+            if (!filename || !isValidBackupFilename(filename)) {
                 return res.status(400).json({ success: false, error: 'Invalid filename' });
             }
             const backupDir = yield getBackupDir();
-            const filepath = path.join(backupDir, filename);
+            const filepath = path.resolve(backupDir, filename);
+            // Ensure resolved path is within backup directory (prevent path traversal)
+            if (!filepath.startsWith(path.resolve(backupDir))) {
+                return res.status(400).json({ success: false, error: 'Invalid path' });
+            }
             // Check if file exists
+            let stats;
             try {
-                yield fs.access(filepath);
+                stats = yield fs.stat(filepath);
             }
             catch (_a) {
                 return res.status(404).json({ success: false, error: 'Backup not found' });
             }
-            // Send file
+            // Send file — disable timeout for large downloads
+            res.setTimeout(0);
             res.setHeader('Content-Type', 'application/gzip');
-            res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+            res.setHeader('Content-Length', stats.size);
+            res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filepath)}"`);
             const fileStream = (0, fs_1.createReadStream)(filepath);
             fileStream.pipe(res);
         }
@@ -280,18 +560,23 @@ function downloadBackup(req, res) {
         }
     });
 }
-// Restore backup
+// Restore backup — mysql binary with pure-JS fallback
 function restoreBackup(req, res) {
     return __awaiter(this, void 0, void 0, function* () {
+        if (res.headersSent)
+            return;
         try {
             const { filename } = req.params;
-            // Validate filename
-            if (!filename || filename.includes('..') || !filename.endsWith('.sql.gz')) {
+            // Strict filename validation (H9 security fix)
+            if (!filename || !isValidBackupFilename(filename)) {
                 return res.status(400).json({ success: false, error: 'Invalid filename' });
             }
             const backupDir = yield getBackupDir();
-            const gzFile = path.join(backupDir, filename);
-            const sqlFile = gzFile.replace('.gz', '');
+            const gzFile = path.resolve(backupDir, filename);
+            // Ensure resolved path is within backup directory
+            if (!gzFile.startsWith(path.resolve(backupDir))) {
+                return res.status(400).json({ success: false, error: 'Invalid path' });
+            }
             // Check if file exists
             try {
                 yield fs.access(gzFile);
@@ -299,24 +584,109 @@ function restoreBackup(req, res) {
             catch (_a) {
                 return res.status(404).json({ success: false, error: 'Backup not found' });
             }
-            // Decompress
-            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(gzFile), (0, zlib_1.createGunzip)(), (0, fs_1.createWriteStream)(sqlFile));
-            // Get mysql command path
-            const mysqlCmd = getMySQLCommand('mysql');
-            // Build mysql restore command
-            const cmd = `"${mysqlCmd}" -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p"${DB_PASSWORD}" < "${sqlFile}"`;
-            // Execute restore
-            yield execAsync(cmd, {
-                env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
-                maxBuffer: 50 * 1024 * 1024
+            // Check if mysql binary is available
+            let hasMySQLBinary = false;
+            try {
+                const mysqlCmd = getMySQLCommand('mysql');
+                if (process.platform === 'win32') {
+                    (0, child_process_1.execSync)(`where "${mysqlCmd}"`, { stdio: 'ignore' });
+                }
+                else {
+                    (0, child_process_1.execSync)(`which "${mysqlCmd}"`, { stdio: 'ignore' });
+                }
+                hasMySQLBinary = true;
+            }
+            catch (_b) {
+                hasMySQLBinary = false;
+            }
+            if (hasMySQLBinary) {
+                console.log('🔄 Using mysql binary for restore');
+                const mysqlCmd = getMySQLCommand('mysql');
+                const restoreArgs = [
+                    '-h', DB_HOST,
+                    '-P', DB_PORT,
+                    '-u', DB_USER,
+                    '--max-allowed-packet=512M',
+                    '--force',
+                    'mysql'
+                ];
+                const TURBO_PREAMBLE = Buffer.from('SET autocommit=0;\n');
+                const TURBO_EPILOGUE = Buffer.from('\nCOMMIT;\nSET autocommit=1;\n');
+                yield new Promise((resolve, reject) => {
+                    const proc = require('child_process').spawn(mysqlCmd, restoreArgs, {
+                        env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
+                        stdio: ['pipe', 'ignore', 'pipe']
+                    });
+                    let stderrData = '';
+                    proc.stderr.on('data', (d) => { stderrData += d.toString(); });
+                    proc.on('close', (code) => {
+                        if (code !== 0) {
+                            const errors = stderrData.split('\n').filter((l) => l.includes('ERROR')).join('\n');
+                            reject(new Error(errors || stderrData));
+                        }
+                        else {
+                            resolve();
+                        }
+                    });
+                    proc.on('error', reject);
+                    proc.stdin.write(TURBO_PREAMBLE);
+                    const gunzip = (0, zlib_1.createGunzip)();
+                    const fileStream = (0, fs_1.createReadStream)(gzFile);
+                    gunzip.on('data', (chunk) => proc.stdin.write(chunk));
+                    gunzip.on('end', () => {
+                        proc.stdin.write(TURBO_EPILOGUE);
+                        proc.stdin.end();
+                    });
+                    gunzip.on('error', reject);
+                    fileStream.on('error', reject);
+                    fileStream.pipe(gunzip);
+                });
+            }
+            else {
+                // Pure-JS fallback: decompress then execute via connection pool
+                console.log('🔄 mysql binary not found — using pure-JS restore');
+                const sqlContent = yield new Promise((resolve, reject) => {
+                    const chunks = [];
+                    const gunzip = (0, zlib_1.createGunzip)();
+                    const fileStream = (0, fs_1.createReadStream)(gzFile);
+                    gunzip.on('data', (chunk) => chunks.push(chunk));
+                    gunzip.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+                    gunzip.on('error', reject);
+                    fileStream.on('error', reject);
+                    fileStream.pipe(gunzip);
+                });
+                yield restorePureJS(sqlContent);
+            }
+            res.json({
+                success: true,
+                message: 'Database restored successfully',
+                method: hasMySQLBinary ? 'mysql-binary' : 'pure-js'
             });
-            // Delete temporary SQL file
-            yield fs.unlink(sqlFile);
-            res.json({ success: true, message: 'Database restored successfully' });
         }
         catch (error) {
             console.error('Restore failed:', error);
             return (0, errorHandler_1.handleControllerError)(res, error, 'restoreBackup');
+        }
+    });
+}
+// Helper to move file to recycle bin on Windows
+function moveToRecycleBin(filepath) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (process.platform === 'win32') {
+            // Use PowerShell to move to Recycle Bin
+            // We use VisualBasic.FileIO.FileSystem.DeleteFile which supports sending to Recycle Bin
+            const command = `powershell.exe -Command "Add-Type -AssemblyName Microsoft.VisualBasic; [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('${filepath}', 'OnlyErrorDialogs', 'SendToRecycleBin')"`;
+            try {
+                yield execAsync(command);
+            }
+            catch (error) {
+                console.error('Failed to move to recycle bin, falling back to permanent delete:', error);
+                yield fs.unlink(filepath);
+            }
+        }
+        else {
+            // Fallback for non-Windows (permanent delete)
+            yield fs.unlink(filepath);
         }
     });
 }
@@ -325,12 +695,16 @@ function deleteBackup(req, res) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
             const { filename } = req.params;
-            // Validate filename
-            if (!filename || filename.includes('..') || !filename.endsWith('.sql.gz')) {
+            // Strict filename validation (H9 security fix)
+            if (!filename || !isValidBackupFilename(filename)) {
                 return res.status(400).json({ success: false, error: 'Invalid filename' });
             }
             const backupDir = yield getBackupDir();
-            const filepath = path.join(backupDir, filename);
+            const filepath = path.resolve(backupDir, filename);
+            // Ensure resolved path is within backup directory
+            if (!filepath.startsWith(path.resolve(backupDir))) {
+                return res.status(400).json({ success: false, error: 'Invalid path' });
+            }
             // Check if file exists
             try {
                 yield fs.access(filepath);
@@ -338,8 +712,8 @@ function deleteBackup(req, res) {
             catch (_a) {
                 return res.status(404).json({ success: false, error: 'Backup not found' });
             }
-            // Delete file
-            yield fs.unlink(filepath);
+            // Move to recycle bin instead of permanent delete
+            yield moveToRecycleBin(filepath);
             res.json({ success: true, message: 'Backup deleted successfully' });
         }
         catch (error) {
@@ -368,8 +742,8 @@ function rotateBackups() {
             // Delete old backups
             const toDelete = backups.slice(0, Math.max(0, backups.length - maxBackups));
             for (const backup of toDelete) {
-                yield fs.unlink(backup.filepath);
-                console.log(`Rotated old backup: ${backup.filename}`);
+                yield moveToRecycleBin(backup.filepath);
+                console.log(`Rotated old backup (Recycle Bin): ${backup.filename}`);
             }
         }
         catch (error) {
@@ -465,16 +839,23 @@ function createScheduledBackup() {
             const filename = getBackupFilename();
             const sqlFile = path.join(backupDir, filename.replace('.gz', ''));
             const gzFile = path.join(backupDir, filename);
-            const mysqldumpCmd = getMySQLCommand('mysqldump');
-            const cmd = `"${mysqldumpCmd}" -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p"${DB_PASSWORD}" ` +
-                `--single-transaction --routines --triggers --events ` +
-                `--add-drop-database --add-drop-table --complete-insert ` +
-                `--hex-blob --set-charset --databases ${DB_NAME} > "${sqlFile}"`;
-            yield execAsync(cmd, {
-                env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
-                maxBuffer: 50 * 1024 * 1024
-            });
-            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)(), (0, fs_1.createWriteStream)(gzFile));
+            const hasMysqlDump = isMySQLDumpAvailable();
+            if (hasMysqlDump) {
+                const mysqldumpCmd = getMySQLCommand('mysqldump');
+                const cmd = `"${mysqldumpCmd}" -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p"${DB_PASSWORD}" ` +
+                    `--single-transaction --routines --triggers --events ` +
+                    `--add-drop-database --add-drop-table ` +
+                    `--quick --extended-insert --net-buffer-length=1048576 --max-allowed-packet=512M ` +
+                    `--hex-blob --set-charset --skip-comments --databases ${DB_NAME} > "${sqlFile}"`;
+                yield execAsync(cmd, {
+                    env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
+                    maxBuffer: 50 * 1024 * 1024
+                });
+            }
+            else {
+                yield generatePureJSDump(sqlFile);
+            }
+            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)({ level: 9 }), (0, fs_1.createWriteStream)(gzFile));
             yield fs.unlink(sqlFile);
             yield rotateBackups();
             console.log('✅ Scheduled backup created:', filename);
@@ -580,35 +961,46 @@ function browseFolders(req, res) {
         try {
             const requestedPath = req.query.path || '';
             const fsSync = require('fs');
+            // Restrict browsing to allowed base directories (H9 security fix)
+            const allowedRoots = (process.env.BACKUP_ALLOWED_PATHS || '').split(',').map(p => p.trim()).filter(Boolean);
             // Determine the base path to browse
             let basePath;
             if (!requestedPath) {
                 // Return available drives on Windows or root folders
                 if (process.platform === 'win32') {
                     const drives = [];
-                    // Check common drive letters
-                    for (const letter of ['C', 'D', 'E', 'F', 'G', 'H']) {
-                        const drivePath = `${letter}:\\`;
-                        try {
-                            if (fsSync.existsSync(drivePath)) {
-                                fsSync.accessSync(drivePath, fsSync.constants.R_OK);
-                                drives.push({
-                                    name: `القرص ${letter}:`,
-                                    path: drivePath,
-                                    type: 'drive'
-                                });
+                    // If allowed paths are configured, only show those
+                    if (allowedRoots.length > 0) {
+                        for (const root of allowedRoots) {
+                            try {
+                                if (fsSync.existsSync(root)) {
+                                    drives.push({
+                                        name: path.basename(root) || root,
+                                        path: root,
+                                        type: 'folder'
+                                    });
+                                }
                             }
-                        }
-                        catch (_a) {
-                            // Drive doesn't exist or not accessible
+                            catch ( /* skip */_a) { /* skip */ }
                         }
                     }
-                    // Add network paths option
-                    drives.push({
-                        name: 'مجلد شبكة...',
-                        path: '\\\\',
-                        type: 'network'
-                    });
+                    else {
+                        // Fallback: check common drive letters
+                        for (const letter of ['C', 'D', 'E', 'F', 'G', 'H']) {
+                            const drivePath = `${letter}:\\`;
+                            try {
+                                if (fsSync.existsSync(drivePath)) {
+                                    fsSync.accessSync(drivePath, fsSync.constants.R_OK);
+                                    drives.push({
+                                        name: `القرص ${letter}:`,
+                                        path: drivePath,
+                                        type: 'drive'
+                                    });
+                                }
+                            }
+                            catch ( /* skip */_b) { /* skip */ }
+                        }
+                    }
                     return res.json({
                         success: true,
                         currentPath: '',
@@ -621,7 +1013,14 @@ function browseFolders(req, res) {
                 }
             }
             else {
-                basePath = requestedPath;
+                basePath = path.resolve(requestedPath);
+                // If allowed roots are configured, enforce containment
+                if (allowedRoots.length > 0) {
+                    const isAllowed = allowedRoots.some(root => basePath.startsWith(path.resolve(root)));
+                    if (!isAllowed) {
+                        return res.status(403).json({ success: false, error: 'Access denied: path outside allowed directories' });
+                    }
+                }
             }
             // Validate path exists and is accessible
             try {
@@ -652,7 +1051,7 @@ function browseFolders(req, res) {
                             type: 'folder'
                         });
                     }
-                    catch (_b) {
+                    catch (_c) {
                         // Skip inaccessible folders
                     }
                 }
@@ -738,7 +1137,7 @@ function updateUserBackupSettings(req, res) {
             }
             else {
                 // Insert new
-                const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+                const { randomUUID: uuidv4 } = require('crypto');
                 yield conn.query(`
                 INSERT INTO user_backup_settings 
                 (id, userId, scheduleEnabled, scheduleFrequency, scheduleHour, scheduleMinute, 
@@ -825,16 +1224,18 @@ function createUserBackup(userId, customPath, email) {
         try {
             // Use custom path if provided, otherwise use default backup dir
             let backupDir;
-            if (customPath) {
-                // Ensure custom directory exists
+            const trimmedPath = (customPath === null || customPath === void 0 ? void 0 : customPath.trim()) || '';
+            if (trimmedPath && trimmedPath.length > 1) {
+                // Normalize: resolve UNC/relative paths on Windows hosting
+                const resolvedPath = path.resolve(trimmedPath);
                 try {
-                    yield fs.access(customPath);
+                    yield fs.access(resolvedPath);
                 }
                 catch (_a) {
-                    yield fs.mkdir(customPath, { recursive: true });
+                    yield fs.mkdir(resolvedPath, { recursive: true });
                 }
-                backupDir = customPath;
-                console.log(`📁 Using custom backup path: ${customPath}`);
+                backupDir = resolvedPath;
+                console.log(`📁 Using custom backup path: ${resolvedPath}`);
             }
             else {
                 backupDir = yield ensureBackupDir();
@@ -842,16 +1243,22 @@ function createUserBackup(userId, customPath, email) {
             const filename = `user-${userId.slice(0, 8)}-${getBackupFilename()}`;
             const sqlFile = path.join(backupDir, filename.replace('.gz', ''));
             const gzFile = path.join(backupDir, filename);
-            const mysqldumpCmd = getMySQLCommand('mysqldump');
-            const cmd = `"${mysqldumpCmd}" -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p"${DB_PASSWORD}" ` +
-                `--single-transaction --routines --triggers --events ` +
-                `--add-drop-database --add-drop-table --complete-insert ` +
-                `--hex-blob --set-charset --databases ${DB_NAME} > "${sqlFile}"`;
-            yield execAsync(cmd, {
-                env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
-                maxBuffer: 50 * 1024 * 1024
-            });
-            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)(), (0, fs_1.createWriteStream)(gzFile));
+            const hasMysqlDump = isMySQLDumpAvailable();
+            if (hasMysqlDump) {
+                const mysqldumpCmd = getMySQLCommand('mysqldump');
+                const cmd = `"${mysqldumpCmd}" -h ${DB_HOST} -P ${DB_PORT} -u ${DB_USER} -p"${DB_PASSWORD}" ` +
+                    `--single-transaction --routines --triggers --events ` +
+                    `--add-drop-database --add-drop-table --complete-insert ` +
+                    `--hex-blob --set-charset --skip-comments --databases ${DB_NAME} > "${sqlFile}"`;
+                yield execAsync(cmd, {
+                    env: Object.assign(Object.assign({}, process.env), { MYSQL_PWD: DB_PASSWORD }),
+                    maxBuffer: 50 * 1024 * 1024
+                });
+            }
+            else {
+                yield generatePureJSDump(sqlFile);
+            }
+            yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)({ level: 9 }), (0, fs_1.createWriteStream)(gzFile));
             yield fs.unlink(sqlFile);
             // Update user backup status
             const conn = yield (0, db_1.getConnection)();

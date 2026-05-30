@@ -16,11 +16,11 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 function testPartnerRollback() {
     return __awaiter(this, void 0, void 0, function* () {
         console.log('\\n=== Testing Partner Transaction Rollback ===');
-        const testId = (0, uuid_1.v4)();
+        const testId = (0, crypto_1.randomUUID)();
         const conn = yield db_1.pool.getConnection();
         try {
             yield conn.beginTransaction();
@@ -54,7 +54,7 @@ function testPartnerRollback() {
 function testAccountRollback() {
     return __awaiter(this, void 0, void 0, function* () {
         console.log('\\n=== Testing Account Transaction Rollback ===');
-        const testId = (0, uuid_1.v4)();
+        const testId = (0, crypto_1.randomUUID)();
         const conn = yield db_1.pool.getConnection();
         try {
             yield conn.beginTransaction();
@@ -62,7 +62,7 @@ function testAccountRollback() {
             yield conn.query('INSERT INTO accounts (id, code, name, type, balance, openingBalance) VALUES (?, ?, ?, ?, ?, ?)', [testId, 'TEST-001', 'Test Rollback Account', 'ASSET', 0, 0]);
             console.log('✓ Account inserted');
             // Force an error (duplicate code)
-            yield conn.query('INSERT INTO accounts (id, code, name, type, balance, openingBalance) VALUES (?, ?, ?, ?, ?, ?)', [(0, uuid_1.v4)(), 'TEST-001', 'Duplicate Account', 'ASSET', 0, 0]);
+            yield conn.query('INSERT INTO accounts (id, code, name, type, balance, openingBalance) VALUES (?, ?, ?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), 'TEST-001', 'Duplicate Account', 'ASSET', 0, 0]);
             yield conn.commit();
             console.log('❌ FAILED: Transaction should have failed!');
         }
@@ -88,7 +88,7 @@ function testAccountRollback() {
 function testUserRollback() {
     return __awaiter(this, void 0, void 0, function* () {
         console.log('\\n=== Testing User Transaction Rollback ===');
-        const testId = (0, uuid_1.v4)();
+        const testId = (0, crypto_1.randomUUID)();
         const conn = yield db_1.pool.getConnection();
         try {
             yield conn.beginTransaction();
@@ -96,7 +96,7 @@ function testUserRollback() {
             yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [testId, 'Test User', 'test@rollback.com', 'testuser', 'hashedpass', 'USER', 'ACTIVE', '[]']);
             console.log('✓ User inserted');
             // Force an error (duplicate email)
-            yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [(0, uuid_1.v4)(), 'Test User 2', 'test@rollback.com', 'testuser2', 'hashedpass', 'USER', 'ACTIVE', '[]']);
+            yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), 'Test User 2', 'test@rollback.com', 'testuser2', 'hashedpass', 'USER', 'ACTIVE', '[]']);
             yield conn.commit();
             console.log('❌ FAILED: Transaction should have failed!');
         }

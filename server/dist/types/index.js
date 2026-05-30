@@ -14,13 +14,16 @@ var __exportStar = (this && this.__exportStar) || function(m, exports) {
     for (var p in m) if (p !== "default" && !Object.prototype.hasOwnProperty.call(exports, p)) __createBinding(exports, m, p);
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.LeaveStatus = exports.PayrollStatus = exports.AttendanceStatus = exports.EmployeeStatus = exports.EmploymentType = exports.ProductionPriority = exports.ProductionOrderStatus = exports.MovementType = exports.UnitOfMeasure = exports.ProductType = exports.ChequeStatus = exports.PaymentMethod = exports.InvoiceStatus = exports.TransactionType = void 0;
+exports.MembershipStatus = exports.LeaveStatus = exports.PayrollStatus = exports.AttendanceStatus = exports.EmployeeStatus = exports.EmploymentType = exports.ProductionPriority = exports.ProductionOrderStatus = exports.MovementType = exports.UnitOfMeasure = exports.ProductType = exports.ChequeStatus = exports.PaymentMethod = exports.InvoiceStatus = exports.TransactionType = void 0;
+__exportStar(require("./membership"), exports);
 var TransactionType;
 (function (TransactionType) {
     TransactionType["INVOICE_SALE"] = "INVOICE_SALE";
     TransactionType["INVOICE_PURCHASE"] = "INVOICE_PURCHASE";
     TransactionType["RETURN_SALE"] = "RETURN_SALE";
     TransactionType["RETURN_PURCHASE"] = "RETURN_PURCHASE";
+    TransactionType["RETURN_IN"] = "RETURN_IN";
+    TransactionType["RETURN_OUT"] = "RETURN_OUT";
     TransactionType["QUOTATION"] = "QUOTATION";
     TransactionType["RECEIPT"] = "RECEIPT";
     TransactionType["PAYMENT"] = "PAYMENT";
@@ -121,6 +124,7 @@ var EmploymentType;
 (function (EmploymentType) {
     EmploymentType["MONTHLY"] = "MONTHLY";
     EmploymentType["DAILY"] = "DAILY";
+    EmploymentType["WEEKLY"] = "WEEKLY";
 })(EmploymentType || (exports.EmploymentType = EmploymentType = {}));
 var EmployeeStatus;
 (function (EmployeeStatus) {
@@ -138,6 +142,7 @@ var AttendanceStatus;
 var PayrollStatus;
 (function (PayrollStatus) {
     PayrollStatus["DRAFT"] = "DRAFT";
+    PayrollStatus["CALCULATED"] = "CALCULATED";
     PayrollStatus["REVIEW"] = "REVIEW";
     PayrollStatus["APPROVED"] = "APPROVED";
     PayrollStatus["PAID"] = "PAID";
@@ -153,3 +158,12 @@ var LeaveStatus;
     LeaveStatus["CANCELLED"] = "CANCELLED";
 })(LeaveStatus || (exports.LeaveStatus = LeaveStatus = {}));
 __exportStar(require("./PaymentTypes"), exports);
+var MembershipStatus;
+(function (MembershipStatus) {
+    MembershipStatus["PENDING"] = "PENDING";
+    MembershipStatus["PENDING_PAYMENT"] = "PENDING_PAYMENT";
+    MembershipStatus["ACTIVE"] = "ACTIVE";
+    MembershipStatus["EXPIRED"] = "EXPIRED";
+    MembershipStatus["FROZEN"] = "FROZEN";
+    MembershipStatus["CANCELLED"] = "CANCELLED";
+})(MembershipStatus || (exports.MembershipStatus = MembershipStatus = {}));

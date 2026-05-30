@@ -10,7 +10,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 function seedCategories() {
     return __awaiter(this, void 0, void 0, function* () {
         try {
@@ -34,7 +34,7 @@ function seedCategories() {
                     if (existingName.length === 0) {
                         console.log(`Creating category for account: ${acc.name}`);
                         const type = acc.type === 'REVENUE' ? 'INCOME' : (acc.type === 'EXPENSE' ? 'EXPENSE' : 'OTHER');
-                        yield conn.query('INSERT INTO cash_categories (id, name, type, accountId) VALUES (?, ?, ?, ?)', [(0, uuid_1.v4)(), acc.name, type, acc.id]);
+                        yield conn.query('INSERT INTO cash_categories (id, name, type, accountId) VALUES (?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), acc.name, type, acc.id]);
                     }
                     else {
                         // Link the existing category if it's not linked

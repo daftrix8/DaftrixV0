@@ -12,15 +12,16 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getSalesmanRoutes = exports.updateVehicleLocation = exports.getProductPerformanceReport = exports.getVehiclePerformanceReport = exports.getVehicleLowStockAlerts = exports.deleteVehicleFuelLog = exports.createVehicleFuelLog = exports.getVehicleFuelLogs = exports.deleteVehicleMaintenance = exports.updateVehicleMaintenance = exports.createVehicleMaintenance = exports.getVehicleMaintenance = exports.deleteVehicleTarget = exports.updateVehicleTarget = exports.createVehicleTarget = exports.getVehicleTargets = exports.getCustomerVehicleHistory = exports.getDailyReport = exports.deleteSettlement = exports.getApprovedSettlements = exports.submitSettlement = exports.disputeSettlement = exports.approveSettlement = exports.updateSettlement = exports.calculateRefinedSettlementStats = exports.createSettlement = exports.getSettlements = exports.processVehicleReturn = exports.createVehicleReturn = exports.getVehicleReturns = exports.deleteCustomerVisit = exports.updateCustomerVisit = exports.createVanReturnVisit = exports.createVanSaleVisit = exports.createCustomerVisit = exports.getCustomerVisits = exports.getVehicleReport = exports.deleteOperation = exports.getOperationDetails = exports.getAllOperations = exports.getVehicleOperations = exports.unloadVehicle = exports.loadVehicle = exports.getAllVehicleInventory = exports.getVehicleInventory = exports.deleteVehicle = exports.updateVehicle = exports.createVehicle = exports.getVehicle = exports.getVehicles = void 0;
 exports.debugDiscounts = exports.completeRoute = exports.startRoute = exports.deleteRouteStop = exports.markStopVisited = exports.updateRouteStop = exports.addRouteStop = exports.deleteRoute = exports.updateRoute = exports.createRoute = exports.getRoute = exports.getRoutes = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
+const eventBus_1 = require("../utils/eventBus");
 // Helper: Check if user is a restricted salesman (not admin/manager)
 const getUserSalesmanFilter = (req) => {
     const user = req.user;
     if (!user)
         return null;
     // Admins and managers see all
-    if (user.role === 'ADMIN' || user.role === 'admin' || user.role === 'MANAGER') {
+    if (user.role === 'ADMIN' || user.role === 'admin' || user.role === 'MANAGER' || user.role === 'MASTER_ADMIN' || user.role === 'GENERAL_MANAGER') {
         return null;
     }
     // If user has a salesmanId, filter by it
@@ -90,7 +91,7 @@ const createVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         return res.status(400).json({ error: 'Plate number is required' });
     }
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         // Convert empty string to null for numeric fields
         const capacityValue = capacity === '' || capacity === undefined ? null : capacity;
         const salesmanValue = salesmanId === '' ? null : salesmanId;
@@ -224,11 +225,11 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
     if (!warehouseId) {
         return res.status(400).json({ error: 'Warehouse is required for loading' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Create operation record
-        const operationId = (0, uuid_1.v4)();
+        const operationId = (0, crypto_1.randomUUID)();
         const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
         yield conn.query(`
             INSERT INTO vehicle_operations (id, vehicleId, operationType, date, warehouseId, notes, createdBy)
@@ -253,9 +254,9 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                 INSERT INTO vehicle_inventory (id, vehicleId, productId, quantity, lastLoadDate)
                 VALUES (?, ?, ?, ?, ?)
                 ON DUPLICATE KEY UPDATE 
-                    quantity = quantity + VALUES(quantity),
-                    lastLoadDate = VALUES(lastLoadDate)
-            `, [(0, uuid_1.v4)(), id, productId, quantity, now]);
+                    quantity = quantity + ?,
+                    lastLoadDate = ?
+            `, [(0, crypto_1.randomUUID)(), id, productId, quantity, now, quantity, now]);
             // Decrease warehouse stock
             yield conn.query(`
                 UPDATE product_stocks 
@@ -269,9 +270,9 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
             // Create stock movement record
             yield conn.query(`
                 INSERT INTO stock_movements (
-                    id, product_id, warehouse_id, qty_change, movement_type,
+                    product_id, warehouse_id, qty_change, movement_type,
                     reference_type, reference_id, notes, movement_date
-                ) VALUES (UUID(), ?, ?, ?, 'TRANSFER_OUT', 'VEHICLE_LOAD', ?, ?, ?)
+                ) VALUES (?, ?, ?, 'TRANSFER_OUT', 'VEHICLE_LOAD', ?, ?, ?)
             `, [productId, warehouseId, -quantity, operationId, `تحميل سيارة`, now]);
         }
         // Update vehicle status to ON_ROUTE if it was AVAILABLE
@@ -280,26 +281,23 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         `, [id]);
         yield conn.commit();
         // Broadcast real-time update to all connected clients
-        const io = req.app.get('io');
-        if (io) {
-            // Notify vehicle inventory viewers
-            io.emit('entity:changed', {
-                entityType: 'vehicle-inventory',
-                vehicleId: id,
-                operation: 'LOAD',
-                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System'
-            });
-            // Notify product viewers (both singular and plural for compatibility)
-            io.emit('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            io.emit('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            // Notify stock balance report and other stock-dependent views
-            io.emit('stock:updated', {
-                warehouseId,
-                operation: 'VEHICLE_LOAD',
-                productIds: items.map((i) => i.productId),
-                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
-            });
-        }
+        // Notify vehicle inventory viewers
+        eventBus_1.eventBus.broadcast('entity:changed', {
+            entityType: 'vehicle-inventory',
+            vehicleId: id,
+            operation: 'LOAD',
+            updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System'
+        });
+        // Notify product viewers (both singular and plural for compatibility)
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        // Notify stock balance report and other stock-dependent views
+        eventBus_1.eventBus.broadcast('stock:updated', {
+            warehouseId,
+            operation: 'VEHICLE_LOAD',
+            productIds: items.map((i) => i.productId),
+            updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
+        });
         res.json({
             message: 'Vehicle loaded successfully',
             operationId,
@@ -327,11 +325,11 @@ const unloadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* 
     if (!warehouseId) {
         return res.status(400).json({ error: 'Warehouse is required for unloading' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Create operation record
-        const operationId = (0, uuid_1.v4)();
+        const operationId = (0, crypto_1.randomUUID)();
         const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
         yield conn.query(`
             INSERT INTO vehicle_operations (id, vehicleId, operationType, date, warehouseId, notes, createdBy)
@@ -366,8 +364,8 @@ const unloadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             yield conn.query(`
                 INSERT INTO product_stocks (id, productId, warehouseId, stock)
                 VALUES (?, ?, ?, ?)
-                ON DUPLICATE KEY UPDATE stock = stock + VALUES(stock)
-            `, [(0, uuid_1.v4)(), productId, warehouseId, quantity]);
+                ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)
+            `, [(0, crypto_1.randomUUID)(), productId, warehouseId, quantity, quantity]);
             // Also increase global product stock
             yield conn.query(`
                 UPDATE products SET stock = stock + ? WHERE id = ?
@@ -375,9 +373,9 @@ const unloadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             // Create stock movement record
             yield conn.query(`
                 INSERT INTO stock_movements (
-                    id, product_id, warehouse_id, qty_change, movement_type,
+                    product_id, warehouse_id, qty_change, movement_type,
                     reference_type, reference_id, notes, movement_date
-                ) VALUES (UUID(), ?, ?, ?, 'TRANSFER_IN', 'VEHICLE_UNLOAD', ?, ?, ?)
+                ) VALUES (?, ?, ?, 'TRANSFER_IN', 'VEHICLE_UNLOAD', ?, ?, ?)
             `, [productId, warehouseId, quantity, operationId, `تفريغ سيارة`, now]);
         }
         // Check if vehicle is now empty, set to AVAILABLE
@@ -387,26 +385,23 @@ const unloadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         yield conn.commit();
         // Broadcast real-time update to all connected clients
-        const io = req.app.get('io');
-        if (io) {
-            // Notify vehicle inventory viewers
-            io.emit('entity:changed', {
-                entityType: 'vehicle-inventory',
-                vehicleId: id,
-                operation: 'UNLOAD',
-                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System'
-            });
-            // Notify product viewers (both singular and plural for compatibility)
-            io.emit('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            io.emit('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            // Notify stock balance report and other stock-dependent views
-            io.emit('stock:updated', {
-                warehouseId,
-                operation: 'VEHICLE_UNLOAD',
-                productIds: items.map((i) => i.productId),
-                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
-            });
-        }
+        // Notify vehicle inventory viewers
+        eventBus_1.eventBus.broadcast('entity:changed', {
+            entityType: 'vehicle-inventory',
+            vehicleId: id,
+            operation: 'UNLOAD',
+            updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System'
+        });
+        // Notify product viewers (both singular and plural for compatibility)
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        // Notify stock balance report and other stock-dependent views
+        eventBus_1.eventBus.broadcast('stock:updated', {
+            warehouseId,
+            operation: 'VEHICLE_UNLOAD',
+            productIds: items.map((i) => i.productId),
+            updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
+        });
         res.json({
             message: 'Vehicle unloaded successfully',
             operationId,
@@ -545,7 +540,7 @@ exports.getOperationDetails = getOperationDetails;
 // Delete a vehicle operation (and reverse inventory changes if applicable)
 const deleteOperation = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { operationId } = req.params;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get operation details first (to reverse inventory changes)
@@ -564,8 +559,8 @@ const deleteOperation = (req, res) => __awaiter(void 0, void 0, void 0, function
         // Reverse inventory changes based on operation type
         for (const item of items) {
             if (operation.operationType === 'LOAD') {
-                // LOAD: Added to vehicle, subtracted from warehouse
-                // Reverse: Subtract from vehicle, add back to warehouse
+                // LOAD: Added to vehicle, subtracted from warehouse + global stock
+                // Reverse: Subtract from vehicle, add back to warehouse + global stock
                 yield conn.query(`
                     UPDATE vehicle_inventory 
                     SET quantity = GREATEST(0, quantity - ?)
@@ -576,10 +571,14 @@ const deleteOperation = (req, res) => __awaiter(void 0, void 0, void 0, function
                     SET stock = stock + ?
                     WHERE productId = ? AND warehouseId = ?
                 `, [item.quantity, item.productId, operation.warehouseId]);
+                // Also restore global product stock (loadVehicle deducts from products.stock)
+                yield conn.query(`
+                    UPDATE products SET stock = stock + ? WHERE id = ?
+                `, [item.quantity, item.productId]);
             }
             else if (operation.operationType === 'UNLOAD') {
-                // UNLOAD: Subtracted from vehicle, added to warehouse
-                // Reverse: Add back to vehicle, subtract from warehouse
+                // UNLOAD: Subtracted from vehicle, added to warehouse + global stock
+                // Reverse: Add back to vehicle, subtract from warehouse + global stock
                 yield conn.query(`
                     INSERT INTO vehicle_inventory (id, vehicleId, productId, quantity, costPrice, sellPrice)
                     VALUES (UUID(), ?, ?, ?, ?, ?)
@@ -590,14 +589,20 @@ const deleteOperation = (req, res) => __awaiter(void 0, void 0, void 0, function
                     SET stock = GREATEST(0, stock - ?)
                     WHERE productId = ? AND warehouseId = ?
                 `, [item.quantity, item.productId, operation.warehouseId]);
+                // Also reverse global product stock
+                yield conn.query(`
+                    UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?
+                `, [item.quantity, item.productId]);
             }
         }
+        // Delete stock movement records for this operation (so Product Movement Card is clean)
+        yield conn.query(`DELETE FROM stock_movements WHERE reference_id = ?`, [operationId]);
         // Delete operation items
         yield conn.query('DELETE FROM vehicle_operation_items WHERE operationId = ?', [operationId]);
         // Delete the operation itself
         yield conn.query('DELETE FROM vehicle_operations WHERE id = ?', [operationId]);
         yield conn.commit();
-        console.log(`🗑️ Deleted vehicle operation ${operationId} (${operation.operationType}) with ${items.length} items`);
+        // PERF: console.log(`🗑️ Deleted vehicle operation ${operationId} (${operation.operationType}) with ${items.length} items`);
         res.json({ success: true, message: 'تم حذف العملية بنجاح' });
     }
     catch (error) {
@@ -726,7 +731,7 @@ const createCustomerVisit = (req, res) => __awaiter(void 0, void 0, void 0, func
         return res.status(400).json({ error: 'Vehicle ID is required' });
     }
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         // Get the salesman from the vehicle
         const [vehicle] = yield db_1.pool.query('SELECT salesmanId FROM vehicles WHERE id = ?', [vehicleId]);
         const salesmanId = ((_a = vehicle[0]) === null || _a === void 0 ? void 0 : _a.salesmanId) || null;
@@ -819,7 +824,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
         subtotalCheck += (item.quantity * item.price);
     }
     const totalCheck = subtotalCheck - (discount || 0) + (taxAmount || 0);
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     const lockKey = `invoice_lock_${customerId}`;
     try {
         // 🔒 GLOBAL MUTEX LOCK (GET_LOCK)
@@ -851,13 +856,13 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             else {
                 const egyptNow = getEgyptNow();
                 dateToInsert = egyptNow.toISOString().slice(0, 19).replace('T', ' ');
-                console.log(`⚠️ processVanSale: Missing visitDate, defaulted to Egypt Time: ${dateToInsert}`);
+                // PERF: console.log(`⚠️ processVanSale: Missing visitDate, defaulted to Egypt Time: ${dateToInsert}`);
             }
-            console.log(`📅 processVanSale: incoming=${visitDate}, used=${dateToInsert}`);
+            // PERF: console.log(`📅 processVanSale: incoming=${visitDate}, used=${dateToInsert}`);
             // Define mysqlNow for compatibility with downstream code
             const mysqlNow = dateToInsert;
-            console.log(`🔒 Acquired mutex lock: ${lockKey}`);
-            console.log(`🔍 Checking for duplicates: customerId=${customerId}, total=${totalCheck}`);
+            // PERF: console.log(`🔒 Acquired mutex lock: ${lockKey}`);
+            // PERF: console.log(`🔍 Checking for duplicates: customerId=${customerId}, total=${totalCheck}`);
             // IDEMPOTENCY CHECK
             // We check for:
             // 1. Same Customer
@@ -884,10 +889,10 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                  FOR UPDATE`, [customerId, invoiceType, subtotalCheck, totalCheck, dateToInsert]);
             if (recentDuplicates.length > 0) {
                 const dup = recentDuplicates[0];
-                console.log(`⚠️ ⚠️ ⚠️ DUPLICATE INVOICE DETECTED! ⚠️ ⚠️ ⚠️`);
-                console.log(`   Customer: ${customerId}`);
-                console.log(`   Total: ${totalCheck}`);
-                console.log(`   Existing Invoice: ${dup.number} (ID: ${dup.id})`);
+                // PERF: console.log(`⚠️ ⚠️ ⚠️ DUPLICATE INVOICE DETECTED! ⚠️ ⚠️ ⚠️`);
+                // PERF: console.log(`   Customer: ${customerId}`);
+                // PERF: console.log(`   Total: ${totalCheck}`);
+                // PERF: console.log(`   Existing Invoice: ${dup.number} (ID: ${dup.id})`);
                 yield conn.rollback();
                 // Release lock in finally block
                 return res.status(200).json({
@@ -899,7 +904,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                     isDuplicate: true
                 });
             }
-            console.log(`✅ No duplicates found, proceeding to create invoice`);
+            // PERF: console.log(`✅ No duplicates found, proceeding to create invoice`);
             // Re-bind to variables used downstream
             const mysqlDate = mysqlNow;
             const invoiceDate = dateToInsert;
@@ -911,12 +916,16 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             const vehicle = vehicleRows[0];
             const salesmanId = vehicle.salesmanId;
             const salesmanName = vehicle.salesmanName;
-            // Validate all items exist in vehicle inventory with sufficient quantity
-            for (const item of items) {
-                const [vehicleStock] = yield conn.query('SELECT quantity FROM vehicle_inventory WHERE vehicleId = ? AND productId = ?', [vehicleId, item.productId]);
-                if (!vehicleStock[0] || vehicleStock[0].quantity < item.quantity) {
-                    const available = ((_a = vehicleStock[0]) === null || _a === void 0 ? void 0 : _a.quantity) || 0;
-                    throw new Error(`الكمية غير كافية للصنف ${item.productName || item.productId}. المتاح: ${available}, المطلوب: ${item.quantity}`);
+            // Validate all items exist in vehicle inventory with sufficient quantity (Batch Check)
+            if (items.length > 0) {
+                const productIds = items.map((i) => i.productId);
+                const [vehicleStocks] = yield conn.query('SELECT productId, quantity FROM vehicle_inventory WHERE vehicleId = ? AND productId IN (?)', [vehicleId, productIds]);
+                const stockMap = new Map(vehicleStocks.map((v) => [v.productId, v.quantity]));
+                for (const item of items) {
+                    const available = stockMap.get(item.productId) || 0;
+                    if (available < item.quantity) {
+                        throw new Error(`الكمية غير كافية للصنف ${item.productName || item.productId}. المتاح: ${available}, المطلوب: ${item.quantity}`);
+                    }
                 }
             }
             // Get partner's current balance BEFORE this invoice (for balance snapshot)
@@ -924,15 +933,15 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             const [partnerRows] = yield conn.query('SELECT COALESCE(balance, 0) as balance FROM partners WHERE id = ?', [customerId]);
             let previousBalance = 0;
             if (partnerRows.length === 0) {
-                console.log(`⚠️ Partner ${customerName} (${customerId}) not found. Auto-creating...`);
+                // PERF: console.log(`⚠️ Partner ${customerName} (${customerId}) not found. Auto-creating...`);
                 // Auto-create missing partner (e.g. created offline)
                 yield conn.query('INSERT INTO partners (id, name, type, isCustomer, status, salesmanId, openingBalance, balance) VALUES (?, ?, "CUSTOMER", 1, "ACTIVE", ?, 0, 0)', [customerId, customerName || "Unknown Customer", salesmanId]);
                 // previousBalance remains 0
             }
             else {
-                previousBalance = Number(((_b = partnerRows[0]) === null || _b === void 0 ? void 0 : _b.balance) || 0);
+                previousBalance = Number(((_a = partnerRows[0]) === null || _a === void 0 ? void 0 : _a.balance) || 0);
             }
-            console.log(`💰 Partner ${customerName} previous balance: ${previousBalance}`);
+            // PERF: console.log(`💰 Partner ${customerName} previous balance: ${previousBalance}`);
             let subtotal = 0;
             for (const item of items) {
                 const lineTotal = item.quantity * item.price;
@@ -943,13 +952,13 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             const total = subtotal - globalDiscount + tax;
             const paidAmount = paymentCollected || (paymentMethod === 'CASH' ? total : 0);
             // Debug logging
-            console.log(`💵 Payment Debug:`);
-            console.log(`   - paymentMethod: ${paymentMethod}`);
-            console.log(`   - paymentCollected (from request): ${paymentCollected}`);
-            console.log(`   - paidAmount (calculated): ${paidAmount}`);
-            console.log(`   - total: ${total}`);
+            // PERF: console.log(`💵 Payment Debug:`);
+            // PERF: console.log(`   - paymentMethod: ${paymentMethod}`);
+            // PERF: console.log(`   - paymentCollected (from request): ${paymentCollected}`);
+            // PERF: console.log(`   - paidAmount (calculated): ${paidAmount}`);
+            // PERF: console.log(`   - total: ${total}`);
             // Create Invoice ID and number
-            const invoiceId = (0, uuid_1.v4)();
+            const invoiceId = (0, crypto_1.randomUUID)();
             // Generate invoice number - count existing VAN invoices for this year
             const currentYear = new Date().getFullYear();
             const [vanInvoiceCount] = yield conn.query(`
@@ -957,7 +966,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             WHERE type = 'INVOICE_SALE' 
             AND number LIKE 'VAN-${currentYear}-%'
         `);
-            const nextNumber = (((_c = vanInvoiceCount[0]) === null || _c === void 0 ? void 0 : _c.count) || 0) + 1;
+            const nextNumber = (((_b = vanInvoiceCount[0]) === null || _b === void 0 ? void 0 : _b.count) || 0) + 1;
             const invoiceNumber = `VAN-${currentYear}-${String(nextNumber).padStart(5, '0')}`;
             // Create invoice - status POSTED for posted van sales/returns
             const invoiceNotes = isReturn
@@ -969,7 +978,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             let bankGLAccountId = null; // The GL account ID for the bank (for receipts)
             // Check if this is a bank payment - either direct BANK or CREDIT with bank partial payment
             const isBankPayment = (paymentMethod === 'BANK' || (paymentMethod === 'CREDIT' && creditPaymentType === 'BANK'));
-            console.log(`💳 Payment type check: paymentMethod=${paymentMethod}, creditPaymentType=${creditPaymentType}, isBankPayment=${isBankPayment}`);
+            // PERF: console.log(`💳 Payment type check: paymentMethod=${paymentMethod}, creditPaymentType=${creditPaymentType}, isBankPayment=${isBankPayment}`);
             if (isBankPayment && paidAmount > 0) {
                 // Get bank name if bankAccountId is provided
                 if (bankAccountId) {
@@ -978,10 +987,10 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                     if (bankRows[0]) {
                         bankNameForInvoice = bankRows[0].name;
                         bankGLAccountId = bankRows[0].accountId; // This is the GL account ID
-                        console.log(`🏦 Found bank: ${bankNameForInvoice}, GL Account: ${bankGLAccountId}`);
+                        // PERF: console.log(`🏦 Found bank: ${bankNameForInvoice}, GL Account: ${bankGLAccountId}`);
                     }
                     else {
-                        console.log(`⚠️ Bank not found for ID: ${bankAccountId}`);
+                        // PERF: console.log(`⚠️ Bank not found for ID: ${bankAccountId}`);
                     }
                 }
                 // Create bank transfer entry
@@ -1015,7 +1024,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             const newBalance = isReturn
                 ? previousBalance - total // Return reduces customer debt
                 : previousBalance + total - paidAmount;
-            console.log(`💰 Partner balance snapshot: previous=${previousBalance}, new=${newBalance} ${isReturn ? '(RETURN)' : ''}`);
+            // PERF: console.log(`💰 Partner balance snapshot: previous=${previousBalance}, new=${newBalance} ${isReturn ? '(RETURN)' : ''}`);
             // Try to update balance fields (columns may not exist in all installations)
             try {
                 yield conn.query(`
@@ -1023,63 +1032,72 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             `, [previousBalance, newBalance, invoiceId]);
             }
             catch (e) {
-                console.log('Note: Could not store balance snapshot (columns may not exist yet)');
+                // PERF: console.log('Note: Could not store balance snapshot (columns may not exist yet)');
             }
-            // Insert invoice lines and update vehicle inventory
+            // Insert invoice lines and update vehicle inventory (BATCHED & PARALLELIZED)
+            const invoiceLinesParams = [];
+            const stockMovementsParams = [];
+            const inventoryUpdatePromises = [];
             for (const item of items) {
                 const lineTotal = item.quantity * item.price;
                 const lineCost = item.cost || 0;
-                // Insert invoice line
-                yield conn.query(`
-                INSERT INTO invoice_lines (
-                    invoiceId, productId, productName, quantity, 
-                    price, cost, discount, total
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            `, [
+                // Prepare invoice line arguments
+                invoiceLinesParams.push([
                     invoiceId, item.productId, item.productName,
                     item.quantity, item.price, lineCost, item.discount || 0, lineTotal
                 ]);
-                // Update vehicle inventory (subtract for sales, add for returns)
+                // Prepare vehicle inventory update promise
                 if (isReturn) {
-                    console.log(`📦 RETURN: Adding ${item.quantity} of ${item.productName} (${item.productId}) to vehicle ${vehicleId}`);
-                    yield conn.query(`
+                    inventoryUpdatePromises.push(conn.query(`
                         UPDATE vehicle_inventory 
                         SET quantity = quantity + ? 
                         WHERE vehicleId = ? AND productId = ?
-                    `, [item.quantity, vehicleId, item.productId]);
+                    `, [item.quantity, vehicleId, item.productId]));
                 }
                 else {
-                    console.log(`📦 SALE: Deducting ${item.quantity} of ${item.productName} (${item.productId}) from vehicle ${vehicleId}`);
-                    yield conn.query(`
+                    inventoryUpdatePromises.push(conn.query(`
                         UPDATE vehicle_inventory 
                         SET quantity = quantity - ? 
                         WHERE vehicleId = ? AND productId = ?
-                    `, [item.quantity, vehicleId, item.productId]);
+                    `, [item.quantity, vehicleId, item.productId]));
                 }
-                // Create stock movement record
+                // Prepare stock movement record arguments
                 const movementType = isReturn ? 'RETURN_IN' : 'SALE';
                 const qtyChange = isReturn ? item.quantity : -item.quantity;
                 const movementNotes = isReturn ? `مرتجع مبيعات - ${customerName}` : `بيع متنقل - ${customerName}`;
-                yield conn.query(`
-                INSERT INTO stock_movements (
-                    id, product_id, warehouse_id, qty_change, movement_type,
-                    reference_type, reference_id, notes, movement_date
-                ) VALUES (UUID(), ?, ?, ?, ?, 'VAN_SALE', ?, ?, ?)
-            `, [
+                stockMovementsParams.push([
                     item.productId,
-                    // CRITICAL FIX: For Van Sales, do NOT link to the warehouse ID.
-                    // The items were already deducted from the warehouse during "Load" (TRANSFER_OUT).
-                    // If we link the warehouse here, it counts as a second deduction from the warehouse.
                     null, // Left as null for Van Sales to indicate "Sold from Vehicle" not "Sold from Warehouse"
                     qtyChange,
                     movementType,
+                    isReturn ? 'VAN_RETURN' : 'VAN_SALE', // reference_type
                     invoiceId,
                     movementNotes,
                     mysqlDate
                 ]);
             }
+            // Execute batches and parallel queries
+            if (invoiceLinesParams.length > 0) {
+                yield conn.query(`
+                    INSERT INTO invoice_lines (
+                        invoiceId, productId, productName, quantity, 
+                        price, cost, discount, total
+                    ) VALUES ?
+                `, [invoiceLinesParams]);
+            }
+            if (stockMovementsParams.length > 0) {
+                yield conn.query(`
+                    INSERT INTO stock_movements (
+                        product_id, warehouse_id, qty_change, movement_type,
+                        reference_type, reference_id, notes, movement_date
+                    ) VALUES ?
+                `, [stockMovementsParams]);
+            }
+            if (inventoryUpdatePromises.length > 0) {
+                yield Promise.all(inventoryUpdatePromises);
+            }
             // Create the visit record linked to the invoice
-            const visitId = (0, uuid_1.v4)();
+            const visitId = (0, crypto_1.randomUUID)();
             const visitResult = isReturn ? 'RETURN' : 'SALE';
             yield conn.query(`
             INSERT INTO vehicle_customer_visits (
@@ -1094,7 +1112,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 latitude, longitude, address, notes, duration
             ]);
             // Create operation record for tracking
-            const operationId = (0, uuid_1.v4)();
+            const operationId = (0, crypto_1.randomUUID)();
             const operationType = isReturn ? 'RETURN' : 'SALE';
             const operationNotes = isReturn
                 ? (notes ? `مرتجع مبيعات - ${customerName}: ${notes}` : `مرتجع مبيعات - ${customerName}`)
@@ -1107,12 +1125,101 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 operationNotes,
                 (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System'
             ]);
-            // Insert operation items
-            for (const item of items) {
+            // Insert operation items (BATCHED)
+            if (items.length > 0) {
+                const operationItemsParams = items.map((item) => [
+                    operationId, item.productId, item.productName, item.quantity, item.price
+                ]);
                 yield conn.query(`
-                INSERT INTO vehicle_operation_items (operationId, productId, productName, quantity, cost)
-                VALUES (?, ?, ?, ?, ?)
-            `, [operationId, item.productId, item.productName, item.quantity, item.price]);
+                    INSERT INTO vehicle_operation_items (operationId, productId, productName, quantity, cost)
+                    VALUES ?
+                `, [operationItemsParams]);
+            }
+            // =====================================================
+            // AUTO-POST REVENUE/COGS JOURNAL ENTRY FOR VAN SALE
+            // =====================================================
+            try {
+                const [revAccRows] = yield conn.query("SELECT id, name FROM accounts WHERE code = '401' OR (type = 'REVENUE' AND name LIKE '%مبيعات%') LIMIT 1");
+                const [cogsAccRows] = yield conn.query("SELECT id, name FROM accounts WHERE code = '501' OR name LIKE '%تكلفة البضاعة%' LIMIT 1");
+                const [invAccRows] = yield conn.query("SELECT id, name FROM accounts WHERE code = '103' OR name LIKE '%مخزون%' LIMIT 1");
+                const [recvAccRows] = yield conn.query("SELECT id, name FROM accounts WHERE code LIKE '104%' OR name LIKE '%عملاء%' LIMIT 1");
+                const revenueAcc = revAccRows[0];
+                const cogsAcc = cogsAccRows[0];
+                const inventoryAcc = invAccRows[0];
+                const receivablesAcc = recvAccRows[0];
+                if (revenueAcc && receivablesAcc && total > 0) {
+                    const revJournalId = (0, crypto_1.randomUUID)();
+                    const revDesc = isReturn
+                        ? `مرتجع بيع متنقل #${invoiceNumber} - ${customerName}`
+                        : `بيع متنقل #${invoiceNumber} - ${customerName}`;
+                    yield conn.query('INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)', [revJournalId, invoiceDate, revDesc, invoiceNumber, (user === null || user === void 0 ? void 0 : user.name) || 'System']);
+                    const revLines = [];
+                    // For fully-paid CASH sales, debit Cash directly instead of Receivables.
+                    // This avoids needing a separate receipt voucher to move money from
+                    // Receivables → Cash, which was causing double-counting in partner statements.
+                    const isCashDirect = !isBankPayment
+                        && (paymentMethod === 'CASH' || (!paymentMethod))
+                        && Math.abs(paidAmount - total) < 0.01
+                        && !isReturn;
+                    let debitAccount = receivablesAcc;
+                    if (isCashDirect) {
+                        const [cashAccRows] = yield conn.query("SELECT id, name FROM accounts WHERE code LIKE '101%' OR name LIKE '%نقدي%' OR name LIKE '%صندوق%' LIMIT 1");
+                        const cashAcc = cashAccRows[0];
+                        if (cashAcc) {
+                            debitAccount = cashAcc;
+                        }
+                    }
+                    if (isReturn) {
+                        revLines.push([revJournalId, revenueAcc.id, revenueAcc.name, total, 0]);
+                        revLines.push([revJournalId, receivablesAcc.id, receivablesAcc.name, 0, total]);
+                    }
+                    else {
+                        revLines.push([revJournalId, debitAccount.id, debitAccount.name, total, 0]);
+                        revLines.push([revJournalId, revenueAcc.id, revenueAcc.name, 0, total]);
+                    }
+                    // COGS entries
+                    if (cogsAcc && inventoryAcc) {
+                        let totalCOGS = 0;
+                        for (const item of items) {
+                            totalCOGS += Math.abs(Number(item.quantity) || 0) * (Number(item.cost || item.price) || 0);
+                        }
+                        totalCOGS = Number(totalCOGS.toFixed(2));
+                        if (totalCOGS > 0) {
+                            if (isReturn) {
+                                revLines.push([revJournalId, inventoryAcc.id, inventoryAcc.name, totalCOGS, 0]);
+                                revLines.push([revJournalId, cogsAcc.id, cogsAcc.name, 0, totalCOGS]);
+                            }
+                            else {
+                                revLines.push([revJournalId, cogsAcc.id, cogsAcc.name, totalCOGS, 0]);
+                                revLines.push([revJournalId, inventoryAcc.id, inventoryAcc.name, 0, totalCOGS]);
+                            }
+                        }
+                    }
+                    if (revLines.length >= 2) {
+                        yield conn.query('INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES ?', [revLines]);
+                        // PERF: console.log(`📊 Van sale Revenue/COGS journal: ${revDesc}, Revenue=${total}`);
+                    }
+                }
+            }
+            catch (revErr) {
+                console.error(`⚠️ Van sale Revenue/COGS journal error: ${revErr.message}`);
+            }
+            // For fully-paid CASH sales, update the cash account balance directly.
+            // The receipt that previously did this is no longer created (to fix double-counting).
+            const isDirectCashSale = !isBankPayment
+                && (paymentMethod === 'CASH' || (!paymentMethod))
+                && Math.abs(paidAmount - total) < 0.01
+                && !isReturn;
+            if (isDirectCashSale && paidAmount > 0) {
+                try {
+                    const [cashAccForBalance] = yield conn.query("SELECT id FROM accounts WHERE code LIKE '101%' OR name LIKE '%نقدي%' OR name LIKE '%صندوق%' LIMIT 1");
+                    if ((_c = cashAccForBalance[0]) === null || _c === void 0 ? void 0 : _c.id) {
+                        yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?', [paidAmount, cashAccForBalance[0].id]);
+                    }
+                }
+                catch (cashErr) {
+                    console.error(`⚠️ Cash account balance update error: ${cashErr.message}`);
+                }
             }
             // =====================================================
             // UPDATE PARTNER BALANCE AND CREATE TREASURY ENTRY
@@ -1130,12 +1237,30 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             SET balance = COALESCE(balance, 0) + ? 
             WHERE id = ?
         `, [balanceChange, customerId]);
-            console.log(`💰 Partner ${customerName} (${customerId}) balance updated by ${balanceChange}`);
+            // PERF: console.log(`💰 Partner ${customerName} (${customerId}) balance updated by ${balanceChange}`);
             // If there's a payment, create a treasury receipt entry
-            console.log(`💳 Checking payment for treasury receipt: paidAmount = ${paidAmount}, type = ${typeof paidAmount}`);
-            if (paidAmount > 0) {
-                console.log(`💳 paidAmount > 0, creating treasury receipt...`);
-                console.log(`💳 Payment method: ${paymentMethod}, creditPaymentType: ${creditPaymentType}`);
+            // PERF: console.log(`💳 Checking payment for treasury receipt: paidAmount = ${paidAmount}, type = ${typeof paidAmount}`);
+            // ═══════════════════════════════════════════════════════════════════
+            // BUG FIX: Do NOT create a receipt (سند قبض) for fully-paid CASH sales.
+            //
+            // The accounting flow for a CASH van sale is:
+            //   1. Revenue Journal: Dr Receivables, Cr Revenue (handled above)
+            //   2. Partner balance update: balanceChange = total - paidAmount = 0
+            //   3. buildInvAggSQL excludes CASH INVOICE_SALE from cImpact
+            //
+            // Creating a RECEIPT voucher on top of this causes double-counting:
+            // the RECEIPT's -(total) credit shows up in the partner statement,
+            // making it look like the partner has a 6250 credit when it should be 0.
+            //
+            // Receipts are ONLY needed for:
+            //   - BANK payments (need treasury/bank journal tracking)
+            //   - CREDIT sales with partial payment (the partial amount needs a receipt)
+            // ═══════════════════════════════════════════════════════════════════
+            const isFullCashPayment = !isBankPayment
+                && (paymentMethod === 'CASH' || (!paymentMethod))
+                && Math.abs(paidAmount - total) < 0.01
+                && !isReturn;
+            if (paidAmount > 0 && !isFullCashPayment) {
                 // Find appropriate account for the receipt based on payment method
                 let treasuryAccountId = null;
                 // For CREDIT payments with bank partial, the receipt should be BANK type
@@ -1143,7 +1268,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 if (isBankPayment && bankGLAccountId) {
                     // Use the already resolved bank GL account from earlier
                     treasuryAccountId = bankGLAccountId;
-                    console.log(`🏦 Using bank GL account from invoice: ${treasuryAccountId}`);
+                    // PERF: console.log(`🏦 Using bank GL account from invoice: ${treasuryAccountId}`);
                 }
                 else if (isBankPayment) {
                     // Fallback: get any bank account
@@ -1151,7 +1276,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                         SELECT accountId FROM banks WHERE accountId IS NOT NULL LIMIT 1
                     `);
                     treasuryAccountId = (_d = bankAccount[0]) === null || _d === void 0 ? void 0 : _d.accountId;
-                    console.log(`🏦 Using fallback bank account: ${treasuryAccountId}`);
+                    // PERF: console.log(`🏦 Using fallback bank account: ${treasuryAccountId}`);
                 }
                 // Fallback to cash account if no bank account or not BANK payment
                 if (!treasuryAccountId) {
@@ -1160,13 +1285,13 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                     `);
                     treasuryAccountId = (_e = cashAccount[0]) === null || _e === void 0 ? void 0 : _e.id;
                     receiptPaymentMethod = 'CASH'; // Force to CASH if using cash account
-                    console.log(`💳 Using default cash account: ${treasuryAccountId}`);
+                    // PERF: console.log(`💳 Using default cash account: ${treasuryAccountId}`);
                 }
                 if (treasuryAccountId) {
                     // Create a treasury invoice/receipt for the payment
-                    const receiptId = (0, uuid_1.v4)();
+                    const receiptId = (0, crypto_1.randomUUID)();
                     const receiptNumber = `RCV-${invoiceNumber}`;
-                    console.log(`💳 Creating receipt invoice: ${receiptNumber} for amount ${paidAmount} (${receiptPaymentMethod})`);
+                    // PERF: console.log(`💳 Creating receipt invoice: ${receiptNumber} for amount ${paidAmount} (${receiptPaymentMethod})`);
                     yield conn.query(`
                     INSERT INTO invoices (
                         id, number, date, type, partnerId, partnerName, 
@@ -1185,17 +1310,17 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                         invoiceId,
                         isBankPayment ? (bankGLAccountId || bankAccountId) : null
                     ]);
-                    console.log(`🧾 Created treasury receipt ${receiptNumber} for ${paidAmount}`);
+                    // PERF: console.log(`🧾 Created treasury receipt ${receiptNumber} for ${paidAmount}`);
                     // Update treasury account balance
                     yield conn.query(`
                     UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?
                 `, [paidAmount, treasuryAccountId]);
-                    console.log(`💰 Updated treasury account ${treasuryAccountId} balance by +${paidAmount}`);
+                    // PERF: console.log(`💰 Updated treasury account ${treasuryAccountId} balance by +${paidAmount}`);
                     // =====================================================
                     // CREATE JOURNAL ENTRY FOR TREASURY RECEIPT
                     // This makes the receipt visible in TreasuryJournal
                     // =====================================================
-                    const journalId = (0, uuid_1.v4)();
+                    const journalId = (0, crypto_1.randomUUID)();
                     // Get default customer receivable account
                     const [defaultReceivable] = yield conn.query(`
                     SELECT id, name FROM accounts WHERE code LIKE '120%' OR name LIKE '%ذمم%' OR name LIKE '%عملاء%' LIMIT 1
@@ -1227,14 +1352,14 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                     INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
                     VALUES (?, ?, ?, 0, ?)
                 `, [journalId, receivableAccountId, receivableAccountName, paidAmount]);
-                    console.log(`📝 Created journal entry ${journalId} for receipt: Debit ${treasuryAccountName} ${paidAmount}, Credit ${receivableAccountName} ${paidAmount}`);
+                    // PERF: console.log(`📝 Created journal entry ${journalId} for receipt: Debit ${treasuryAccountName} ${paidAmount}, Credit ${receivableAccountName} ${paidAmount}`);
                 }
                 else {
-                    console.log(`⚠️ No treasury account found! Cannot create receipt.`);
+                    // PERF: console.log(`⚠️ No treasury account found! Cannot create receipt.`);
                 }
             }
             else {
-                console.log(`💳 paidAmount is ${paidAmount}, skipping treasury receipt`);
+                // PERF: console.log(`💳 paidAmount is ${paidAmount}, skipping treasury receipt`);
             }
             yield conn.commit();
             // =====================================================
@@ -1243,7 +1368,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
             // =====================================================
             try {
                 const today = invoiceDate.slice(0, 10); // YYYY-MM-DD
-                const conn2 = yield db_1.pool.getConnection();
+                const conn2 = yield (0, db_1.getConnection)();
                 try {
                     // Check for existing LIVE or non-approved settlement for today
                     // FIX: Find ANY open settlement (submitted) to merge new visit into it, regardless of date
@@ -1276,10 +1401,10 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                             existingSettlement[0].id
                         ]);
                         if (result[0].affectedRows > 0) {
-                            console.log(`📊 Updated SUBMITTED settlement ${existingSettlement[0].id} for ${today}`);
+                            // PERF: console.log(`📊 Updated SUBMITTED settlement ${existingSettlement[0].id} for ${today}`);
                         }
                         else {
-                            console.log(`⚠️ Settlement ${existingSettlement[0].id} was approved during sync, skipping update`);
+                            // PERF: console.log(`⚠️ Settlement ${existingSettlement[0].id} was approved during sync, skipping update`);
                         }
                     }
                     else {
@@ -1287,7 +1412,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                         const [approved] = yield conn2.query(`SELECT id FROM vehicle_settlements WHERE vehicleId = ? AND settlementDate = ? AND status = 'APPROVED'`, [vehicleId, today]);
                         if (approved.length === 0) {
                             // Create new LIVE settlement
-                            const newSettlementId = (0, uuid_1.v4)();
+                            const newSettlementId = (0, crypto_1.randomUUID)();
                             yield conn2.query(`
                                 INSERT INTO vehicle_settlements(
                             id, vehicleId, settlementDate, salesmanId, salesmanName,
@@ -1306,7 +1431,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                                 stats.expectedCash,
                                 (user === null || user === void 0 ? void 0 : user.name) || 'System'
                             ]);
-                            console.log(`📊 Created SUBMITTED settlement ${newSettlementId} for ${today}`);
+                            // PERF: console.log(`📊 Created SUBMITTED settlement ${newSettlementId} for ${today}`);
                         }
                         else {
                             const [existingLiveAfterApproval] = yield conn2.query(`SELECT id FROM vehicle_settlements 
@@ -1341,15 +1466,15 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                                     existingLiveAfterApproval[0].id
                                 ]);
                                 if (result2[0].affectedRows > 0) {
-                                    console.log(`📊 Updated SUBMITTED settlement ${existingLiveAfterApproval[0].id} (after approval) for ${today}`);
+                                    // PERF: console.log(`📊 Updated SUBMITTED settlement ${existingLiveAfterApproval[0].id} (after approval) for ${today}`);
                                 }
                                 else {
-                                    console.log(`⚠️ Settlement ${existingLiveAfterApproval[0].id} was approved during sync, skipping update`);
+                                    // PERF: console.log(`⚠️ Settlement ${existingLiveAfterApproval[0].id} was approved during sync, skipping update`);
                                 }
                             }
                             else {
                                 // Create new LIVE settlement with only this invoice's data
-                                const newSettlementId = (0, uuid_1.v4)();
+                                const newSettlementId = (0, crypto_1.randomUUID)();
                                 const thisSaleCash = (paymentMethod === 'CASH' ? total : 0);
                                 const thisSaleCredit = (paymentMethod === 'CREDIT' ? total : 0);
                                 const thisSaleBank = (paymentMethod === 'BANK' ? total : 0);
@@ -1370,7 +1495,7 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                                     paidAmount,
                                     (user === null || user === void 0 ? void 0 : user.name) || 'System'
                                 ]);
-                                console.log(`📊 Created additional SUBMITTED settlement ${newSettlementId} for ${today}(after approval)`);
+                                // PERF: console.log(`📊 Created additional SUBMITTED settlement ${newSettlementId} for ${today}(after approval)`);
                             }
                         }
                     }
@@ -1384,27 +1509,24 @@ const createVanSaleVisit = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 // Don't fail the invoice creation for this
             }
             // Broadcast real-time update to all connected clients
-            const io = req.app.get('io');
-            if (io) {
-                io.emit('entity:changed', {
-                    entityType: 'vehicle-inventory',
-                    vehicleId,
-                    operation: 'SALE',
-                    invoiceNumber,
-                    updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'بيع متنقل'
-                });
-                io.emit('entity:changed', { entityType: 'invoice', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'بيع متنقل' });
-                io.emit('entity:changed', { entityType: 'partner', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-                io.emit('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-                io.emit('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-                // Notify stock balance report
-                io.emit('stock:updated', {
-                    warehouseId: warehouseId || vehicle.warehouseId,
-                    operation: 'VAN_SALE',
-                    productIds: items.map((i) => i.productId),
-                    updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
-                });
-            }
+            eventBus_1.eventBus.broadcast('entity:changed', {
+                entityType: 'vehicle-inventory',
+                vehicleId,
+                operation: 'SALE',
+                invoiceNumber,
+                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'بيع متنقل'
+            });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'بيع متنقل' });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'partner', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+            // Notify stock balance report
+            eventBus_1.eventBus.broadcast('stock:updated', {
+                warehouseId: warehouseId || vehicle.warehouseId,
+                operation: 'VAN_SALE',
+                productIds: items.map((i) => i.productId),
+                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
+            });
             res.status(201).json({
                 success: true,
                 message: 'تم إنشاء فاتورة البيع المتنقل بنجاح',
@@ -1460,7 +1582,7 @@ const createVanReturnVisit = (req, res) => __awaiter(void 0, void 0, void 0, fun
     if (!vehicleId || !items || items.length === 0) {
         return res.status(400).json({ error: 'Vehicle ID and items are required' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get vehicle details
@@ -1482,7 +1604,7 @@ const createVanReturnVisit = (req, res) => __awaiter(void 0, void 0, void 0, fun
         // For returns, payment is typically refund
         const refundAmount = paymentMethod === 'CREDIT' ? 0 : total;
         // Create Return Invoice ID and number
-        const invoiceId = (0, uuid_1.v4)();
+        const invoiceId = (0, crypto_1.randomUUID)();
         // Generate invoice number - count existing VAN return invoices for this year
         const currentYear = new Date().getFullYear();
         const [vanReturnCount] = yield conn.query(`
@@ -1555,11 +1677,11 @@ const createVanReturnVisit = (req, res) => __awaiter(void 0, void 0, void 0, fun
                 yield conn.query(`
                     INSERT INTO vehicle_inventory(id, vehicleId, productId, quantity, lastLoadDate)
                     VALUES(?, ?, ?, ?, ?)
-                        `, [(0, uuid_1.v4)(), vehicleId, item.productId, item.quantity, mysqlDate]);
+                        `, [(0, crypto_1.randomUUID)(), vehicleId, item.productId, item.quantity, mysqlDate]);
             }
         }
         // Create customer visit record with result = RETURN
-        const visitId = (0, uuid_1.v4)();
+        const visitId = (0, crypto_1.randomUUID)();
         yield conn.query(`
             INSERT INTO vehicle_customer_visits(
                             id, vehicleId, salesmanId, customerId, customerName,
@@ -1574,7 +1696,7 @@ const createVanReturnVisit = (req, res) => __awaiter(void 0, void 0, void 0, fun
             latitude, longitude, address, notes, duration
         ]);
         // Create a RETURN operation record for tracking
-        const operationId = (0, uuid_1.v4)();
+        const operationId = (0, crypto_1.randomUUID)();
         yield conn.query(`
             INSERT INTO vehicle_operations(id, vehicleId, operationType, date, warehouseId, notes, createdBy)
                     VALUES(?, ?, 'RETURN', ?, ?, ?, ?)
@@ -1592,27 +1714,24 @@ const createVanReturnVisit = (req, res) => __awaiter(void 0, void 0, void 0, fun
         }
         yield conn.commit();
         // Broadcast real-time update to all connected clients
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', {
-                entityType: 'vehicle-inventory',
-                vehicleId,
-                operation: 'RETURN',
-                invoiceNumber,
-                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'مرتجع متنقل'
-            });
-            io.emit('entity:changed', { entityType: 'invoice', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'مرتجع متنقل' });
-            io.emit('entity:changed', { entityType: 'partner', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            io.emit('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            io.emit('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
-            // Notify stock balance report
-            io.emit('stock:updated', {
-                warehouseId: warehouseId || vehicle.warehouseId,
-                operation: 'VAN_RETURN',
-                productIds: items.map((i) => i.productId),
-                updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
-            });
-        }
+        eventBus_1.eventBus.broadcast('entity:changed', {
+            entityType: 'vehicle-inventory',
+            vehicleId,
+            operation: 'RETURN',
+            invoiceNumber,
+            updatedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'مرتجع متنقل'
+        });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'مرتجع متنقل' });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'partner', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'product', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'products', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System' });
+        // Notify stock balance report
+        eventBus_1.eventBus.broadcast('stock:updated', {
+            warehouseId: warehouseId || vehicle.warehouseId,
+            operation: 'VAN_RETURN',
+            productIds: items.map((i) => i.productId),
+            updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System'
+        });
         res.status(201).json({
             success: true,
             message: 'تم إنشاء فاتورة المرتجع المتنقل بنجاح',
@@ -1723,10 +1842,10 @@ const createVehicleReturn = (req, res) => __awaiter(void 0, void 0, void 0, func
     if (!vehicleId || !items || !Array.isArray(items) || items.length === 0) {
         return res.status(400).json({ error: 'Vehicle ID and items are required' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         const totalValue = items.reduce((sum, item) => sum + (item.quantity * (item.unitPrice || 0)), 0);
         // Convert ISO date to MySQL format (YYYY-MM-DD HH:MM:SS)
         const mysqlDate = returnDate
@@ -1775,7 +1894,7 @@ const processVehicleReturn = (req, res) => __awaiter(void 0, void 0, void 0, fun
     if (!['APPROVED', 'REJECTED', 'PROCESSED'].includes(status)) {
         return res.status(400).json({ error: 'Invalid status' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get return details
@@ -1822,7 +1941,6 @@ exports.processVehicleReturn = processVehicleReturn;
 // END OF DAY SETTLEMENT (تسوية نهاية اليوم)
 // ==========================================
 const getSettlements = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
     const { vehicleId, status, startDate, endDate } = req.query;
     // Get salesman filter from auth token
     const userSalesmanFilter = getUserSalesmanFilter(req);
@@ -1904,7 +2022,7 @@ const getSettlements = (req, res) => __awaiter(void 0, void 0, void 0, function*
             }
             else {
                 if (settlement.status === 'APPROVED') {
-                    console.log(`⚠️ Recalculating APPROVED settlement ${settlement.id} (Discounts: ${storedDiscounts})`);
+                    // PERF: console.log(`⚠️ Recalculating APPROVED settlement ${settlement.id} (Discounts: ${storedDiscounts})`);
                 }
                 // For SUBMITTED and other statuses, calculate discounts from invoices
                 // This ensures we show correct values even if they weren't saved properly
@@ -1974,7 +2092,7 @@ const getSettlements = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 WHERE paymentMethod = 'BANK' 
                 AND status = 'POSTED'
                         `);
-            console.log(`📊 Total BANK invoices in database: ${(_a = allBankInvoices[0]) === null || _a === void 0 ? void 0 : _a.count}, total amount: ${(_b = allBankInvoices[0]) === null || _b === void 0 ? void 0 : _b.total} `);
+            // PERF: console.log(`📊 Total BANK invoices in database: ${allBankInvoices[0]?.count}, total amount: ${allBankInvoices[0]?.total} `);
         }
         catch (e) {
             console.log('Could not count bank invoices:', e);
@@ -2076,23 +2194,20 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
     if (!vehicleId) {
         return res.status(400).json({ error: 'Vehicle ID is required' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         const date = settlementDate || new Date().toISOString().slice(0, 10);
-        // Check if settlement already exists for this date
-        const [existing] = yield conn.query('SELECT id, status FROM vehicle_settlements WHERE vehicleId = ? AND settlementDate = ? ORDER BY createdAt DESC', [vehicleId, date]);
-        // Only block if there's an active (non-approved, non-submitted) settlement for this date
-        // APPROVED settlements can have a new one created for additional work
-        // SUBMITTED settlements can be updated by this quick settlement
-        const activeSettlement = existing.find((s) => s.status !== 'APPROVED' && s.status !== 'SUBMITTED');
-        if (activeSettlement) {
-            return res.status(400).json({ error: 'Settlement already exists for this date. Use update instead.' });
-        }
-        // If there's a SUBMITTED settlement, update it instead of creating new
-        // This ensures Quick Settlement updates the existing pending settlement rather than creating duplicates
-        const submittedSettlement = existing.find((s) => s.status === 'SUBMITTED');
-        const isUpdate = !!submittedSettlement;
+        // Check if ANY unapproved settlement already exists for this vehicle
+        // so we don't leave old "SUBMITTED" or "DRAFT" settlements hanging around when a new one is created.
+        const [existing] = yield conn.query('SELECT id, status, settlementDate FROM vehicle_settlements WHERE vehicleId = ? AND status IN ("SUBMITTED", "PENDING", "DRAFT") ORDER BY createdAt DESC', [vehicleId]);
+        // Find an updatable settlement: PENDING or SUBMITTED (not yet approved)
+        // Priority: SUBMITTED first (already sent for review), then PENDING
+        const updatableSettlement = existing.find((s) => s.status === 'SUBMITTED')
+            || existing.find((s) => s.status === 'PENDING' || s.status === 'DRAFT');
+        // Only create a brand-new settlement if ALL existing ones are APPROVED
+        // (i.e., this is genuinely new work after a closed cycle)
+        const isUpdate = !!updatableSettlement;
         // Get vehicle info
         const [vehicle] = yield conn.query('SELECT v.*, s.name as salesmanName FROM vehicles v LEFT JOIN salesmen s ON v.salesmanId = s.id WHERE v.id = ?', [vehicleId]);
         if (vehicle.length === 0) {
@@ -2101,9 +2216,12 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
         // Calculate statistics using helper
         // When updating a SUBMITTED settlement, exclude it from cutoff calculation
         // so we don't lose visits created before the settlement was first created
-        const excludeId = isUpdate && submittedSettlement ? submittedSettlement.id : undefined;
-        const stats = yield (0, exports.calculateRefinedSettlementStats)(conn, vehicleId, date, excludeId);
-        console.log(`🛠️ ${isUpdate ? 'Updating' : 'Creating'} Settlement: Sales = ${stats.totalSales}, Disc = ${stats.totalDiscounts}, Bank = ${stats.totalBankTransfers} `);
+        const excludeId = isUpdate && updatableSettlement ? updatableSettlement.id : undefined;
+        // FIX: Use ignoreDateFilter=true to capture ALL unsettled visits since last APPROVED settlement
+        // This matches getDailyReport behavior and prevents the issue where the wizard runs on day X
+        // but visits were created on day X-1 (e.g., settlement on 15/2 but visits on 14/2)
+        const stats = yield (0, exports.calculateRefinedSettlementStats)(conn, vehicleId, date, excludeId, true);
+        // PERF: console.log(`🛠️ ${isUpdate ? 'Updating' : 'Creating'} Settlement: Sales = ${stats.totalSales}, Returns = ${stats.totalReturns}, Disc = ${stats.totalDiscounts}, Bank = ${stats.totalBankTransfers} `);
         // Expected cash = cash collected minus cash refunds for returns
         // Note: stats.expectedCash might already be calculated, but checking here
         const baseExpectedCash = stats.expectedCash;
@@ -2114,9 +2232,9 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
         // Final expected cash = base expected - expenses
         const expectedCash = baseExpectedCash - expensesTotal;
         let settlementId;
-        if (isUpdate && submittedSettlement) {
-            // Update the existing SUBMITTED settlement
-            settlementId = submittedSettlement.id;
+        if (isUpdate && updatableSettlement) {
+            // Update the existing PENDING or SUBMITTED settlement (avoid creating duplicates)
+            settlementId = updatableSettlement.id;
             const result3 = yield conn.query(`
                 UPDATE vehicle_settlements SET
                     salesmanId = ?, salesmanName = ?,
@@ -2127,8 +2245,8 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
                         plannedVisits = ?, completedVisits = ?, successfulVisits = ?,
                         expectedCash = ?, actualCash = ?, cashDifference = ?,
                         totalDiscounts = ?, totalBankTransfers = ?,
-                        status = 'SUBMITTED', notes = ?, updatedAt = NOW()
-                WHERE id = ? AND status = 'SUBMITTED'
+                        settlementDate = ?, status = 'SUBMITTED', notes = ?, updatedAt = NOW()
+                WHERE id = ? AND status IN ('PENDING', 'DRAFT', 'SUBMITTED')
                         `, [
                 vehicle[0].salesmanId, vehicle[0].salesmanName,
                 stats.totalCashSales, stats.totalCreditSales, stats.totalSales,
@@ -2139,10 +2257,10 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 stats.plannedVisits, stats.completedVisits, stats.successfulVisits,
                 expectedCash, actualCash || 0, (actualCash || 0) - expectedCash,
                 stats.totalDiscounts, stats.totalBankTransfers,
-                notes, settlementId
+                date, notes, settlementId
             ]);
             if (result3[0].affectedRows > 0) {
-                console.log(`📊 Updated existing SUBMITTED settlement ${settlementId} `);
+                // PERF: console.log(`📊 Updated existing settlement ${settlementId} (was: ${updatableSettlement.status})`);
             }
             else {
                 yield conn.rollback();
@@ -2151,7 +2269,7 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
         }
         else {
             // Create new settlement
-            settlementId = (0, uuid_1.v4)();
+            settlementId = (0, crypto_1.randomUUID)();
             yield conn.query(`
                 INSERT INTO vehicle_settlements(
                             id, vehicleId, settlementDate, salesmanId, salesmanName,
@@ -2191,13 +2309,13 @@ const createSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
             // Delete existing expenses first (for updates)
             yield conn.query('DELETE FROM settlement_expenses WHERE settlementId = ?', [settlementId]);
             for (const expense of expenseDetails) {
-                const expenseId = (0, uuid_1.v4)();
+                const expenseId = (0, crypto_1.randomUUID)();
                 yield conn.query(`
                     INSERT INTO settlement_expenses(id, settlementId, category, description, amount, receiptNumber, expenseType)
                     VALUES(?, ?, ?, ?, ?, ?, ?)
                 `, [expenseId, settlementId, expense.category || 'OTHER', expense.description || '', expense.amount || 0, expense.receiptNumber || null, expense.category === 'FUEL' ? 'FUEL' : 'MANUAL']);
             }
-            console.log(`💰 Saved ${expenseDetails.length} expenses for settlement ${settlementId}`);
+            // PERF: console.log(`💰 Saved ${expenseDetails.length} expenses for settlement ${settlementId}`);
         }
         yield conn.commit();
         res.status(201).json({ id: settlementId, message: isUpdate ? 'Settlement updated successfully' : 'Settlement created successfully' });
@@ -2218,7 +2336,7 @@ const calculateRefinedSettlementStats = (conn_1, vehicleId_1, date_1, excludeSet
     // 1. Find cutoff time from latest APPROVED settlement for this vehicle
     // FIX: Use approvedAt (not createdAt) because we want to count transactions AFTER approval
     // FIX: Only look at APPROVED settlements (SUBMITTED should not block new calculations)
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t;
     let cutoffQuery = `
         SELECT COALESCE(approvedAt, createdAt) as cutoff 
         FROM vehicle_settlements 
@@ -2234,10 +2352,10 @@ const calculateRefinedSettlementStats = (conn_1, vehicleId_1, date_1, excludeSet
     const [lastSettlement] = yield conn.query(cutoffQuery, cutoffParams);
     const cutoff = (_a = lastSettlement[0]) === null || _a === void 0 ? void 0 : _a.cutoff;
     if (cutoff) {
-        console.log(`🔒 Found APPROVED settlement cutoff: ${cutoff} - will only count data after this time`);
+        // PERF: console.log(`🔒 Found APPROVED settlement cutoff: ${cutoff} - will only count data after this time`);
     }
     else {
-        console.log(`📊 No prior APPROVED settlement found for vehicle ${vehicleId} - counting all data for date ${date}`);
+        // PERF: console.log(`📊 No prior APPROVED settlement found for vehicle ${vehicleId} - counting all data for date ${date}`);
     }
     // NOTE: For "Live" stats, we don't have an upper bound because we want everything up to now.
     // The previous stats logic is correct for "Live", but we need to respect prior SUBMITTED settlements too.
@@ -2282,21 +2400,26 @@ const calculateRefinedSettlementStats = (conn_1, vehicleId_1, date_1, excludeSet
     if (cutoff)
         bankParams.push(cutoff);
     // Visits - properly calculating cash collected and credit sales
+    // FIX: Exclude RETURN visits from cashCollected to prevent returns inflating expected cash
     const [visits] = yield conn.query(`
                     SELECT
                     COUNT(*) as totalVisits,
                         SUM(CASE WHEN result = 'SALE' THEN 1 ELSE 0 END) as successfulVisits,
-                        SUM(COALESCE(v.invoiceAmount, 0)) as totalSales,
+                        SUM(CASE WHEN result = 'SALE' THEN COALESCE(v.invoiceAmount, 0) ELSE 0 END) as totalSales,
                         
-                        -- Total Cash Collected (Base + Debt + Extra)
-                        SUM(COALESCE(v.paymentCollected, 0) + COALESCE(v.debtCollected, 0)) as cashCollected,
+                        -- Total Cash Collected (Base + Debt + Extra) - ONLY from non-RETURN visits
+                        SUM(CASE WHEN result != 'RETURN' THEN COALESCE(v.paymentCollected, 0) + COALESCE(v.debtCollected, 0) ELSE 0 END) as cashCollected,
                         
                         -- Cash Sales Component (Capped payment on CASH invoices)
                         SUM(CASE 
                             WHEN result = 'SALE' AND (i.paymentMethod = 'CASH' OR i.paymentMethod IS NULL)
                             THEN LEAST(COALESCE(v.paymentCollected, 0), COALESCE(v.invoiceAmount, 0))
                             ELSE 0 
-                        END) as cashPartSales
+                        END) as cashPartSales,
+
+                        -- Returns from visits (result = 'RETURN')
+                        SUM(CASE WHEN result = 'RETURN' THEN COALESCE(v.invoiceAmount, 0) ELSE 0 END) as returnsFromVisits,
+                        COUNT(CASE WHEN result = 'RETURN' THEN 1 END) as returnVisitsCount
                         
         FROM vehicle_customer_visits v
         LEFT JOIN invoices i ON v.invoiceId = i.id
@@ -2377,6 +2500,7 @@ const calculateRefinedSettlementStats = (conn_1, vehicleId_1, date_1, excludeSet
     const [treasuryReceipts] = yield conn.query(treasuryReceiptQuery, receiptParams);
     const treasuryReceiptsTotal = Number(((_b = treasuryReceipts[0]) === null || _b === void 0 ? void 0 : _b.totalReceipts) || 0);
     // cashCollected = total of all paymentCollected (includes debt collections beyond invoice amounts)
+    // FIX: Now excludes RETURN visits to prevent returns from inflating cash collected
     const cashCollected = Number(((_c = visits[0]) === null || _c === void 0 ? void 0 : _c.cashCollected) || 0);
     // totalCashSales = invoice amounts minus any unpaid (credit) portions
     // For cash sales: the portion of invoices covered by payments (capped at invoice amount)
@@ -2385,15 +2509,21 @@ const calculateRefinedSettlementStats = (conn_1, vehicleId_1, date_1, excludeSet
     const totalCashSales = Number(((_e = visits[0]) === null || _e === void 0 ? void 0 : _e.cashPartSales) || 0);
     // Derived credit sales: Total Sales - Cash Sales
     const totalCreditSales = totalSales - totalCashSales;
-    const totalReturns = Number(((_f = returns[0]) === null || _f === void 0 ? void 0 : _f.totalReturns) || 0);
+    // FIX: Combine returns from BOTH sources:
+    // 1. vehicle_returns table (older format)
+    // 2. vehicle_customer_visits with result='RETURN' (mobile app format)
+    const returnsFromTable = Number(((_f = returns[0]) === null || _f === void 0 ? void 0 : _f.totalReturns) || 0);
+    const returnsFromVisits = Number(((_g = visits[0]) === null || _g === void 0 ? void 0 : _g.returnsFromVisits) || 0);
+    const totalReturns = returnsFromTable + returnsFromVisits;
+    // PERF: console.log(`📊 Returns breakdown: fromTable=${returnsFromTable}, fromVisits=${returnsFromVisits}, total=${totalReturns}`);
     // Include treasury receipts in total collections
     const totalCollectionsWithReceipts = cashCollected + treasuryReceiptsTotal;
     // FIX: Expected cash should exclude Bank Transfers (as they are not collected in cash)
-    const totalBank = Number(((_g = banks[0]) === null || _g === void 0 ? void 0 : _g.totalBank) || 0); // Use the calculated bank total
+    const totalBank = Number(((_h = banks[0]) === null || _h === void 0 ? void 0 : _h.totalBank) || 0); // Use the calculated bank total
     const expectedCash = totalCollectionsWithReceipts - totalReturns - totalBank;
     // Log for debugging
     if (cutoff) {
-        console.log(`🧮 Calculated refined stats with cutoff ${cutoff.toISOString()}: Sales = ${totalSales}, Collection = ${cashCollected}, Bank = ${totalBank}, Treasury = ${treasuryReceiptsTotal}`);
+        // PERF: console.log(`🧮 Calculated refined stats with cutoff ${cutoff.toISOString()}: Sales = ${totalSales}, Collection = ${cashCollected}, Bank = ${totalBank}, Treasury = ${treasuryReceiptsTotal}`);
     }
     return {
         totalCashSales,
@@ -2403,18 +2533,18 @@ const calculateRefinedSettlementStats = (conn_1, vehicleId_1, date_1, excludeSet
         totalCollections: totalCollectionsWithReceipts, // Now includes treasury receipts
         treasuryReceipts: treasuryReceiptsTotal, // New field for transparency
         totalReturns,
-        returnCount: Number(((_h = returns[0]) === null || _h === void 0 ? void 0 : _h.returnCount) || 0),
-        loadedValue: Number(((_j = operations[0]) === null || _j === void 0 ? void 0 : _j.loadedValue) || 0),
-        unloadedValue: Number(((_k = operations[0]) === null || _k === void 0 ? void 0 : _k.unloadedValue) || 0),
-        closingInventoryValue: Number(((_l = inventory[0]) === null || _l === void 0 ? void 0 : _l.closingValue) || 0),
+        returnCount: Number(((_j = returns[0]) === null || _j === void 0 ? void 0 : _j.returnCount) || 0) + Number(((_k = visits[0]) === null || _k === void 0 ? void 0 : _k.returnVisitsCount) || 0),
+        loadedValue: Number(((_l = operations[0]) === null || _l === void 0 ? void 0 : _l.loadedValue) || 0),
+        unloadedValue: Number(((_m = operations[0]) === null || _m === void 0 ? void 0 : _m.unloadedValue) || 0),
+        closingInventoryValue: Number(((_o = inventory[0]) === null || _o === void 0 ? void 0 : _o.closingValue) || 0),
         plannedVisits: 0,
-        completedVisits: Number(((_m = visits[0]) === null || _m === void 0 ? void 0 : _m.totalVisits) || 0),
-        totalVisits: Number(((_o = visits[0]) === null || _o === void 0 ? void 0 : _o.totalVisits) || 0),
-        successfulVisits: Number(((_p = visits[0]) === null || _p === void 0 ? void 0 : _p.successfulVisits) || 0),
+        completedVisits: Number(((_p = visits[0]) === null || _p === void 0 ? void 0 : _p.totalVisits) || 0),
+        totalVisits: Number(((_q = visits[0]) === null || _q === void 0 ? void 0 : _q.totalVisits) || 0),
+        successfulVisits: Number(((_r = visits[0]) === null || _r === void 0 ? void 0 : _r.successfulVisits) || 0),
         expectedCash,
         actualCash: 0, // Default actual cash to 0 for stats
-        totalDiscounts: Number(((_q = discounts[0]) === null || _q === void 0 ? void 0 : _q.totalDiscounts) || 0),
-        totalBankTransfers: Number(((_r = banks[0]) === null || _r === void 0 ? void 0 : _r.totalBank) || 0)
+        totalDiscounts: Number(((_s = discounts[0]) === null || _s === void 0 ? void 0 : _s.totalDiscounts) || 0),
+        totalBankTransfers: Number(((_t = banks[0]) === null || _t === void 0 ? void 0 : _t.totalBank) || 0)
     };
 });
 exports.calculateRefinedSettlementStats = calculateRefinedSettlementStats;
@@ -2423,7 +2553,7 @@ const updateSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
     const { settlementId } = req.params;
     const { actualCash, notes, status, disputeReason, openingCash, totalExpenses, expenseDetails } = req.body;
     const user = req.user;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get current settlement with row lock to prevent race conditions
@@ -2499,7 +2629,7 @@ const updateSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 yield conn.query('DELETE FROM settlement_expenses WHERE settlementId = ?', [settlementId]);
                 // Insert new expenses
                 for (const expense of expenseDetails) {
-                    const expenseId = (0, uuid_1.v4)();
+                    const expenseId = (0, crypto_1.randomUUID)();
                     yield conn.query(`
                         INSERT INTO settlement_expenses(id, settlementId, category, description, amount, receiptNumber, expenseType)
                     VALUES(?, ?, ?, ?, ?, ?, ?)
@@ -2513,18 +2643,15 @@ const updateSettlement = (req, res) => __awaiter(void 0, void 0, void 0, functio
         yield conn.commit();
         // If settlement was approved, notify the salesman via WebSocket
         if (status === 'APPROVED') {
-            const io = req.app.get('io');
-            if (io) {
-                // Emit to all clients - mobile will filter by salesmanId
-                io.emit('settlement:approved', {
-                    settlementId,
-                    salesmanId: settlement.salesmanId,
-                    settlementDate: settlement.settlementDate,
-                    approvedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System',
-                    message: 'تم اعتماد التسوية - سيتم تصفير بيانات اليوم'
-                });
-                console.log(`📢 Settlement ${settlementId} approved - notifying salesman ${settlement.salesmanId} `);
-            }
+            // Emit to all clients - mobile will filter by salesmanId
+            eventBus_1.eventBus.broadcast('settlement:approved', {
+                settlementId,
+                salesmanId: settlement.salesmanId,
+                settlementDate: settlement.settlementDate,
+                approvedBy: (user === null || user === void 0 ? void 0 : user.name) || 'System',
+                message: 'تم اعتماد التسوية - سيتم تصفير بيانات اليوم'
+            });
+            // PERF: console.log(`📢 Settlement ${settlementId} approved - notifying salesman ${settlement.salesmanId} `);
         }
         res.json({ message: 'Settlement updated successfully', status: status || settlement.status });
     }
@@ -2543,6 +2670,12 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
         try {
+            // Check if journal entry ALREADY exists for this settlement to prevent duplicate accounting entries
+            const [existingEntry] = yield conn.query('SELECT id FROM journal_entries WHERE referenceId = ? AND description LIKE ?', [settlement.id, 'تسوية نهاية اليوم%']);
+            if (existingEntry.length > 0) {
+                // PERF: console.log(`⏭️ [SYNC] SKIP duplicate settlement journal ${existingEntry[0].id} — matching journal already exists for settlement ${settlement.id}`);
+                return;
+            }
             const expectedCash = settlement.expectedCash || 0;
             const cashDifference = actualCash - expectedCash; // Negative = deficit
             // Get Treasury account
@@ -2553,7 +2686,7 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
             LIMIT 1
         `);
             if (cashAccounts.length === 0) {
-                console.log('⚠️ No treasury account found for journal entry');
+                // PERF: console.log('⚠️ No treasury account found for journal entry');
                 return;
             }
             const treasuryAccountId = cashAccounts[0].id;
@@ -2567,12 +2700,12 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
             }
             if (custodyAccounts.length === 0) {
                 // Create custody account for this salesman
-                salesmanCustodyAccountId = (0, uuid_1.v4)();
+                salesmanCustodyAccountId = (0, crypto_1.randomUUID)();
                 yield conn.query(`
                 INSERT INTO accounts(id, code, name, type, balance)
                     VALUES(?, ?, ?, 'ASSET', 0)
             `, [salesmanCustodyAccountId, `CUST - ${((_a = settlement.salesmanId) === null || _a === void 0 ? void 0 : _a.slice(0, 8)) || 'GEN'} `, custodyAccountName]);
-                console.log(`📗 Created salesman custody account: ${custodyAccountName} `);
+                // PERF: console.log(`📗 Created salesman custody account: ${custodyAccountName} `);
             }
             else {
                 salesmanCustodyAccountId = custodyAccounts[0].id;
@@ -2583,19 +2716,19 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                 const [deficitAccounts] = yield conn.query(`SELECT id FROM accounts WHERE(name LIKE '%عجز%' OR name LIKE '%deficit%') AND type = 'EXPENSE' LIMIT 1`);
                 if (deficitAccounts.length === 0) {
                     // Create deficit account
-                    deficitAccountId = (0, uuid_1.v4)();
+                    deficitAccountId = (0, crypto_1.randomUUID)();
                     yield conn.query(`
                     INSERT INTO accounts(id, code, name, type, balance)
                     VALUES(?, 'DEF-SAL', 'عجز المناديب', 'EXPENSE', 0)
                 `, [deficitAccountId]);
-                    console.log(`📗 Created deficit account: عجز المناديب`);
+                    // PERF: console.log(`📗 Created deficit account: عجز المناديب`);
                 }
                 else {
                     deficitAccountId = deficitAccounts[0].id;
                 }
             }
             // Create main journal entry
-            const journalId = (0, uuid_1.v4)();
+            const journalId = (0, crypto_1.randomUUID)();
             yield conn.query(`
             INSERT INTO journal_entries(id, date, description, referenceId)
                     VALUES(?, ?, ?, ?)
@@ -2606,15 +2739,18 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                 settlement.id
             ]);
             // ===== BALANCED JOURNAL ENTRY =====
-            // NOTE: Treasury is NOT debited here because individual receipt journal entries
-            // already debited the treasury when payments were collected (تحصيل بيع متنقل).
-            // This settlement journal only handles:
-            // 1. Credit Custody account (to clear salesman's balance)
-            // 2. Debit Receivables/Deficit (to balance the entry)
-            // REMOVED: Treasury debit - this was causing double-counting!
-            // The actualCash was already recorded via individual RECEIPT invoices
-            // created in createVanSaleVisit() with their own journal entries.
-            console.log(`⚠️ Settlement: Treasury NOT debited (already done via receipts). actualCash=${actualCash}`);
+            // Settlement accounting:
+            //   Debit: Treasury (actualCash)         → cash physically received from salesman
+            //   Debit: Deficit (|cashDifference|)    → if salesman returned less than expected
+            //   Credit: Custody (expectedCash)       → clear salesman's custody balance
+            // Balance: actualCash + deficit = expectedCash ✓
+            // Debit: Treasury Account (actualCash received from salesman)
+            if (actualCash > 0) {
+                yield conn.query(`
+                INSERT INTO journal_lines(journalId, accountId, accountName, debit, credit)
+                    VALUES(?, ?, ?, ?, 0)
+                        `, [journalId, treasuryAccountId, cashAccounts[0].name || 'الخزينة', actualCash]);
+            }
             // Debit: Deficit Account (if cashDifference < 0)
             if (cashDifference < 0 && deficitAccountId) {
                 const deficitAmount = Math.abs(cashDifference);
@@ -2626,7 +2762,7 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                 yield conn.query(`
                 UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?
                         `, [deficitAmount, deficitAccountId]);
-                console.log(`⚠️ Deficit of ${deficitAmount} recorded for ${settlement.salesmanName}`);
+                // PERF: console.log(`⚠️ Deficit of ${deficitAmount} recorded for ${settlement.salesmanName}`);
             }
             // Credit: Salesman Custody Account (expected cash - this is what was owed to company)
             if (expectedCash > 0) {
@@ -2639,13 +2775,13 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                 UPDATE accounts SET balance = COALESCE(balance, 0) - ? WHERE id = ?
                         `, [expectedCash, salesmanCustodyAccountId]);
             }
-            console.log(`✅ Settlement journal entry created: ${journalId} `);
-            console.log(`   💵 Treasury(Debit): 0 (already done via individual receipts)`);
-            console.log(`   📉 Deficit(Debit): ${cashDifference < 0 ? Math.abs(cashDifference) : 0} `);
-            console.log(`   👤 Custody(Credit): ${expectedCash} `);
+            // PERF: console.log(`✅ Settlement journal entry created: ${journalId} `);
+            // PERF: console.log(`   💵 Treasury(Debit): ${actualCash}`);
+            // PERF: console.log(`   📉 Deficit(Debit): ${cashDifference < 0 ? Math.abs(cashDifference) : 0} `);
+            // PERF: console.log(`   👤 Custody(Credit): ${expectedCash} `);
             // === CREATE EXPENSE JOURNAL ENTRIES ===
             if (expenseDetails && Array.isArray(expenseDetails) && expenseDetails.length > 0) {
-                console.log(`📝 Creating journal entries for ${expenseDetails.length} expenses...`);
+                // PERF: console.log(`📝 Creating journal entries for ${expenseDetails.length} expenses...`);
                 const expenseAccountMapping = {
                     'FUEL': 'مصروفات بنزين',
                     'FOOD': 'مصروفات وجبات',
@@ -2664,12 +2800,12 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                     if (expenseAccounts.length === 0) {
                         [expenseAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE type = 'EXPENSE' AND name LIKE '%مصروفات%' LIMIT 1`);
                         if (expenseAccounts.length === 0) {
-                            expenseAccountId = (0, uuid_1.v4)();
+                            expenseAccountId = (0, crypto_1.randomUUID)();
                             yield conn.query(`
                             INSERT INTO accounts(id, code, name, type, balance)
                     VALUES(?, ?, ?, 'EXPENSE', 0)
                         `, [expenseAccountId, `EXP - ${expense.category} `, categoryName]);
-                            console.log(`📗 Created expense account: ${categoryName} `);
+                            // PERF: console.log(`📗 Created expense account: ${categoryName} `);
                         }
                         else {
                             expenseAccountId = expenseAccounts[0].id;
@@ -2679,7 +2815,7 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                         expenseAccountId = expenseAccounts[0].id;
                     }
                     // Create expense journal entry
-                    const expenseJournalId = (0, uuid_1.v4)();
+                    const expenseJournalId = (0, crypto_1.randomUUID)();
                     const expenseDescription = expense.description
                         ? `${categoryName}: ${expense.description} - ${settlement.salesmanName || 'المندوب'} `
                         : `${categoryName} - ${settlement.salesmanName || 'المندوب'} `;
@@ -2709,7 +2845,7 @@ function createSettlementJournalEntry(conn, settlement, actualCash, user, expens
                     yield conn.query(`
                     UPDATE accounts SET balance = COALESCE(balance, 0) - ? WHERE id = ?
                         `, [expense.amount, treasuryAccountId]);
-                    console.log(`💰 Expense journal entry created: ${expenseDescription} - ${expense.amount} `);
+                    // PERF: console.log(`💰 Expense journal entry created: ${expenseDescription} - ${expense.amount} `);
                 }
             }
         }
@@ -2780,7 +2916,7 @@ exports.getApprovedSettlements = getApprovedSettlements;
 // Delete settlement
 const deleteSettlement = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { settlementId } = req.params;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Approved settlements can now be deleted
@@ -2835,7 +2971,7 @@ const getDailyReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
         // ✅ Find the latest approved settlement's approval time for this vehicle/date
         // This is used to filter out visits that were already settled
         // Use DATE() on both sides for consistent comparison
-        console.log(`📊 Daily Report Request: vehicleId = ${vehicleId}, reportDate = ${reportDate} `);
+        // PERF: console.log(`📊 Daily Report Request: vehicleId = ${vehicleId}, reportDate = ${reportDate} `);
         const [latestApproved] = yield db_1.pool.query(`
             SELECT id, settlementDate, COALESCE(approvedAt, updatedAt, createdAt) as approvalTime 
             FROM vehicle_settlements 
@@ -2844,9 +2980,9 @@ const getDailyReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
         `, [vehicleId]);
         const hasApprovedSettlements = latestApproved.length > 0;
         const cutoffTime = hasApprovedSettlements ? latestApproved[0].approvalTime : null;
-        console.log(`📊 Daily Report: hasApprovedSettlements = ${hasApprovedSettlements}, cutoffTime = ${cutoffTime} `);
+        // PERF: console.log(`📊 Daily Report: hasApprovedSettlements = ${hasApprovedSettlements}, cutoffTime = ${cutoffTime} `);
         if (hasApprovedSettlements) {
-            console.log(`📊 Found approved settlement: id = ${latestApproved[0].id}, settlementDate = ${latestApproved[0].settlementDate} `);
+            // PERF: console.log(`📊 Found approved settlement: id = ${latestApproved[0].id}, settlementDate = ${latestApproved[0].settlementDate} `);
         }
         // Build time filter for visits - only count visits AFTER last approved settlement
         // IMPORTANT: Use v.createdAt (when synced to server) instead of v.visitDate (when visit happened)
@@ -2856,10 +2992,10 @@ const getDailyReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
         if (cutoffTime) {
             visitTimeFilter = ' AND v.createdAt > ?';
             visitParams.push(cutoffTime);
-            console.log(`📊 Daily Report: Filtering visits by createdAt > ${cutoffTime}`);
+            // PERF: console.log(`📊 Daily Report: Filtering visits by createdAt > ${cutoffTime}`);
         }
         else {
-            console.log(`📊 Daily Report: No previous approved settlement. Fetching ALL visits.`);
+            // PERF: console.log(`📊 Daily Report: No previous approved settlement. Fetching ALL visits.`);
         }
         // Visits statistics - now properly separating SALE and RETURN
         const [visits] = yield db_1.pool.query(`
@@ -2973,7 +3109,7 @@ const getDailyReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 ${receiptTimeFilter}
             `, receiptParams);
             treasuryReceiptsTotal = Number(((_a = treasuryReceipts[0]) === null || _a === void 0 ? void 0 : _a.totalReceipts) || 0);
-            console.log(`📊 Daily Report: Treasury receipts for salesman ${salesmanId}: ${treasuryReceiptsTotal}`);
+            // PERF: console.log(`📊 Daily Report: Treasury receipts for salesman ${salesmanId}: ${treasuryReceiptsTotal}`);
         }
         // Fuel Logs (Expenses)
         const [fuelLogs] = yield db_1.pool.query(`
@@ -3274,7 +3410,7 @@ exports.getCustomerVehicleHistory = getCustomerVehicleHistory;
 // VEHICLE TARGETS (أهداف السيارات)
 // ==========================================
 const getVehicleTargets = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { vehicleId, isActive, periodType } = req.query;
+    const { vehicleId, salesmanId, isActive, periodType } = req.query;
     const userSalesmanFilter = getUserSalesmanFilter(req);
     try {
         let query = `
@@ -3282,7 +3418,36 @@ const getVehicleTargets = (req, res) => __awaiter(void 0, void 0, void 0, functi
                         v.plateNumber as vehiclePlateNumber,
                         v.name as vehicleName,
                         s.name as salesmanName,
-                        ROUND((vt.achievedValue / vt.targetValue) * 100, 1) as progressPercent
+                        
+                        -- Dynamic Achieved Value Calculation
+                        CASE 
+                            WHEN vt.salesmanId IS NOT NULL AND vt.targetType = 'SALES_AMOUNT' THEN (
+                                SELECT COALESCE(SUM(total), 0) FROM invoices 
+                                WHERE salesmanId = vt.salesmanId 
+                                AND status = 'POSTED'
+                                AND date BETWEEN vt.periodStart AND vt.periodEnd
+                            )
+                            WHEN vt.salesmanId IS NOT NULL AND vt.targetType = 'SALES_COUNT' THEN (
+                                SELECT COUNT(*) FROM invoices 
+                                WHERE salesmanId = vt.salesmanId 
+                                AND status = 'POSTED'
+                                AND date BETWEEN vt.periodStart AND vt.periodEnd
+                            )
+                            WHEN vt.salesmanId IS NOT NULL AND vt.targetType = 'VISITS' THEN (
+                                SELECT COUNT(*) FROM customer_visits 
+                                WHERE salesmanId = vt.salesmanId 
+                                AND date BETWEEN vt.periodStart AND vt.periodEnd
+                            )
+                            WHEN vt.salesmanId IS NOT NULL AND vt.targetType = 'COLLECTIONS' THEN (
+                                SELECT COALESCE(SUM(amount), 0) 
+                                FROM invoice_payments ip
+                                JOIN invoices i ON ip.invoiceId = i.id
+                                WHERE i.salesmanId = vt.salesmanId
+                                AND ip.date BETWEEN vt.periodStart AND vt.periodEnd
+                            )
+                            ELSE vt.achievedValue
+                        END as achievedValue
+
             FROM vehicle_targets vt
             LEFT JOIN vehicles v ON vt.vehicleId = v.id
             LEFT JOIN salesmen s ON vt.salesmanId = s.id
@@ -3292,6 +3457,10 @@ const getVehicleTargets = (req, res) => __awaiter(void 0, void 0, void 0, functi
         if (userSalesmanFilter) {
             query += ` AND vt.salesmanId = ? `;
             params.push(userSalesmanFilter);
+        }
+        else if (salesmanId) {
+            query += ` AND vt.salesmanId = ? `;
+            params.push(salesmanId);
         }
         if (vehicleId) {
             query += ` AND vt.vehicleId = ? `;
@@ -3307,7 +3476,23 @@ const getVehicleTargets = (req, res) => __awaiter(void 0, void 0, void 0, functi
         }
         query += ` ORDER BY vt.periodEnd DESC, vt.createdAt DESC LIMIT 200`;
         const [rows] = yield db_1.pool.query(query, params);
-        res.json(rows);
+        // PERF: console.log('--- DEBUG: GET /vehicles/targets ---');
+        console.log('DB Config:', {
+            host: process.env.DB_HOST,
+            db: process.env.DB_NAME,
+            port: process.env.DB_PORT
+        });
+        // PERF: console.log(`Found ${rows.length} targets.`);
+        if (rows.length > 0) {
+            // PERF: console.log('First Target:', JSON.stringify(rows[0], null, 2));
+        }
+        else {
+            // PERF: console.log('No targets found.');
+        }
+        // PERF: console.log('------------------------------------');
+        // Calculate progress percentage in code to be safe, or database
+        const processedRows = rows.map(row => (Object.assign(Object.assign({}, row), { progressPercent: row.targetValue > 0 ? ((row.achievedValue / row.targetValue) * 100).toFixed(1) : 0 })));
+        res.json(processedRows);
     }
     catch (error) {
         console.error('Error fetching vehicle targets:', error);
@@ -3318,18 +3503,19 @@ exports.getVehicleTargets = getVehicleTargets;
 const createVehicleTarget = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { vehicleId, salesmanId, targetType, periodType, targetValue, periodStart, periodEnd, notes } = req.body;
     const user = req.user;
-    if (!vehicleId || !targetValue || !periodStart || !periodEnd) {
-        return res.status(400).json({ error: 'Vehicle, target value, and period dates are required' });
+    // Validate: At least vehicle OR salesman must be specified
+    if ((!vehicleId && !salesmanId) || !targetValue || !periodStart || !periodEnd) {
+        return res.status(400).json({ error: 'Vehicle or Salesman, target value, and period dates are required' });
     }
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
             INSERT INTO vehicle_targets(
                             id, vehicleId, salesmanId, targetType, periodType,
                             targetValue, periodStart, periodEnd, achievedValue, isActive, notes, createdBy
                         ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, 0, TRUE, ?, ?)
         `, [
-            id, vehicleId, salesmanId,
+            id, vehicleId || null, salesmanId || null,
             targetType || 'SALES_AMOUNT',
             periodType || 'DAILY',
             targetValue, periodStart, periodEnd,
@@ -3438,7 +3624,7 @@ const createVehicleMaintenance = (req, res) => __awaiter(void 0, void 0, void 0,
         return res.status(400).json({ error: 'Vehicle ID is required' });
     }
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
             INSERT INTO vehicle_maintenance(
                             id, vehicleId, maintenanceType, description, scheduledDate, completedDate,
@@ -3556,7 +3742,7 @@ const createVehicleFuelLog = (req, res) => __awaiter(void 0, void 0, void 0, fun
         return res.status(400).json({ error: 'Vehicle ID and liters are required' });
     }
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         // Calculate km per liter if we have previous full tank record
         let kmPerLiter = null;
         if (fullTank && mileage) {
@@ -3791,13 +3977,13 @@ const getSalesmanRoutes = (req, res) => __awaiter(void 0, void 0, void 0, functi
                             OR v.salesmanId IN(SELECT id FROM salesmen WHERE userId = ?)
                OR v.salesmanId = ?
                         `, [user === null || user === void 0 ? void 0 : user.id, user === null || user === void 0 ? void 0 : user.id, user === null || user === void 0 ? void 0 : user.id, user === null || user === void 0 ? void 0 : user.salesmanId]);
-        console.log(`📋 Vehicles found for user ${user === null || user === void 0 ? void 0 : user.id}: `, vehicles.map((v) => `${v.id} (${v.plateNumber})`));
+        // PERF: console.log(`📋 Vehicles found for user ${user?.id}: `, vehicles.map((v: any) => `${v.id} (${v.plateNumber})`));
         if (vehicles.length === 0) {
-            console.log(`📋 No vehicles found for user ${user === null || user === void 0 ? void 0 : user.id}(salesmanId: ${user === null || user === void 0 ? void 0 : user.salesmanId})`);
+            // PERF: console.log(`📋 No vehicles found for user ${user?.id}(salesmanId: ${user?.salesmanId})`);
             return res.json([]);
         }
         const vehicleIds = vehicles.map((v) => v.id);
-        console.log(`📋 Found ${vehicleIds.length} vehicles for user ${user === null || user === void 0 ? void 0 : user.id}: ${vehicleIds.join(', ')} `);
+        // PERF: console.log(`📋 Found ${vehicleIds.length} vehicles for user ${user?.id}: ${vehicleIds.join(', ')} `);
         // Get ALL routes for these vehicles (no date filter for mobile sync)
         const [routes] = yield db_1.pool.query(`
             SELECT r.*,
@@ -3834,7 +4020,7 @@ const getSalesmanRoutes = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 saleAmount: s.amountCollected
             }));
         }
-        console.log(`📋 Returning ${routes.length} routes with stops for user ${user === null || user === void 0 ? void 0 : user.id}`);
+        // PERF: console.log(`📋 Returning ${routes.length} routes with stops for user ${user?.id}`);
         res.json(routes);
     }
     catch (error) {
@@ -3928,10 +4114,10 @@ const createRoute = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
     if (!routeDate) {
         return res.status(400).json({ error: 'Route date is required' });
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        const routeId = (0, uuid_1.v4)();
+        const routeId = (0, crypto_1.randomUUID)();
         yield conn.query(`
             INSERT INTO vehicle_routes(id, vehicleId, routeName, routeDate, status, notes, createdBy)
                     VALUES(?, ?, ?, ?, 'PLANNED', ?, ?)
@@ -3940,7 +4126,7 @@ const createRoute = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         if (stops && Array.isArray(stops)) {
             for (let i = 0; i < stops.length; i++) {
                 const stop = stops[i];
-                const stopId = (0, uuid_1.v4)();
+                const stopId = (0, crypto_1.randomUUID)();
                 yield conn.query(`
                     INSERT INTO vehicle_route_stops(id, routeId, stopOrder, customerId, customerName, address, plannedArrival, notes)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?)
@@ -3963,7 +4149,7 @@ exports.createRoute = createRoute;
 const updateRoute = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { id } = req.params;
     const { vehicleId, routeName, routeDate, status, plannedDistance, actualDistance, startTime, endTime, notes, stops } = req.body;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Update the route basic info
@@ -3987,7 +4173,7 @@ const updateRoute = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
             // Insert new stops
             for (let i = 0; i < stops.length; i++) {
                 const stop = stops[i];
-                const stopId = (0, uuid_1.v4)();
+                const stopId = (0, crypto_1.randomUUID)();
                 yield conn.query(`
                     INSERT INTO vehicle_route_stops(id, routeId, customerId, customerName, address, stopOrder, status)
                     VALUES(?, ?, ?, ?, ?, ?, 'PENDING')
@@ -4028,7 +4214,7 @@ const addRouteStop = (req, res) => __awaiter(void 0, void 0, void 0, function* (
         // Get max stopOrder
         const [maxOrder] = yield db_1.pool.query('SELECT MAX(stopOrder) as maxOrder FROM vehicle_route_stops WHERE routeId = ?', [routeId]);
         const nextOrder = (((_a = maxOrder[0]) === null || _a === void 0 ? void 0 : _a.maxOrder) || 0) + 1;
-        const stopId = (0, uuid_1.v4)();
+        const stopId = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
             INSERT INTO vehicle_route_stops(id, routeId, stopOrder, customerId, customerName, address, plannedArrival, notes, latitude, longitude)
                     VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)

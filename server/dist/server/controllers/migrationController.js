@@ -12,39 +12,6 @@
  * - Opening Balances (أرصدة افتتاحية)
  * - Invoices (الفواتير) - Historical
  */
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -60,11 +27,15 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getMigrationStats = exports.importFromDatabase = exports.previewDatabaseTable = exports.getDatabaseTables = exports.testDatabaseConnection = exports.importData = exports.validateData = exports.parseUploadedFile = exports.downloadTemplate = exports.getEntities = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
-const XLSX = __importStar(require("xlsx"));
+const crypto_1 = require("crypto");
 const exceljs_1 = __importDefault(require("exceljs"));
 const promise_1 = __importDefault(require("mysql2/promise"));
 const errorHandler_1 = require("../utils/errorHandler");
+// Validate SQL identifiers to prevent injection (H2 security fix)
+const SAFE_SQL_IDENTIFIER = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+function isSafeIdentifier(name) {
+    return SAFE_SQL_IDENTIFIER.test(name) && name.length <= 64;
+}
 const ENTITY_DEFINITIONS = {
     categories: {
         name: 'categories',
@@ -165,32 +136,86 @@ const ENTITY_DEFINITIONS = {
 // HELPER FUNCTIONS
 // ========================================
 /**
- * Parse Excel/CSV file and return JSON data
+ * Parse Excel/CSV file and return JSON data (using ExcelJS)
  */
 function parseFile(buffer, filename) {
-    const workbook = XLSX.read(buffer, { type: 'buffer', cellDates: true });
-    // Find the data sheet - skip "تعليمات" (instructions) sheet
-    let sheetName = workbook.SheetNames[0];
-    // If there are multiple sheets, look for the data sheet
-    if (workbook.SheetNames.length > 1) {
-        // Find a sheet that's not instructions
-        const dataSheet = workbook.SheetNames.find(name => !name.includes('تعليمات') &&
-            !name.toLowerCase().includes('instruction'));
-        if (dataSheet) {
-            sheetName = dataSheet;
+    return __awaiter(this, void 0, void 0, function* () {
+        const workbook = new exceljs_1.default.Workbook();
+        try {
+            if (filename.toLowerCase().endsWith('.csv')) {
+                const stream = require('stream').Readable.from(buffer);
+                yield workbook.csv.read(stream);
+            }
+            else {
+                yield workbook.xlsx.load(buffer);
+            }
         }
-        else {
-            // Default to second sheet if first is instructions
-            sheetName = workbook.SheetNames[1] || workbook.SheetNames[0];
+        catch (err) {
+            throw new Error(`تعذر قراءة الملف. تأكد من أن الملف بصيغة صالحة (XLSX أو CSV). التفاصيل: ${err.message}`);
         }
-    }
-    const worksheet = workbook.Sheets[sheetName];
-    // Convert to JSON with header row
-    const data = XLSX.utils.sheet_to_json(worksheet, {
-        defval: null,
-        raw: false // Get strings for easier processing
+        // Find the data sheet - skip "تعليمات" (instructions) sheet
+        let worksheet = workbook.worksheets[0];
+        if (workbook.worksheets.length > 1) {
+            // Find a sheet that's not instructions
+            const dataSheet = workbook.worksheets.find(ws => !ws.name.includes('تعليمات') &&
+                !ws.name.toLowerCase().includes('instruction'));
+            if (dataSheet) {
+                worksheet = dataSheet;
+            }
+            else {
+                worksheet = workbook.worksheets[1] || workbook.worksheets[0];
+            }
+        }
+        // Extract headers from first row
+        const headers = [];
+        const headerRow = worksheet.getRow(1);
+        headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+            headers[colNumber] = cell.value ? String(cell.value).trim() : `Column${colNumber}`;
+        });
+        // Convert rows to JSON objects
+        const data = [];
+        worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+            if (rowNumber === 1)
+                return; // Skip header row
+            const rowObj = {};
+            let hasData = false;
+            row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+                const header = headers[colNumber];
+                if (!header)
+                    return;
+                let value = cell.value;
+                // Handle ExcelJS cell value types
+                if (value && typeof value === 'object') {
+                    if ('result' in value) {
+                        // Formula cell - use the result
+                        value = value.result;
+                    }
+                    else if ('richText' in value) {
+                        // Rich text - concatenate plain text
+                        value = value.richText.map((rt) => rt.text).join('');
+                    }
+                    else if (value instanceof Date) {
+                        value = value.toISOString().split('T')[0];
+                    }
+                }
+                // Convert to string for consistency (matching xlsx raw:false behavior)
+                rowObj[header] = value !== null && value !== undefined ? String(value) : null;
+                if (value !== null && value !== undefined && String(value).trim() !== '') {
+                    hasData = true;
+                }
+            });
+            // Also fill in missing headers with null
+            for (const h of headers) {
+                if (h && !(h in rowObj)) {
+                    rowObj[h] = null;
+                }
+            }
+            if (hasData) {
+                data.push(rowObj);
+            }
+        });
+        return data;
     });
-    return data;
 }
 /**
  * Auto-detect column mappings based on column names
@@ -261,7 +286,7 @@ function validateRow(row, mappings, entityType, rowIndex) {
  */
 function transformRow(row, mappings, entityType) {
     const entity = ENTITY_DEFINITIONS[entityType];
-    const result = { id: (0, uuid_1.v4)() };
+    const result = { id: (0, crypto_1.randomUUID)() };
     for (const [sourceColumn, targetField] of Object.entries(mappings)) {
         const field = entity.fields.find(f => f.name === targetField);
         if (!field)
@@ -379,6 +404,23 @@ const downloadTemplate = (req, res) => __awaiter(void 0, void 0, void 0, functio
             row.font = { size: 11, color: { argb: f.required ? 'FFDC2626' : 'FF6B7280' } };
         });
         instructionsSheet.addRow(['']);
+        // Add variant instructions for products
+        if (entity === 'products') {
+            const variantHeader = instructionsSheet.addRow(['📦 استيراد المتغيرات (Variants):']);
+            variantHeader.font = { bold: true, size: 14, color: { argb: 'FF7C3AED' } };
+            const variantInstructions = [
+                '• يوجد ورقة (Sheet) ثانية باسم "المتغيرات" لإضافة المتغيرات لكل منتج',
+                '• عمود "كود المنتج الأب" يجب أن يطابق الكود في ورقة المنتجات',
+                '• كل صف في ورقة المتغيرات يمثل متغير واحد (مثلاً: مقاس أو لون)',
+                '• عمود "الخصائص" اختياري بصيغة JSON مثلاً: {"لون":"أحمر","مقاس":"L"}',
+                '• إذا لم يكن للمنتج متغيرات، لا تضف شيئاً في ورقة المتغيرات',
+            ];
+            variantInstructions.forEach(inst => {
+                const row = instructionsSheet.addRow([inst]);
+                row.font = { size: 11, color: { argb: 'FF7C3AED' } };
+            });
+            instructionsSheet.addRow(['']);
+        }
         const successRow = instructionsSheet.addRow(['✅ بعد تجهيز البيانات، ارفع هذا الملف من خلال شاشة استيراد البيانات']);
         successRow.font = { size: 12, color: { argb: 'FF059669' } };
         // ========================================
@@ -491,6 +533,87 @@ const downloadTemplate = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 };
             });
         }
+        // ========================================
+        // SHEET 3 (PRODUCTS ONLY): VARIANTS TEMPLATE
+        // ========================================
+        if (entity === 'products') {
+            const variantSheet = workbook.addWorksheet('المتغيرات', {
+                views: [{ rightToLeft: true, state: 'frozen', ySplit: 1 }]
+            });
+            const variantHeaders = [
+                'كود المنتج الأب *',
+                'اسم المتغير *',
+                'كود المتغير',
+                'باركود',
+                'سعر الشراء',
+                'سعر البيع',
+                'الكمية',
+                'الخصائص (JSON)'
+            ];
+            const variantHeaderRow = variantSheet.addRow(variantHeaders);
+            variantHeaderRow.height = 25;
+            variantHeaderRow.eachCell((cell, colNumber) => {
+                const isRequired = colNumber <= 2;
+                cell.fill = {
+                    type: 'pattern',
+                    pattern: 'solid',
+                    fgColor: { argb: isRequired ? 'FF7C3AED' : 'FF8B5CF6' }
+                };
+                cell.font = { bold: true, size: 12, color: { argb: 'FFFFFFFF' } };
+                cell.alignment = { horizontal: 'center', vertical: 'middle' };
+                cell.border = {
+                    top: { style: 'thin', color: { argb: 'FF000000' } },
+                    left: { style: 'thin', color: { argb: 'FF000000' } },
+                    bottom: { style: 'medium', color: { argb: 'FF000000' } },
+                    right: { style: 'thin', color: { argb: 'FF000000' } }
+                };
+            });
+            // Variant column widths
+            const variantWidths = [18, 30, 18, 18, 14, 14, 10, 35];
+            variantWidths.forEach((w, i) => { variantSheet.getColumn(i + 1).width = w; });
+            // Sample variant data
+            const variantSamples = [
+                ['PRD-001', 'صابون عود - كبير', 'PRD-001-L', '6221234567893', 10.00, 18.00, 50, '{"مقاس":"كبير"}'],
+                ['PRD-001', 'صابون عود - صغير', 'PRD-001-S', '6221234567894', 7.00, 12.00, 80, '{"مقاس":"صغير"}'],
+                ['PRD-002', 'شامبو - 500 مل', 'PRD-002-500', '6221234567895', 15.00, 30.00, 30, '{"الحجم":"500 مل"}'],
+                ['PRD-002', 'شامبو - 250 مل', 'PRD-002-250', '6221234567896', 8.00, 16.00, 60, '{"الحجم":"250 مل"}'],
+            ];
+            variantSamples.forEach((rowData, index) => {
+                const row = variantSheet.addRow(rowData);
+                row.eachCell((cell) => {
+                    cell.fill = {
+                        type: 'pattern',
+                        pattern: 'solid',
+                        fgColor: { argb: index % 2 === 0 ? 'FFF5F3FF' : 'FFFFFFFF' }
+                    };
+                    cell.font = { size: 11, color: { argb: 'FF374151' } };
+                    cell.alignment = { horizontal: 'right', vertical: 'middle' };
+                    cell.border = {
+                        top: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+                        left: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+                        bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+                        right: { style: 'thin', color: { argb: 'FFE5E7EB' } }
+                    };
+                });
+            });
+            // Empty rows for data entry
+            for (let i = 0; i < 100; i++) {
+                const row = variantSheet.addRow(new Array(variantHeaders.length).fill(''));
+                row.eachCell((cell) => {
+                    cell.fill = {
+                        type: 'pattern',
+                        pattern: 'solid',
+                        fgColor: { argb: i % 2 === 0 ? 'FFFAFAFA' : 'FFFFFFFF' }
+                    };
+                    cell.border = {
+                        top: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+                        left: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+                        bottom: { style: 'thin', color: { argb: 'FFE5E7EB' } },
+                        right: { style: 'thin', color: { argb: 'FFE5E7EB' } }
+                    };
+                });
+            }
+        }
         // Generate buffer
         const buffer = yield workbook.xlsx.writeBuffer();
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -516,7 +639,7 @@ const parseUploadedFile = (req, res) => __awaiter(void 0, void 0, void 0, functi
         if (!entityType || !ENTITY_DEFINITIONS[entityType]) {
             return res.status(400).json({ error: 'نوع البيانات غير مدعوم' });
         }
-        const data = parseFile(req.file.buffer, req.file.originalname);
+        const data = yield parseFile(req.file.buffer, req.file.originalname);
         if (data.length === 0) {
             return res.status(400).json({ error: 'الملف فارغ' });
         }
@@ -551,7 +674,7 @@ const validateData = (req, res) => __awaiter(void 0, void 0, void 0, function* (
         if (!entityType || !ENTITY_DEFINITIONS[entityType]) {
             return res.status(400).json({ error: 'نوع البيانات غير مدعوم' });
         }
-        const data = parseFile(req.file.buffer, req.file.originalname);
+        const data = yield parseFile(req.file.buffer, req.file.originalname);
         const entity = ENTITY_DEFINITIONS[entityType];
         let allErrors = [];
         let allWarnings = [];
@@ -561,12 +684,13 @@ const validateData = (req, res) => __awaiter(void 0, void 0, void 0, function* (
         let conn;
         const existingValues = new Set();
         try {
-            conn = yield db_1.pool.getConnection();
+            conn = yield (0, db_1.getConnection)();
             if (entity.uniqueField) {
                 const uniqueField = entity.uniqueField;
+                // uniqueField is from code-defined ENTITY_DEFINITIONS, safe for SQL
                 const sourceColumn = Object.keys(parsedMappings).find(key => parsedMappings[key] === uniqueField);
                 if (sourceColumn) {
-                    const [rows] = yield conn.query(`SELECT ${uniqueField} FROM ${entity.tableName}`);
+                    const [rows] = yield conn.query(`SELECT \`${uniqueField}\` FROM \`${entity.tableName}\``);
                     rows.forEach((row) => existingValues.add(String(row[uniqueField]).toLowerCase()));
                 }
             }
@@ -634,9 +758,9 @@ const importData = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         if (!entityType || !ENTITY_DEFINITIONS[entityType]) {
             return res.status(400).json({ error: 'نوع البيانات غير مدعوم' });
         }
-        const data = parseFile(req.file.buffer, req.file.originalname);
+        const data = yield parseFile(req.file.buffer, req.file.originalname);
         const entity = ENTITY_DEFINITIONS[entityType];
-        conn = yield db_1.pool.getConnection();
+        conn = yield (0, db_1.getConnection)();
         yield conn.beginTransaction();
         let imported = 0;
         let updated = 0;
@@ -644,12 +768,23 @@ const importData = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         const errors = [];
         // Get existing records for duplicate checking
         const existingRecords = new Map();
+        // Lookup maps for resolving names to IDs
+        const categoriesMap = new Map();
+        const warehousesMap = new Map();
         if (entity.uniqueField) {
             const uniqueField = entity.uniqueField;
-            const [rows] = yield conn.query(`SELECT * FROM ${entity.tableName}`);
+            const [rows] = yield conn.query(`SELECT * FROM \`${entity.tableName}\``);
             rows.forEach((row) => {
                 existingRecords.set(String(row[uniqueField]).toLowerCase(), row);
             });
+        }
+        // Pre-fetch categories and warehouses for products
+        if (entityType === 'products') {
+            const [cats] = yield conn.query('SELECT id, name FROM categories');
+            cats.forEach((c) => categoriesMap.set(c.name.toLowerCase(), c.id));
+            const [warehouses] = yield conn.query('SELECT id, name FROM warehouses');
+            warehouses.forEach((w) => warehousesMap.set(w.name.toLowerCase(), w.id));
+            console.log(`📋 Loaded ${categoriesMap.size} categories and ${warehousesMap.size} warehouses for lookup`);
         }
         for (let i = 0; i < data.length; i++) {
             const row = data[i];
@@ -677,10 +812,10 @@ const importData = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                     else if (duplicateAction === 'update') {
                         // Update existing record
                         const updateFields = Object.keys(transformed)
-                            .filter(k => k !== 'id' && transformed[k] !== undefined)
-                            .map(k => `${k} = ?`);
+                            .filter(k => k !== 'id' && transformed[k] !== undefined && isSafeIdentifier(k))
+                            .map(k => `\`${k}\` = ?`);
                         const updateValues = Object.keys(transformed)
-                            .filter(k => k !== 'id' && transformed[k] !== undefined)
+                            .filter(k => k !== 'id' && transformed[k] !== undefined && isSafeIdentifier(k))
                             .map(k => transformed[k]);
                         if (updateFields.length > 0) {
                             yield conn.query(`UPDATE ${entity.tableName} SET ${updateFields.join(', ')} WHERE id = ?`, [...updateValues, existingRecord.id]);
@@ -689,6 +824,31 @@ const importData = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                         continue;
                     }
                     // duplicateAction === 'create' - create new with different ID
+                }
+                // Look up Category and Warehouse IDs for Products (resolve name -> UUID)
+                if (entityType === 'products') {
+                    if (transformed.categoryId && typeof transformed.categoryId === 'string') {
+                        const catId = categoriesMap.get(transformed.categoryId.toLowerCase());
+                        if (catId) {
+                            console.log(`🏷️ Resolved category "${transformed.categoryId}" -> ${catId}`);
+                            transformed.categoryId = catId;
+                        }
+                        else {
+                            console.log(`⚠️ Category "${transformed.categoryId}" not found, setting to null`);
+                            transformed.categoryId = null;
+                        }
+                    }
+                    if (transformed.warehouseId && typeof transformed.warehouseId === 'string') {
+                        const whId = warehousesMap.get(transformed.warehouseId.toLowerCase());
+                        if (whId) {
+                            console.log(`🏢 Resolved warehouse "${transformed.warehouseId}" -> ${whId}`);
+                            transformed.warehouseId = whId;
+                        }
+                        else {
+                            console.log(`⚠️ Warehouse "${transformed.warehouseId}" not found, setting to null`);
+                            transformed.warehouseId = null;
+                        }
+                    }
                 }
                 // Insert new record
                 const fields = Object.keys(transformed).filter(k => transformed[k] !== undefined);
@@ -706,21 +866,101 @@ const importData = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 skipped++;
             }
         }
+        // ========================================
+        // VARIANT IMPORT (Products only)
+        // ========================================
+        let variantsImported = 0;
+        if (entityType === 'products' && req.file) {
+            try {
+                const variantRows = yield parseVariantsSheet(req.file.buffer);
+                if (variantRows.length > 0) {
+                    // Build SKU → product ID map from DB (includes just-imported products)
+                    const [allProducts] = yield conn.query('SELECT id, sku FROM products');
+                    const skuToId = new Map();
+                    allProducts.forEach((p) => {
+                        if (p.sku)
+                            skuToId.set(String(p.sku).trim().toLowerCase(), p.id);
+                    });
+                    for (let vi = 0; vi < variantRows.length; vi++) {
+                        const vRow = variantRows[vi];
+                        const parentSku = String(vRow.parentSku || '').trim();
+                        const variantName = String(vRow.name || '').trim();
+                        if (!parentSku || !variantName) {
+                            errors.push(`المتغيرات صف ${vi + 1}: كود المنتج الأب والاسم مطلوبان`);
+                            continue;
+                        }
+                        const productId = skuToId.get(parentSku.toLowerCase());
+                        if (!productId) {
+                            errors.push(`المتغيرات صف ${vi + 1}: المنتج بكود "${parentSku}" غير موجود`);
+                            continue;
+                        }
+                        try {
+                            const variantId = (0, crypto_1.randomUUID)();
+                            let attributes = null;
+                            if (vRow.attributes) {
+                                try {
+                                    // Validate JSON
+                                    JSON.parse(vRow.attributes);
+                                    attributes = vRow.attributes;
+                                }
+                                catch (_a) {
+                                    attributes = null;
+                                }
+                            }
+                            yield conn.query(`INSERT INTO product_variants (id, productId, name, sku, barcode, purchasePrice, sellingPrice, stock, attributes, isActive)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, TRUE)`, [
+                                variantId,
+                                productId,
+                                variantName,
+                                vRow.sku || null,
+                                vRow.barcode || null,
+                                Number(vRow.purchasePrice) || 0,
+                                Number(vRow.sellingPrice) || 0,
+                                Number(vRow.stock) || 0,
+                                attributes
+                            ]);
+                            variantsImported++;
+                        }
+                        catch (vErr) {
+                            errors.push(`المتغيرات صف ${vi + 1}: ${vErr.message}`);
+                        }
+                    }
+                    // Update embeddedVariantCount on parent products
+                    if (variantsImported > 0) {
+                        yield conn.query(`
+                            UPDATE products p
+                            SET p.embeddedVariantCount = (
+                                SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = TRUE
+                            )
+                            WHERE p.id IN (SELECT DISTINCT productId FROM product_variants)
+                        `).catch((e) => console.warn('⚠️ Could not update embeddedVariantCount:', e.message));
+                    }
+                    console.log(`📦 Variants imported: ${variantsImported}`);
+                }
+            }
+            catch (variantError) {
+                console.warn('⚠️ Variant sheet processing error:', variantError.message);
+                // Non-fatal — products were already imported
+            }
+        }
         yield conn.commit();
         // Log audit
         try {
-            yield conn.query(`INSERT INTO audit_log (id, date, user, module, action, details) VALUES (?, NOW(), ?, ?, ?, ?)`, [(0, uuid_1.v4)(), user, 'MIGRATION', 'IMPORT', `Imported ${imported} ${entity.arabicName}, Updated ${updated}, Skipped ${skipped}`]);
+            const variantMsg = variantsImported > 0 ? ` + ${variantsImported} متغير` : '';
+            yield conn.query(`INSERT INTO audit_log (id, date, user, module, action, details) VALUES (?, NOW(), ?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), user, 'MIGRATION', 'IMPORT', `Imported ${imported} ${entity.arabicName}${variantMsg}, Updated ${updated}, Skipped ${skipped}`]);
         }
         catch (auditError) {
             // Ignore audit error
         }
+        const variantMsg = variantsImported > 0 ? ` و ${variantsImported} متغير` : '';
         res.json({
             success: true,
             imported,
             updated,
             skipped,
+            variantsImported,
             errors: errors.slice(0, 20),
-            message: `تم استيراد ${imported} سجل بنجاح${updated > 0 ? ` وتحديث ${updated}` : ''}${skipped > 0 ? ` وتخطي ${skipped}` : ''}`
+            message: `تم استيراد ${imported} سجل بنجاح${variantMsg}${updated > 0 ? ` وتحديث ${updated}` : ''}${skipped > 0 ? ` وتخطي ${skipped}` : ''}`
         });
     }
     catch (error) {
@@ -735,6 +975,100 @@ const importData = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
     }
 });
 exports.importData = importData;
+// ========================================
+// VARIANT SHEET PARSER
+// ========================================
+/**
+ * Parse the "المتغيرات" (Variants) sheet from a products Excel file.
+ * Returns an array of variant row objects. If the sheet doesn't exist, returns [].
+ */
+function parseVariantsSheet(buffer) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const workbook = new exceljs_1.default.Workbook();
+        yield workbook.xlsx.load(buffer);
+        // Find the variants sheet by name
+        const variantSheet = workbook.worksheets.find(ws => ws.name.includes('متغيرات') || ws.name.toLowerCase().includes('variant'));
+        if (!variantSheet)
+            return [];
+        // Known header mapping (Arabic header → field name)
+        const VARIANT_HEADER_MAP = {
+            'كود المنتج الأب': 'parentSku',
+            'كود المنتج الأب *': 'parentSku',
+            'اسم المتغير': 'name',
+            'اسم المتغير *': 'name',
+            'كود المتغير': 'sku',
+            'باركود': 'barcode',
+            'سعر الشراء': 'purchasePrice',
+            'سعر البيع': 'sellingPrice',
+            'الكمية': 'stock',
+            'الخصائص (JSON)': 'attributes',
+            'الخصائص': 'attributes',
+            // English fallbacks
+            'Parent SKU': 'parentSku',
+            'Variant Name': 'name',
+            'Variant SKU': 'sku',
+            'Barcode': 'barcode',
+            'Purchase Price': 'purchasePrice',
+            'Selling Price': 'sellingPrice',
+            'Stock': 'stock',
+            'Attributes': 'attributes',
+        };
+        // Read headers from first row
+        const headers = [];
+        const headerRow = variantSheet.getRow(1);
+        headerRow.eachCell({ includeEmpty: false }, (cell, colNumber) => {
+            const raw = cell.value ? String(cell.value).trim().replace(/\s*\*\s*$/, '').trim() : '';
+            headers[colNumber] = raw;
+        });
+        // Map column numbers to field names
+        const colFieldMap = {};
+        for (const [colNum, headerText] of Object.entries(headers)) {
+            if (!headerText)
+                continue;
+            // Try exact match first, then match with * stripped
+            const originalHeader = String(variantSheet.getRow(1).getCell(Number(colNum)).value || '').trim();
+            const fieldName = VARIANT_HEADER_MAP[originalHeader] || VARIANT_HEADER_MAP[headerText];
+            if (fieldName)
+                colFieldMap[Number(colNum)] = fieldName;
+        }
+        // Parse data rows
+        const results = [];
+        variantSheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+            if (rowNumber === 1)
+                return;
+            const rowObj = {};
+            let hasData = false;
+            row.eachCell({ includeEmpty: true }, (cell, colNumber) => {
+                const fieldName = colFieldMap[colNumber];
+                if (!fieldName)
+                    return;
+                let value = cell.value;
+                if (value && typeof value === 'object') {
+                    if ('result' in value)
+                        value = value.result;
+                    else if ('richText' in value)
+                        value = value.richText.map((rt) => rt.text).join('');
+                }
+                rowObj[fieldName] = value !== null && value !== undefined ? String(value).trim() : null;
+                if (value !== null && value !== undefined && String(value).trim() !== '')
+                    hasData = true;
+            });
+            if (hasData && rowObj.parentSku && rowObj.name) {
+                results.push({
+                    parentSku: rowObj.parentSku || '',
+                    name: rowObj.name || '',
+                    sku: rowObj.sku || null,
+                    barcode: rowObj.barcode || null,
+                    purchasePrice: Number(rowObj.purchasePrice) || 0,
+                    sellingPrice: Number(rowObj.sellingPrice) || 0,
+                    stock: Number(rowObj.stock) || 0,
+                    attributes: rowObj.attributes || null,
+                });
+            }
+        });
+        return results;
+    });
+}
 /**
  * POST /api/migration/test-connection
  * Test connection to external database
@@ -794,8 +1128,11 @@ const getDatabaseTables = (req, res) => __awaiter(void 0, void 0, void 0, functi
             const tableNames = tables.map((t) => Object.values(t)[0]);
             const tableStructures = {};
             for (const tableName of tableNames) {
-                const [columns] = yield connection.query(`DESCRIBE ${tableName}`);
-                const [count] = yield connection.query(`SELECT COUNT(*) as count FROM ${tableName}`);
+                // Validate table name from external DB (H2 security fix)
+                if (!isSafeIdentifier(tableName))
+                    continue;
+                const [columns] = yield connection.query(`DESCRIBE \`${tableName}\``);
+                const [count] = yield connection.query(`SELECT COUNT(*) as count FROM \`${tableName}\``);
                 tableStructures[tableName] = {
                     columns: columns.map((c) => ({
                         name: c.Field,
@@ -838,8 +1175,12 @@ const previewDatabaseTable = (req, res) => __awaiter(void 0, void 0, void 0, fun
                 password,
                 database
             });
-            const [rows] = yield connection.query(`SELECT * FROM ${tableName} LIMIT ?`, [limit]);
-            const [columns] = yield connection.query(`DESCRIBE ${tableName}`);
+            // Validate table name (H2 security fix)
+            if (!tableName || !isSafeIdentifier(tableName)) {
+                return res.status(400).json({ error: 'Invalid table name' });
+            }
+            const [rows] = yield connection.query(`SELECT * FROM \`${tableName}\` LIMIT ?`, [limit]);
+            const [columns] = yield connection.query(`DESCRIBE \`${tableName}\``);
             yield connection.end();
             res.json({
                 success: true,
@@ -884,10 +1225,14 @@ const importFromDatabase = (req, res) => __awaiter(void 0, void 0, void 0, funct
         else {
             return res.status(400).json({ error: 'نوع قاعدة البيانات غير مدعوم حالياً' });
         }
+        // Validate external table name (H2 security fix)
+        if (!tableName || !isSafeIdentifier(tableName)) {
+            return res.status(400).json({ error: 'Invalid table name' });
+        }
         // Fetch all data from external table
-        const [externalData] = yield externalConn.query(`SELECT * FROM ${tableName}`);
+        const [externalData] = yield externalConn.query(`SELECT * FROM \`${tableName}\``);
         // Connect to local database
-        localConn = yield db_1.pool.getConnection();
+        localConn = yield (0, db_1.getConnection)();
         yield localConn.beginTransaction();
         // Get existing records
         const existingRecords = new Map();
@@ -906,7 +1251,7 @@ const importFromDatabase = (req, res) => __awaiter(void 0, void 0, void 0, funct
             const row = externalData[i];
             try {
                 // Transform row based on mappings
-                const transformed = { id: (0, uuid_1.v4)() };
+                const transformed = { id: (0, crypto_1.randomUUID)() };
                 for (const [externalField, localField] of Object.entries(mappings)) {
                     if (row[externalField] !== undefined) {
                         const field = entity.fields.find(f => f.name === localField);
@@ -974,7 +1319,7 @@ const importFromDatabase = (req, res) => __awaiter(void 0, void 0, void 0, funct
         yield localConn.commit();
         // Log audit
         try {
-            yield localConn.query(`INSERT INTO audit_log (id, date, user, module, action, details) VALUES (?, NOW(), ?, ?, ?, ?)`, [(0, uuid_1.v4)(), currentUser, 'MIGRATION', 'DB_IMPORT', `Imported from ${database}.${tableName}: ${imported} ${entity.arabicName}, Updated ${updated}, Skipped ${skipped}`]);
+            yield localConn.query(`INSERT INTO audit_log (id, date, user, module, action, details) VALUES (?, NOW(), ?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), currentUser, 'MIGRATION', 'DB_IMPORT', `Imported from ${database}.${tableName}: ${imported} ${entity.arabicName}, Updated ${updated}, Skipped ${skipped}`]);
         }
         catch (auditError) {
             // Ignore
@@ -1010,7 +1355,7 @@ exports.importFromDatabase = importFromDatabase;
 const getMigrationStats = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     let conn;
     try {
-        conn = yield db_1.pool.getConnection();
+        conn = yield (0, db_1.getConnection)();
         const stats = {};
         for (const [key, entity] of Object.entries(ENTITY_DEFINITIONS)) {
             try {

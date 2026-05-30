@@ -84,7 +84,7 @@ const getQCTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 exports.getQCTemplate = getQCTemplate;
 // Create QC template with criteria
 const createQCTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id, code, name, productId, description, checkType, isActive, criteria } = req.body;
@@ -156,7 +156,7 @@ const createQCTemplate = (req, res) => __awaiter(void 0, void 0, void 0, functio
 exports.createQCTemplate = createQCTemplate;
 // Update QC template
 const updateQCTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
@@ -327,7 +327,7 @@ const getQualityCheck = (req, res) => __awaiter(void 0, void 0, void 0, function
 exports.getQualityCheck = getQualityCheck;
 // Create quality check
 const createQualityCheck = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id, checkNumber, templateId, productionOrderId, productId, batchNumber, qtyInspected, inspector, results, defects } = req.body;
@@ -409,7 +409,7 @@ const createQualityCheck = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.createQualityCheck = createQualityCheck;
 // Complete quality check
 const completeQualityCheck = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;

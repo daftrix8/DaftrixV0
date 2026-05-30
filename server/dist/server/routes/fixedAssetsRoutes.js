@@ -2,9 +2,12 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const fixedAssetsController_1 = require("../controllers/fixedAssetsController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const policyMiddleware_1 = require("../middleware/policyMiddleware");
 const router = (0, express_1.Router)();
-router.get('/fixed-assets', fixedAssetsController_1.getFixedAssets);
-router.post('/fixed-assets', fixedAssetsController_1.createFixedAsset);
-router.put('/fixed-assets/:id', fixedAssetsController_1.updateFixedAsset);
-router.delete('/fixed-assets/:id', fixedAssetsController_1.deleteFixedAsset);
+router.get('/fixed-assets', (0, authMiddleware_1.requirePermission)('accounting.fixed_assets'), fixedAssetsController_1.getFixedAssets);
+router.post('/fixed-assets', (0, authMiddleware_1.requirePermission)('accounting.fixed_assets'), (0, policyMiddleware_1.enforceLockDate)(), fixedAssetsController_1.createFixedAsset);
+router.put('/fixed-assets/:id', (0, authMiddleware_1.requirePermission)('accounting.fixed_assets'), fixedAssetsController_1.updateFixedAsset);
+router.delete('/fixed-assets/:id', (0, authMiddleware_1.requirePermission)('accounting.fixed_assets'), fixedAssetsController_1.deleteFixedAsset);
+router.post('/fixed-assets/:id/depreciate', (0, authMiddleware_1.requirePermission)('accounting.fixed_assets'), (0, policyMiddleware_1.enforceLockDate)(), fixedAssetsController_1.postDepreciation);
 exports.default = router;

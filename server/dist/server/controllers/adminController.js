@@ -13,13 +13,22 @@ exports.fiscalYearRollover = exports.resetDatabase = void 0;
 const db_1 = require("../db");
 const backupController_1 = require("./backupController");
 const errorHandler_1 = require("../utils/errorHandler");
-// Admin password from environment or default
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+// Admin password from environment — NO DEFAULT (C4 security fix)
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+if (!ADMIN_PASSWORD) {
+    console.warn('⚠️ [SECURITY] ADMIN_PASSWORD not set in .env — database reset/rollover will be disabled.');
+}
 /**
- * Verify admin password
+ * Verify admin password — constant-time comparison to prevent timing attacks
  */
 function verifyPassword(password) {
-    return password === ADMIN_PASSWORD;
+    if (!ADMIN_PASSWORD || !password)
+        return false;
+    // Use constant-time comparison
+    if (password.length !== ADMIN_PASSWORD.length)
+        return false;
+    const crypto = require('crypto');
+    return crypto.timingSafeEqual(Buffer.from(password, 'utf8'), Buffer.from(ADMIN_PASSWORD, 'utf8'));
 }
 /**
  * Helper function to safely delete from a table
@@ -27,13 +36,13 @@ function verifyPassword(password) {
 function safeDelete(conn, table) {
     return __awaiter(this, void 0, void 0, function* () {
         try {
-            yield conn.query(`DELETE FROM ${table}`);
-            console.log(`  ✓ Deleted: ${table}`);
+            yield conn.query(`DELETE FROM ${table} `);
+            console.log(`  ✓ Deleted: ${table} `);
         }
         catch (err) {
             // Table might not exist - that's OK
             if (!err.message.includes("doesn't exist")) {
-                console.log(`  ⚠️ Warning deleting ${table}: ${err.message}`);
+                console.log(`  ⚠️ Warning deleting ${table}: ${err.message} `);
             }
         }
     });
@@ -49,7 +58,7 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (!verifyPassword(password)) {
             return res.status(403).json({ message: 'Invalid password' });
         }
-        console.log(`🔄 Starting database reset (${mode})...`);
+        console.log(`🔄 Starting database reset(${mode})...`);
         const conn = yield (0, db_1.getConnection)();
         // Disable foreign key checks temporarily
         yield conn.query('SET FOREIGN_KEY_CHECKS = 0');
@@ -68,6 +77,9 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // Journal entries
         yield safeDelete(conn, 'journal_lines');
         yield safeDelete(conn, 'journal_entries');
+        // Account & Bank transactions
+        yield safeDelete(conn, 'account_transactions');
+        yield safeDelete(conn, 'bank_transactions');
         // Cheques
         yield safeDelete(conn, 'cheques');
         // Stock & Inventory
@@ -77,6 +89,26 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         yield safeDelete(conn, 'stock_taking_items');
         yield safeDelete(conn, 'stock_taking_sessions');
         yield safeDelete(conn, 'product_stocks');
+        yield safeDelete(conn, 'inventory_batches');
+        yield safeDelete(conn, 'inventory_lots');
+        // Serial tracking
+        yield safeDelete(conn, 'serial_transactions');
+        yield safeDelete(conn, 'product_serials');
+        // Commission & Sales tracking
+        yield safeDelete(conn, 'commission_records');
+        yield safeDelete(conn, 'commission_tiers');
+        yield safeDelete(conn, 'customer_visits');
+        yield safeDelete(conn, 'batch_genealogy');
+        // HR transactional data
+        yield safeDelete(conn, 'attendance_records');
+        yield safeDelete(conn, 'payroll_entries');
+        yield safeDelete(conn, 'payroll_cycles');
+        yield safeDelete(conn, 'employee_advances');
+        // Branch transfers
+        yield safeDelete(conn, 'branch_transfer_items');
+        yield safeDelete(conn, 'branch_transfers');
+        // Insurance & other
+        yield safeDelete(conn, 'insurance');
         // Audit
         yield safeDelete(conn, 'audit_logs');
         // Van Sales / Mobile Distribution
@@ -126,7 +158,7 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 for (const bank of bankAccounts) {
                     if (bank.accountId) {
                         yield conn.query('DELETE FROM accounts WHERE id = ?', [bank.accountId]);
-                        console.log(`  ✓ Deleted bank account: ${bank.accountId}`);
+                        console.log(`  ✓ Deleted bank account: ${bank.accountId} `);
                     }
                 }
             }
@@ -135,15 +167,50 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             }
             // Now delete banks table
             yield safeDelete(conn, 'banks');
+            // HR data
+            yield safeDelete(conn, 'employee_salary_structure');
+            yield safeDelete(conn, 'employee_payroll_templates');
+            yield safeDelete(conn, 'structure_assignments');
+            yield safeDelete(conn, 'additional_salary_entries');
+            yield safeDelete(conn, 'employees');
+            // Salesman targets
+            yield safeDelete(conn, 'salesman_targets');
+            // Exchange rates
+            yield safeDelete(conn, 'exchange_rates');
+            yield safeDelete(conn, 'currencies');
+            // Egyptian tax
+            yield safeDelete(conn, 'egyptian_tax_brackets');
+            // Fiscal years
+            yield safeDelete(conn, 'fiscal_years');
             // Users & permissions
             yield safeDelete(conn, 'permissions');
             yield safeDelete(conn, 'users');
-            // ====================================
-            // Step 5: Reset remaining account balances
-            // ====================================
-            console.log('💰 Step 5: Resetting account balances...');
-            yield conn.query('UPDATE accounts SET balance = openingBalance');
-            console.log('✅ All data deleted successfully');
+            console.log('💰 Step 5: Resetting account balances to zero (keeping chart of accounts)...');
+            // Reset ALL account balances to 0 (keep the accounts structure intact)
+            yield conn.query('UPDATE accounts SET balance = 0, openingBalance = 0');
+            console.log('  ✓ All account balances reset to 0');
+            // Delete system config (initDB will recreate defaults)
+            yield safeDelete(conn, 'system_config');
+            // POS data
+            yield safeDelete(conn, 'pos_shifts');
+            yield safeDelete(conn, 'pos_sessions');
+            yield safeDelete(conn, 'pos_terminals');
+            // Payroll templates & structures
+            yield safeDelete(conn, 'salary_structures');
+            yield safeDelete(conn, 'salary_structure_components');
+            yield safeDelete(conn, 'payroll_templates');
+            yield safeDelete(conn, 'payroll_template_components');
+            yield safeDelete(conn, 'payroll_gl_mappings');
+            // Leave management
+            yield safeDelete(conn, 'leave_requests');
+            yield safeDelete(conn, 'leave_allocations');
+            yield safeDelete(conn, 'leave_types');
+            // Loan data
+            yield safeDelete(conn, 'loan_repayments');
+            yield safeDelete(conn, 'loans');
+            // Work entries
+            yield safeDelete(conn, 'work_entries');
+            console.log('✅ ALL data deleted — true factory reset');
         }
         else {
             // ====================================
@@ -151,8 +218,14 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             // ====================================
             console.log('💰 Resetting balances...');
             yield conn.query('UPDATE accounts SET balance = openingBalance');
-            yield conn.query('UPDATE partners SET balance = openingBalance');
-            yield conn.query('UPDATE banks SET balance = 0');
+            try {
+                yield conn.query('UPDATE partners SET balance = openingBalance');
+            }
+            catch ( /* column might not exist */_a) { /* column might not exist */ }
+            try {
+                yield conn.query('UPDATE banks SET balance = 0');
+            }
+            catch ( /* table might not exist */_b) { /* table might not exist */ }
             yield conn.query('UPDATE products SET stock = 0');
             console.log('✅ Balances reset successfully');
         }
@@ -189,11 +262,11 @@ const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 'audit_logs'
             ];
         res.json({
-            message: `Database reset successful (${mode})`,
+            message: `Database reset successful(${mode})`,
             mode: mode,
             cleared: clearedTables,
             kept: mode === 'FULL'
-                ? ['accounts (core chart of accounts)', 'system_config']
+                ? ['nothing — true factory reset, initDB will recreate defaults']
                 : ['accounts', 'products', 'partners', 'warehouses', 'categories', 'all master data']
         });
     }
@@ -244,7 +317,7 @@ const fiscalYearRollover = (req, res) => __awaiter(void 0, void 0, void 0, funct
             SELECT productId, warehouseId, stock 
             FROM product_stocks 
             WHERE stock > 0
-        `);
+    `);
         // Step 5: Delete transaction history (using safe delete)
         console.log('🗑️ Step 4: Clearing transaction history...');
         // Payment & Invoice related
@@ -282,7 +355,7 @@ const fiscalYearRollover = (req, res) => __awaiter(void 0, void 0, void 0, funct
         // Step 6: Restore stock from snapshot (these are now "opening" stocks)
         console.log('📦 Step 5: Restoring stock positions...');
         yield conn.query(`
-            INSERT INTO product_stocks (id, productId, warehouseId, stock)
+            INSERT INTO product_stocks(id, productId, warehouseId, stock)
             SELECT UUID(), productId, warehouseId, stock
             FROM temp_stock_snapshot
         `);
@@ -300,7 +373,7 @@ const fiscalYearRollover = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 config.currentFiscalYear = newYearName;
                 config.lastRolloverDate = new Date().toISOString();
                 yield conn.query('UPDATE system_config SET config = ?', [JSON.stringify(config)]);
-                console.log(`  ✓ Updated fiscal year to: ${newYearName}`);
+                console.log(`  ✓ Updated fiscal year to: ${newYearName} `);
             }
             catch (e) {
                 console.log('  ⚠️ Could not update system config (might not exist)');

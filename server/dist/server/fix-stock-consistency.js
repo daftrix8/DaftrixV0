@@ -16,7 +16,7 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const path_1 = __importDefault(require("path"));
 dotenv_1.default.config({ path: path_1.default.join(__dirname, '.env') });
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 function fixStockConsistency() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
@@ -35,7 +35,7 @@ function fixStockConsistency() {
             const [warehouses] = yield db_1.pool.query('SELECT id FROM warehouses');
             const defaultWarehouseId = (_a = warehouses[0]) === null || _a === void 0 ? void 0 : _a.id;
             // Prepare Opening Balance Permit
-            const openingPermitId = (0, uuid_1.v4)();
+            const openingPermitId = (0, crypto_1.randomUUID)();
             // Note: Using destWarehouseId for IN permit. sourceWarehouseId is null.
             yield db_1.pool.query(`
             INSERT INTO stock_permits (id, date, type, description, destWarehouseId)
@@ -100,7 +100,7 @@ function fixStockConsistency() {
                 yield db_1.pool.query('UPDATE products SET stock = ? WHERE id = ?', [finalStock, product.id]);
                 // E. Insert into product_stocks
                 for (const [whId, stock] of warehouseMap.entries()) {
-                    yield db_1.pool.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, uuid_1.v4)(), product.id, whId, stock]);
+                    yield db_1.pool.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), product.id, whId, stock]);
                 }
             }
             console.log('✅ Successfully recalculated all stock balances and created opening balances.');

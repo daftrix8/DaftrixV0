@@ -11,9 +11,10 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.convertQuantity = exports.bulkCreateUnits = exports.getStockInAllUnits = exports.deleteProductUnit = exports.updateProductUnit = exports.createProductUnit = exports.getUnitByBarcode = exports.getProductUnits = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const auditController_1 = require("./auditController");
 const errorHandler_1 = require("../utils/errorHandler");
+const eventBus_1 = require("../utils/eventBus");
 // ========================================
 // PRODUCT UNITS CONTROLLER
 // وحدات قياس المنتج - البيع بوحدات متعددة
@@ -78,11 +79,11 @@ const getUnitByBarcode = (req, res) => __awaiter(void 0, void 0, void 0, functio
 exports.getUnitByBarcode = getUnitByBarcode;
 // Create a new unit for a product
 const createProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b;
     try {
         const { productId } = req.params;
         const { unitName, unitNameEn, conversionFactor, isBaseUnit, barcode, purchasePrice, salePrice, wholesalePrice, minSaleQty, sortOrder } = req.body;
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         const conn = yield (0, db_1.getConnection)();
         // If this is being set as base unit, clear other base units first
         if (isBaseUnit) {
@@ -116,14 +117,10 @@ const createProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, functi
             UPDATE products SET hasMultipleUnits = TRUE WHERE id = ?
         `, [productId]);
         conn.release();
-        // @ts-ignore
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.username) || req.body.user || 'System';
+        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
         yield (0, auditController_1.logAction)(user, 'PRODUCT_UNIT', 'CREATE', `إضافة وحدة قياس: ${unitName}`, `المنتج: ${productId} | عامل التحويل: ${conversionFactor}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'product-units', productId, updatedBy: user });
-        }
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'product-units', productId, updatedBy: user });
         res.status(201).json(Object.assign({ id, productId }, req.body));
     }
     catch (error) {
@@ -137,7 +134,7 @@ const createProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, functi
 exports.createProductUnit = createProductUnit;
 // Update a product unit
 const updateProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b;
     try {
         const { productId, unitId } = req.params;
         const { unitName, unitNameEn, conversionFactor, isBaseUnit, barcode, purchasePrice, salePrice, wholesalePrice, minSaleQty, isActive, sortOrder } = req.body;
@@ -172,14 +169,10 @@ const updateProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, functi
             unitId, productId
         ]);
         conn.release();
-        // @ts-ignore
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.username) || req.body.user || 'System';
+        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
         yield (0, auditController_1.logAction)(user, 'PRODUCT_UNIT', 'UPDATE', `تعديل وحدة قياس: ${unitName}`, `المنتج: ${productId} | عامل التحويل: ${conversionFactor}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'product-units', productId, updatedBy: user });
-        }
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'product-units', productId, updatedBy: user });
         res.json(Object.assign({ id: unitId, productId }, req.body));
     }
     catch (error) {
@@ -190,7 +183,7 @@ const updateProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, functi
 exports.updateProductUnit = updateProductUnit;
 // Delete a product unit
 const deleteProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c;
     try {
         const { productId, unitId } = req.params;
         const conn = yield (0, db_1.getConnection)();
@@ -216,14 +209,10 @@ const deleteProductUnit = (req, res) => __awaiter(void 0, void 0, void 0, functi
             `, [productId]);
         }
         conn.release();
-        // @ts-ignore
-        const user = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.query.user || 'System';
+        const user = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || ((_c = req.user) === null || _c === void 0 ? void 0 : _c.username) || req.query.user || 'System';
         yield (0, auditController_1.logAction)(user, 'PRODUCT_UNIT', 'DELETE', `حذف وحدة قياس: ${unitName}`, `المنتج: ${productId}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:deleted', { entityType: 'product-units', entityId: unitId, productId, deletedBy: user });
-        }
+        eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'product-units', entityId: unitId, productId, deletedBy: user });
         res.json({ message: 'Unit deleted successfully' });
     }
     catch (error) {
@@ -284,7 +273,7 @@ const getStockInAllUnits = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.getStockInAllUnits = getStockInAllUnits;
 // Bulk create units for a product (useful for initial setup)
 const bulkCreateUnits = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b;
     try {
         const { productId } = req.params;
         const { units } = req.body; // Array of unit objects
@@ -298,7 +287,7 @@ const bulkCreateUnits = (req, res) => __awaiter(void 0, void 0, void 0, function
             yield conn.query(`DELETE FROM product_units WHERE productId = ?`, [productId]);
         }
         for (const unit of units) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             yield conn.query(`
                 INSERT INTO product_units (
                     id, productId, unitName, unitNameEn, conversionFactor,
@@ -324,8 +313,7 @@ const bulkCreateUnits = (req, res) => __awaiter(void 0, void 0, void 0, function
             UPDATE products SET hasMultipleUnits = TRUE WHERE id = ?
         `, [productId]);
         conn.release();
-        // @ts-ignore
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.username) || req.body.user || 'System';
+        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
         yield (0, auditController_1.logAction)(user, 'PRODUCT_UNIT', 'BULK_CREATE', `إضافة ${units.length} وحدات قياس`, `المنتج: ${productId}`);
         res.status(201).json({
             message: `Created ${createdUnits.length} units successfully`,

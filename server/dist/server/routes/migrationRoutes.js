@@ -10,6 +10,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const multer_1 = __importDefault(require("multer"));
 const migrationController_1 = require("../controllers/migrationController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
 const router = express_1.default.Router();
 // Configure multer for file uploads (memory storage)
 const upload = (0, multer_1.default)({
@@ -40,29 +41,29 @@ const upload = (0, multer_1.default)({
 // GENERAL ENDPOINTS
 // ========================================
 // Get list of supported entities
-router.get('/entities', migrationController_1.getEntities);
+router.get('/entities', (0, authMiddleware_1.requirePermission)('migration.view'), migrationController_1.getEntities);
 // Get current database statistics
-router.get('/stats', migrationController_1.getMigrationStats);
+router.get('/stats', (0, authMiddleware_1.requirePermission)('migration.view'), migrationController_1.getMigrationStats);
 // Download Excel template for an entity
-router.get('/template/:entity', migrationController_1.downloadTemplate);
+router.get('/template/:entity', (0, authMiddleware_1.requirePermission)('migration.view'), migrationController_1.downloadTemplate);
 // ========================================
 // FILE UPLOAD ENDPOINTS
 // ========================================
 // Parse uploaded file and detect mappings
-router.post('/parse', upload.single('file'), migrationController_1.parseUploadedFile);
+router.post('/parse', (0, authMiddleware_1.requirePermission)('migration.import'), upload.single('file'), migrationController_1.parseUploadedFile);
 // Validate data with mappings
-router.post('/validate', upload.single('file'), migrationController_1.validateData);
+router.post('/validate', (0, authMiddleware_1.requirePermission)('migration.import'), upload.single('file'), migrationController_1.validateData);
 // Import data into database
-router.post('/import', upload.single('file'), migrationController_1.importData);
+router.post('/import', (0, authMiddleware_1.requirePermission)('migration.import'), upload.single('file'), migrationController_1.importData);
 // ========================================
 // DATABASE CONNECTOR ENDPOINTS
 // ========================================
 // Test connection to external database
-router.post('/db/test-connection', migrationController_1.testDatabaseConnection);
+router.post('/db/test-connection', (0, authMiddleware_1.requirePermission)('migration.database'), migrationController_1.testDatabaseConnection);
 // Get tables and structure from external database
-router.post('/db/tables', migrationController_1.getDatabaseTables);
+router.post('/db/tables', (0, authMiddleware_1.requirePermission)('migration.database'), migrationController_1.getDatabaseTables);
 // Preview data from external table
-router.post('/db/preview', migrationController_1.previewDatabaseTable);
+router.post('/db/preview', (0, authMiddleware_1.requirePermission)('migration.database'), migrationController_1.previewDatabaseTable);
 // Import data from external database
-router.post('/db/import', migrationController_1.importFromDatabase);
+router.post('/db/import', (0, authMiddleware_1.requirePermission)('migration.database'), migrationController_1.importFromDatabase);
 exports.default = router;

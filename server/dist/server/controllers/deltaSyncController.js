@@ -18,6 +18,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getEnhancedSyncStatus = exports.getSettingsDelta = exports.getStockMovementsDelta = exports.getPriceListItemsDelta = exports.getPriceListsDelta = exports.getPaymentsDelta = exports.healthCheck = exports.getSyncStatus = exports.getVehiclesDelta = exports.getInvoicesDelta = exports.getPartnersDelta = exports.getProductsDelta = void 0;
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
+const dataFiltering_1 = require("../utils/dataFiltering");
 /**
  * Common delta query helper
  */
@@ -37,7 +38,7 @@ function getDeltaItems(tableName_1, columns_1, sinceTimestamp_1) {
             query += ` WHERE ${whereClauses.join(' AND ')}`;
         }
         query += ` ORDER BY updatedAt DESC, id ASC LIMIT 2000`;
-        const [rows] = yield db_1.pool.query(query, params);
+        const [rows] = yield (0, db_1.safePoolQuery)(query, params);
         return rows;
     });
 }
@@ -52,7 +53,7 @@ const getProductsDelta = (req, res) => __awaiter(void 0, void 0, void 0, functio
         if (products.length > 0) {
             const categoryIds = [...new Set(products.map(p => p.categoryId).filter(Boolean))];
             if (categoryIds.length > 0) {
-                const [categories] = yield db_1.pool.query(`SELECT id, name FROM categories WHERE id IN (${categoryIds.map(() => '?').join(',')})`, categoryIds);
+                const [categories] = yield (0, db_1.safePoolQuery)(`SELECT id, name FROM categories WHERE id IN (${categoryIds.map(() => '?').join(',')})`, categoryIds);
                 const catMap = new Map(categories.map((c) => [c.id, c.name]));
                 products.forEach(p => {
                     p.categoryName = catMap.get(p.categoryId) || null;
@@ -78,13 +79,15 @@ exports.getProductsDelta = getProductsDelta;
 const getPartnersDelta = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const since = req.query.since;
-        const user = req.user;
+        const authReq = req;
         // Build salesman filter
         let salesmanFilter = '';
         const params = [];
-        if ((user === null || user === void 0 ? void 0 : user.role) === 'SALES' && (user === null || user === void 0 ? void 0 : user.salesmanId)) {
-            salesmanFilter = 'salesmanId = ?';
-            params.push(user.salesmanId);
+        if (authReq.userFilterOptions && authReq.systemConfig) {
+            const filter = (0, dataFiltering_1.buildSalesmanFilterClause)(authReq.userFilterOptions, 'partners', '' // No prefix
+            );
+            salesmanFilter = filter.clause;
+            params.push(...filter.params);
         }
         const partners = yield getDeltaItems('partners', ['id', 'code', 'name', 'phone', 'address', 'type', 'isCustomer', 'isSupplier', 'balance', 'creditLimit', 'priceListId', 'salesmanId', 'updatedAt', 'createdAt'], since || null, salesmanFilter, params);
         res.json({
@@ -106,19 +109,22 @@ exports.getPartnersDelta = getPartnersDelta;
 const getInvoicesDelta = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const since = req.query.since;
-        const user = req.user;
+        const authReq = req;
         // Build user filter (salesmen see only their invoices)
         let userFilter = '';
         const params = [];
-        if ((user === null || user === void 0 ? void 0 : user.role) === 'SALES' && (user === null || user === void 0 ? void 0 : user.salesmanId)) {
-            userFilter = 'salesmanId = ?';
-            params.push(user.salesmanId);
+        if (authReq.userFilterOptions && authReq.systemConfig) {
+            if ((0, dataFiltering_1.shouldFilterBySalesman)(authReq.userFilterOptions, 'invoices')) {
+                const salesmanId = authReq.userFilterOptions.salesmanId;
+                userFilter = '(salesmanId = ? OR partnerId IN (SELECT id FROM partners WHERE salesmanId = ?))';
+                params.push(salesmanId, salesmanId);
+            }
         }
         const invoices = yield getDeltaItems('invoices', ['id', 'type', 'partnerId', 'partnerName', 'date', 'dueDate', 'total', 'paidAmount', 'status', 'notes', 'salesmanId', 'updatedAt', 'createdAt'], since || null, userFilter, params);
         // Get invoice lines for each invoice
         if (invoices.length > 0) {
             const invoiceIds = invoices.map(i => i.id);
-            const [lines] = yield db_1.pool.query(`SELECT * FROM invoice_lines WHERE invoiceId IN (${invoiceIds.map(() => '?').join(',')})`, invoiceIds);
+            const [lines] = yield (0, db_1.safePoolQuery)(`SELECT * FROM invoice_lines WHERE invoiceId IN (${invoiceIds.map(() => '?').join(',')})`, invoiceIds);
             const linesMap = new Map();
             lines.forEach((line) => {
                 if (!linesMap.has(line.invoiceId)) {
@@ -149,19 +155,24 @@ exports.getInvoicesDelta = getInvoicesDelta;
 const getVehiclesDelta = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const since = req.query.since;
-        const user = req.user;
+        const authReq = req;
         let salesmanFilter = '';
         const params = [];
-        if ((user === null || user === void 0 ? void 0 : user.role) === 'SALES' && (user === null || user === void 0 ? void 0 : user.salesmanId)) {
-            salesmanFilter = 'salesmanId = ?';
-            params.push(user.salesmanId);
+        if (authReq.userFilterOptions && authReq.systemConfig) {
+            if ((0, dataFiltering_1.shouldFilterBySalesman)(authReq.userFilterOptions, 'partners')) {
+                const salesmanId = authReq.userFilterOptions.salesmanId;
+                if (salesmanId) {
+                    salesmanFilter = 'salesmanId = ?';
+                    params.push(salesmanId);
+                }
+            }
         }
         const vehicles = yield getDeltaItems('vehicles', ['id', 'plateNumber', 'name', 'type', 'status', 'salesmanId', 'warehouseId', 'updatedAt', 'createdAt'], since || null, salesmanFilter, params);
         // Get salesman names
         if (vehicles.length > 0) {
             const salesmanIds = [...new Set(vehicles.map(v => v.salesmanId).filter(Boolean))];
             if (salesmanIds.length > 0) {
-                const [salesmen] = yield db_1.pool.query(`SELECT id, name FROM salesmen WHERE id IN (${salesmanIds.map(() => '?').join(',')})`, salesmanIds);
+                const [salesmen] = yield (0, db_1.safePoolQuery)(`SELECT id, name FROM salesmen WHERE id IN (${salesmanIds.map(() => '?').join(',')})`, salesmanIds);
                 const salesMap = new Map(salesmen.map((s) => [s.id, s.name]));
                 vehicles.forEach(v => {
                     v.salesmanName = salesMap.get(v.salesmanId) || null;
@@ -186,22 +197,26 @@ exports.getVehiclesDelta = getVehiclesDelta;
 // ==========================================
 const getSyncStatus = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const [productCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM products');
-        const [partnerCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM partners');
-        const [invoiceCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM invoices');
-        const [lastProduct] = yield db_1.pool.query('SELECT MAX(updatedAt) as lastUpdate FROM products');
-        const [lastPartner] = yield db_1.pool.query('SELECT MAX(updatedAt) as lastUpdate FROM partners');
-        const [lastInvoice] = yield db_1.pool.query('SELECT MAX(updatedAt) as lastUpdate FROM invoices');
+        const [rows] = yield (0, db_1.safePoolQuery)(`
+            SELECT 
+                (SELECT COUNT(*) FROM products) as productCount,
+                (SELECT COUNT(*) FROM partners) as partnerCount,
+                (SELECT COUNT(*) FROM invoices) as invoiceCount,
+                (SELECT MAX(updatedAt) FROM products) as lastProduct,
+                (SELECT MAX(updatedAt) FROM partners) as lastPartner,
+                (SELECT MAX(updatedAt) FROM invoices) as lastInvoice
+        `);
+        const data = rows[0];
         res.json({
             counts: {
-                products: productCount[0].count,
-                partners: partnerCount[0].count,
-                invoices: invoiceCount[0].count,
+                products: data.productCount || 0,
+                partners: data.partnerCount || 0,
+                invoices: data.invoiceCount || 0,
             },
             lastUpdates: {
-                products: lastProduct[0].lastUpdate,
-                partners: lastPartner[0].lastUpdate,
-                invoices: lastInvoice[0].lastUpdate,
+                products: data.lastProduct,
+                partners: data.lastPartner,
+                invoices: data.lastInvoice,
             },
             serverTime: new Date().toISOString(),
         });
@@ -218,7 +233,7 @@ exports.getSyncStatus = getSyncStatus;
 const healthCheck = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         // Quick DB ping
-        yield db_1.pool.query('SELECT 1');
+        yield (0, db_1.safePoolQuery)('SELECT 1');
         res.json({
             status: 'ok',
             timestamp: new Date().toISOString(),
@@ -258,7 +273,7 @@ const getPaymentsDelta = (req, res) => __awaiter(void 0, void 0, void 0, functio
         if (payments.length > 0) {
             const partnerIds = [...new Set(payments.map(p => p.partnerId).filter(Boolean))];
             if (partnerIds.length > 0) {
-                const [partners] = yield db_1.pool.query(`SELECT id, name FROM partners WHERE id IN (${partnerIds.map(() => '?').join(',')})`, partnerIds);
+                const [partners] = yield (0, db_1.safePoolQuery)(`SELECT id, name FROM partners WHERE id IN (${partnerIds.map(() => '?').join(',')})`, partnerIds);
                 const partnerMap = new Map(partners.map((p) => [p.id, p.name]));
                 payments.forEach(p => {
                     if (!p.partnerName) {
@@ -292,7 +307,7 @@ const getPriceListsDelta = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const includeItems = req.query.includeItems === 'true';
         if (includeItems && priceLists.length > 0) {
             const listIds = priceLists.map(pl => pl.id);
-            const [items] = yield db_1.pool.query(`SELECT pli.*, p.name as productName 
+            const [items] = yield (0, db_1.safePoolQuery)(`SELECT pli.*, p.name as productName 
                  FROM price_list_items pli
                  LEFT JOIN products p ON pli.productId = p.id
                  WHERE pli.priceListId IN (${listIds.map(() => '?').join(',')})`, listIds);
@@ -338,7 +353,7 @@ const getPriceListItemsDelta = (req, res) => __awaiter(void 0, void 0, void 0, f
         if (items.length > 0) {
             const productIds = [...new Set(items.map(i => i.productId).filter(Boolean))];
             if (productIds.length > 0) {
-                const [products] = yield db_1.pool.query(`SELECT id, name FROM products WHERE id IN (${productIds.map(() => '?').join(',')})`, productIds);
+                const [products] = yield (0, db_1.safePoolQuery)(`SELECT id, name FROM products WHERE id IN (${productIds.map(() => '?').join(',')})`, productIds);
                 const productMap = new Map(products.map((p) => [p.id, p.name]));
                 items.forEach(i => {
                     i.productName = productMap.get(i.productId) || null;
@@ -386,14 +401,14 @@ const getStockMovementsDelta = (req, res) => __awaiter(void 0, void 0, void 0, f
             const productIds = [...new Set(movements.map(m => m.productId).filter(Boolean))];
             const warehouseIds = [...new Set(movements.map(m => m.warehouseId).filter(Boolean))];
             if (productIds.length > 0) {
-                const [products] = yield db_1.pool.query(`SELECT id, name FROM products WHERE id IN (${productIds.map(() => '?').join(',')})`, productIds);
+                const [products] = yield (0, db_1.safePoolQuery)(`SELECT id, name FROM products WHERE id IN (${productIds.map(() => '?').join(',')})`, productIds);
                 const productMap = new Map(products.map((p) => [p.id, p.name]));
                 movements.forEach(m => {
                     m.productName = productMap.get(m.productId) || null;
                 });
             }
             if (warehouseIds.length > 0) {
-                const [warehouses] = yield db_1.pool.query(`SELECT id, name FROM warehouses WHERE id IN (${warehouseIds.map(() => '?').join(',')})`, warehouseIds);
+                const [warehouses] = yield (0, db_1.safePoolQuery)(`SELECT id, name FROM warehouses WHERE id IN (${warehouseIds.map(() => '?').join(',')})`, warehouseIds);
                 const warehouseMap = new Map(warehouses.map((w) => [w.id, w.name]));
                 movements.forEach(m => {
                     m.warehouseName = warehouseMap.get(m.warehouseId) || null;
@@ -421,7 +436,7 @@ const getSettingsDelta = (req, res) => __awaiter(void 0, void 0, void 0, functio
     try {
         const since = req.query.since;
         // Get company settings
-        const [settingsRows] = yield db_1.pool.query(`SELECT * FROM settings WHERE category = 'company' ORDER BY key`);
+        const [settingsRows] = yield (0, db_1.safePoolQuery)(`SELECT * FROM settings WHERE category = 'company' ORDER BY key`);
         // Transform to key-value object
         const settings = {};
         settingsRows.forEach((row) => {
@@ -433,7 +448,7 @@ const getSettingsDelta = (req, res) => __awaiter(void 0, void 0, void 0, functio
             }
         });
         // Get last update time
-        const [lastUpdate] = yield db_1.pool.query(`SELECT MAX(updatedAt) as lastUpdate FROM settings WHERE category = 'company'`);
+        const [lastUpdate] = yield (0, db_1.safePoolQuery)(`SELECT MAX(updatedAt) as lastUpdate FROM settings WHERE category = 'company'`);
         res.json({
             settings,
             lastUpdate: ((_a = lastUpdate[0]) === null || _a === void 0 ? void 0 : _a.lastUpdate) || null,
@@ -453,16 +468,16 @@ exports.getSettingsDelta = getSettingsDelta;
 const getEnhancedSyncStatus = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         // Get counts for all entities
-        const [productCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM products');
-        const [partnerCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM partners');
-        const [invoiceCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM invoices');
-        const [paymentCount] = yield db_1.pool.query(`SELECT COUNT(*) as count FROM transactions WHERE type IN ('RECEIPT', 'PAYMENT')`);
-        const [priceListCount] = yield db_1.pool.query('SELECT COUNT(*) as count FROM price_lists');
+        const [productCount] = yield (0, db_1.safePoolQuery)('SELECT COUNT(*) as count FROM products');
+        const [partnerCount] = yield (0, db_1.safePoolQuery)('SELECT COUNT(*) as count FROM partners');
+        const [invoiceCount] = yield (0, db_1.safePoolQuery)('SELECT COUNT(*) as count FROM invoices');
+        const [paymentCount] = yield (0, db_1.safePoolQuery)(`SELECT COUNT(*) as count FROM transactions WHERE type IN ('RECEIPT', 'PAYMENT')`);
+        const [priceListCount] = yield (0, db_1.safePoolQuery)('SELECT COUNT(*) as count FROM price_lists');
         // Get last update times
-        const [lastProduct] = yield db_1.pool.query('SELECT MAX(updatedAt) as lastUpdate FROM products');
-        const [lastPartner] = yield db_1.pool.query('SELECT MAX(updatedAt) as lastUpdate FROM partners');
-        const [lastInvoice] = yield db_1.pool.query('SELECT MAX(updatedAt) as lastUpdate FROM invoices');
-        const [lastPayment] = yield db_1.pool.query(`SELECT MAX(updatedAt) as lastUpdate FROM transactions WHERE type IN ('RECEIPT', 'PAYMENT')`);
+        const [lastProduct] = yield (0, db_1.safePoolQuery)('SELECT MAX(updatedAt) as lastUpdate FROM products');
+        const [lastPartner] = yield (0, db_1.safePoolQuery)('SELECT MAX(updatedAt) as lastUpdate FROM partners');
+        const [lastInvoice] = yield (0, db_1.safePoolQuery)('SELECT MAX(updatedAt) as lastUpdate FROM invoices');
+        const [lastPayment] = yield (0, db_1.safePoolQuery)(`SELECT MAX(updatedAt) as lastUpdate FROM transactions WHERE type IN ('RECEIPT', 'PAYMENT')`);
         res.json({
             counts: {
                 products: productCount[0].count,

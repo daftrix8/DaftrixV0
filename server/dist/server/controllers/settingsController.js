@@ -53,9 +53,53 @@ var __rest = (this && this.__rest) || function (s, e) {
     return t;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.validateLicense = exports.updateSystemConfig = exports.getSystemConfig = void 0;
+exports.validateLicense = exports.updateSystemConfig = exports.getSystemConfig = exports.getPublicBranding = void 0;
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
+const eventBus_1 = require("../utils/eventBus");
+const aiChatController_1 = require("./aiChatController");
+/**
+ * Public endpoint — no authentication required.
+ * Returns only the branding fields needed for the login screen.
+ */
+const getPublicBranding = (_req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const [rows] = yield db_1.pool.query('SELECT companyName, config FROM system_config LIMIT 1');
+        if (rows.length > 0) {
+            const row = rows[0];
+            let additionalConfig = {};
+            if (row.config && typeof row.config === 'string') {
+                try {
+                    additionalConfig = JSON.parse(row.config);
+                }
+                catch (e) { /* ignore */ }
+            }
+            else if (row.config && typeof row.config === 'object') {
+                additionalConfig = row.config;
+            }
+            console.log('🎨 Public branding - appName:', additionalConfig.appName || '(empty)', ', loginTextColor:', additionalConfig.loginTextColor || '(empty)', ', loginAccentColor:', additionalConfig.loginAccentColor || '(empty)');
+            res.json({
+                appName: additionalConfig.appName || '',
+                appLogoUrl: additionalConfig.appLogoUrl || '',
+                companyName: row.companyName || '',
+                logo: additionalConfig.logo || '',
+                companySlogan: additionalConfig.companySlogan || '',
+                loginAccentColor: additionalConfig.loginAccentColor || '',
+                loginBgGradient: additionalConfig.loginBgGradient || '',
+                loginTextColor: additionalConfig.loginTextColor || '',
+                loginCardColor: additionalConfig.loginCardColor || '',
+                appFontSize: additionalConfig.appFontSize || 16,
+            });
+        }
+        else {
+            res.json({ appName: '', appLogoUrl: '', companyName: '', logo: '', companySlogan: '', loginAccentColor: '', loginBgGradient: '', loginTextColor: '', loginCardColor: '', appFontSize: 16 });
+        }
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'operation');
+    }
+});
+exports.getPublicBranding = getPublicBranding;
 const getSystemConfig = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const [rows] = yield db_1.pool.query('SELECT * FROM system_config LIMIT 1');
@@ -121,16 +165,19 @@ const updateSystemConfig = (req, res) => __awaiter(void 0, void 0, void 0, funct
         ;
         // 2. Prepare JSON config
         const jsonConfig = JSON.stringify(rest);
+        // Debug logging
+        console.log('📝 [Settings Save] appName:', rest.appName || '(empty)', ', appLogoUrl:', rest.appLogoUrl ? `[${rest.appLogoUrl.length} chars]` : '(empty)', ', logo:', rest.logo ? `[${rest.logo.length} chars]` : '(empty)', ', JSON size:', jsonConfig.length, 'bytes');
         // 3. Check if config exists
         const [rows] = yield db_1.pool.query('SELECT * FROM system_config LIMIT 1');
         if (rows.length > 0) {
             // Update
-            yield db_1.pool.query(`UPDATE system_config SET 
+            const [result] = yield db_1.pool.query(`UPDATE system_config SET 
                 companyName=?, companyAddress=?, companyPhone=?, companyEmail=?, 
                 taxId=?, commercialRegister=?, currency=?, vatRate=?, config=?`, [
                 companyName, companyAddress, companyPhone, companyEmail,
                 taxId, commercialRegister, currency, vatRate, jsonConfig
             ]);
+            console.log('📝 [Settings Save] UPDATE result - affectedRows:', result.affectedRows, ', changedRows:', result.changedRows);
         }
         else {
             // Insert
@@ -139,24 +186,50 @@ const updateSystemConfig = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 companyName, companyAddress, companyPhone, companyEmail,
                 taxId, commercialRegister, currency, vatRate, jsonConfig
             ]);
+            console.log('📝 [Settings Save] INSERT completed');
         }
-        // 4. Return updated config (re-using get logic to ensure consistency)
-        // We can just call the get logic or construct it manually. 
-        // Manual construction is faster here since we have the data.
-        const updatedConfig = Object.assign(Object.assign({}, rest), { companyName,
-            companyAddress,
-            companyPhone,
-            companyEmail,
-            taxId,
-            commercialRegister,
-            currency,
-            vatRate });
-        // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'settings', updatedBy: 'System' });
+        // 4. Re-read from DB to confirm persistence (instead of trusting in-memory data)
+        const [verifyRows] = yield db_1.pool.query('SELECT companyName, config FROM system_config LIMIT 1');
+        if (verifyRows.length > 0) {
+            const verifyRow = verifyRows[0];
+            let verifyConfig = {};
+            if (verifyRow.config && typeof verifyRow.config === 'string') {
+                try {
+                    verifyConfig = JSON.parse(verifyRow.config);
+                }
+                catch (e) { }
+            }
+            else if (verifyRow.config && typeof verifyRow.config === 'object') {
+                verifyConfig = verifyRow.config;
+            }
+            console.log('✅ [Settings Verify] DB confirms - appName:', verifyConfig.appName || '(empty)', ', appLogoUrl:', verifyConfig.appLogoUrl ? `[${verifyConfig.appLogoUrl.length} chars]` : '(empty)', ', logo:', verifyConfig.logo ? `[${verifyConfig.logo.length} chars]` : '(empty)');
+            // Return the verified data from DB (not the in-memory data)
+            const fullConfig = Object.assign(Object.assign({}, verifyConfig), { companyName: verifyRow.companyName || companyName, companyAddress,
+                companyPhone,
+                companyEmail,
+                taxId,
+                commercialRegister,
+                currency,
+                vatRate, modules: Object.assign({ sales: true, purchase: true, inventory: true, accounting: true, treasury: true, banks: true, partners: true, manufacturing: true, hr: true }, verifyConfig.modules) });
+            // Broadcast real-time update
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'settings', updatedBy: 'System' });
+            // Reset AI client so new API key takes effect
+            (0, aiChatController_1.resetAIClient)();
+            res.json(fullConfig);
         }
-        res.json(updatedConfig);
+        else {
+            // Fallback: return in-memory constructed data
+            const updatedConfig = Object.assign(Object.assign({}, rest), { companyName,
+                companyAddress,
+                companyPhone,
+                companyEmail,
+                taxId,
+                commercialRegister,
+                currency,
+                vatRate });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'settings', updatedBy: 'System' });
+            res.json(updatedConfig);
+        }
     }
     catch (error) {
         console.error("Error updating config:", error);
@@ -201,9 +274,7 @@ const validateLicense = (req, res) => __awaiter(void 0, void 0, void 0, function
             if (result.modules)
                 additionalConfig.modules = Object.assign(Object.assign({}, additionalConfig.modules), result.modules);
             yield db_1.pool.query('UPDATE system_config SET config=?', [JSON.stringify(additionalConfig)]);
-            const io = req.app.get('io');
-            if (io)
-                io.emit('entity:changed', { entityType: 'settings', updatedBy: 'License' });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'settings', updatedBy: 'License' });
         }
         res.json({ valid: true, client: result.client, expiry: result.expiry, daysRemaining: result.daysRemaining, modules: result.modules, message: 'License activated' });
     }

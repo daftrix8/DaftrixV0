@@ -11,7 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.reservationController = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 exports.reservationController = {
     /**
      * Create material reservations for a production order
@@ -20,7 +20,7 @@ exports.reservationController = {
     createReservations(productionOrderId, bomId, quantity, warehouseId) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
-            const connection = yield db_1.pool.getConnection();
+            const connection = yield (0, db_1.getConnection)();
             try {
                 yield connection.beginTransaction();
                 // 1. Get BOM items with waste percentage
@@ -103,7 +103,7 @@ exports.reservationController = {
                         const availableStock = physicalStock - alreadyReserved;
                         if (availableStock > 0) {
                             const reserveAmount = Math.min(availableStock, remainingToReserve);
-                            const reservationId = (0, uuid_1.v4)();
+                            const reservationId = (0, crypto_1.randomUUID)();
                             yield connection.query(`
                             INSERT INTO material_reservations 
                             (id, productionOrderId, productId, warehouseId, quantityReserved, status)

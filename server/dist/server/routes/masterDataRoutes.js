@@ -38,20 +38,37 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = __importDefault(require("express"));
 const masterData = __importStar(require("../controllers/masterDataController"));
+const authMiddleware_1 = require("../middleware/authMiddleware");
 const router = express_1.default.Router();
-// Helper to register routes
-const registerRoutes = (path, controller) => {
-    router.get(`/${path}`, controller.getAll);
-    router.post(`/${path}`, controller.create);
-    router.put(`/${path}/:id`, controller.update);
-    router.delete(`/${path}/:id`, controller.delete);
+// Helper to register CRUD routes.
+// - writePermissionId: required for POST/PUT/DELETE
+// - readPermissionId: optional; if set, GET also requires this permission.
+//   Leave unset for lookup tables that form dropdowns need (warehouses, categories, etc.)
+const registerRoutes = (path, controller, writePermissionId, readPermissionId) => {
+    if (readPermissionId) {
+        router.get(`/${path}`, (0, authMiddleware_1.requirePermission)(readPermissionId), controller.getAll);
+    }
+    else {
+        router.get(`/${path}`, controller.getAll); // Open: form dropdowns in invoices, POS, etc.
+    }
+    router.post(`/${path}`, (0, authMiddleware_1.requirePermission)(writePermissionId), controller.create);
+    router.put(`/${path}/:id`, (0, authMiddleware_1.requirePermission)(writePermissionId), controller.update);
+    router.delete(`/${path}/:id`, (0, authMiddleware_1.requirePermission)(writePermissionId), controller.delete);
 };
-registerRoutes('branches', masterData.branches);
-registerRoutes('warehouses', masterData.warehouses);
-registerRoutes('categories', masterData.categories);
-registerRoutes('salesmen', masterData.salesmen);
-registerRoutes('taxes', masterData.taxes);
-registerRoutes('cost-centers', masterData.costCenters);
-registerRoutes('cash-categories', masterData.cashCategories);
-registerRoutes('partner-groups', masterData.partnerGroups);
+registerRoutes('branches', masterData.branches, 'master.branches');
+registerRoutes('warehouses', masterData.warehouses, 'master.warehouses');
+registerRoutes('categories', masterData.categories, 'master.categories');
+registerRoutes('salesmen', masterData.salesmen, 'master.salesmen');
+registerRoutes('taxes', masterData.taxes, 'system.settings');
+// GET is open — cost-centers and cash-categories are loaded for ALL users (invoice/receipt dropdowns)
+// Write operations stay protected by their respective permissions
+registerRoutes('cost-centers', masterData.costCenters, 'accounting.cost_centers');
+registerRoutes('cash-categories', masterData.cashCategories, 'treasury.manage');
+registerRoutes('partner-groups', masterData.partnerGroups, 'partners.manage');
+registerRoutes('manufacturers', masterData.manufacturers, 'inventory.manage_products');
+registerRoutes('sizes', masterData.sizes, 'inventory.manage_products');
+registerRoutes('colors', masterData.colors, 'inventory.manage_products');
+registerRoutes('specifications', masterData.specifications, 'inventory.manage_products');
+registerRoutes('item-descriptions', masterData.itemDescriptions, 'inventory.manage_products');
+registerRoutes('product-groups', masterData.productGroups, 'inventory.manage_products');
 exports.default = router;

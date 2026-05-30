@@ -14,7 +14,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const db_1 = require("./db");
 const dotenv_1 = __importDefault(require("dotenv"));
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 dotenv_1.default.config();
 const fixBNBBank = () => __awaiter(void 0, void 0, void 0, function* () {
     yield (0, db_1.initDB)();
@@ -52,7 +52,7 @@ const fixBNBBank = () => __awaiter(void 0, void 0, void 0, function* () {
             return Math.max(max, code);
         }, 10200);
         const newCode = (maxCode + 1).toString();
-        const newAccountId = (0, uuid_1.v4)();
+        const newAccountId = (0, crypto_1.randomUUID)();
         const newAccount = {
             id: newAccountId,
             name: `Bank: ${bnbBank.name}`,

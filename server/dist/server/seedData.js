@@ -5,10 +5,7 @@ exports.INITIAL_ACCOUNTS = void 0;
 exports.INITIAL_ACCOUNTS = [
     // 1. Assets
     { id: '101', code: '101', name: 'الخزينة الرئيسية', type: 'ASSET', balance: 0, openingBalance: 0 },
-    { id: '10102', code: '10102', name: 'خزينة فرعية', type: 'ASSET', balance: 0, openingBalance: 0 },
     { id: '10201', code: '10201', name: 'البنك الرئيسي', type: 'ASSET', balance: 0, openingBalance: 0 },
-    { id: '10202', code: '10202', name: 'بنك إضافي 1', type: 'ASSET', balance: 0, openingBalance: 0 },
-    { id: '10203', code: '10203', name: 'بنك إضافي 2', type: 'ASSET', balance: 0, openingBalance: 0 },
     { id: '103', code: '103', name: 'مخزون البضائع', type: 'ASSET', balance: 0, openingBalance: 0 },
     { id: '104', code: '104', name: 'العملاء (الذمم المدينة)', type: 'ASSET', balance: 0, openingBalance: 0 },
     { id: '105', code: '105', name: 'ضريبة القيمة المضافة (مدخلات)', type: 'ASSET', balance: 0, openingBalance: 0 },

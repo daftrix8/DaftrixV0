@@ -14,7 +14,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 const promise_1 = require("mysql2/promise");
 const dotenv_1 = __importDefault(require("dotenv"));
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 dotenv_1.default.config();
 const pool = (0, promise_1.createPool)({
     host: process.env.DB_HOST,
@@ -33,7 +33,7 @@ function verifyFixes() {
             console.log('Connected to DB');
             // --- TEST 1: Invoice Warehouse Persistence ---
             console.log('\n--- TEST 1: Invoice Warehouse Persistence ---');
-            const invoiceId = (0, uuid_1.v4)();
+            const invoiceId = (0, crypto_1.randomUUID)();
             const warehouseId = 'test-warehouse-id';
             const partnerId = 'test-partner-id'; // Assuming this exists or foreign key checks might fail. 
             // Note: If FK checks are on, this might fail if partner doesn't exist. 

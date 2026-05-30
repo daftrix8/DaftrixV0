@@ -12,8 +12,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.cancelProduction = exports.finishProduction = exports.startProduction = exports.deleteProductionOrder = exports.updateProductionOrder = exports.createProductionOrder = exports.getProductionOrder = exports.getProductionOrders = void 0;
 const db_1 = require("../db");
 const reservationController_1 = require("./reservationController");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
+const eventBus_1 = require("../utils/eventBus");
 /**
  * Production Controller
  * Handles production order operations
@@ -111,6 +112,8 @@ const getProductionOrders = (req, res) => __awaiter(void 0, void 0, void 0, func
             actualStartDate: row.actual_start_date,
             actualEndDate: row.actual_end_date,
             warehouseId: row.warehouse_id,
+            sourceWarehouseId: row.source_warehouse_id || row.warehouse_id,
+            destWarehouseId: row.dest_warehouse_id || row.warehouse_id,
             notes: row.notes,
             createdBy: row.created_by,
             createdAt: row.created_at,
@@ -179,7 +182,7 @@ const getProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.getProductionOrder = getProductionOrder;
 // Create production order
 const createProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b;
     try {
         const { id, orderNumber, bomId, finishedProductId, qtyPlanned, startDate, endDate, warehouseId, // Legacy: kept for backward compatibility
         sourceWarehouseId, // NEW: مخزن المواد الخام - where raw materials come from
@@ -214,6 +217,20 @@ const createProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
         const overheadCostPerUnit = parseFloat(bom.overhead_cost) || 0;
         const costPerUnit = materialCostPerUnit + laborCostPerUnit + overheadCostPerUnit;
         const estimatedCost = costPerUnit * qtyPlanned;
+        // Generate server-side UUID if client didn't provide one
+        const orderId = id || (0, crypto_1.randomUUID)();
+        // Idempotent: if this ID already exists (e.g. retry after timeout), return existing order
+        const [existingOrder] = yield db_1.pool.query('SELECT id FROM production_orders WHERE id = ?', [orderId]);
+        if (existingOrder.length > 0) {
+            console.log(`⚠️ Production order ${orderId} already exists — returning existing (idempotent retry)`);
+            const [existing] = yield db_1.pool.query(`
+                SELECT po.*, p.name as finished_product_name
+                FROM production_orders po
+                LEFT JOIN products p ON po.finished_product_id = p.id
+                WHERE po.id = ?
+            `, [orderId]);
+            return res.json(existing[0]);
+        }
         // Insert production order with estimated cost
         // Store source_warehouse_id for raw materials and dest_warehouse_id for finished products
         yield db_1.pool.query(`
@@ -223,7 +240,7 @@ const createProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
                 notes, created_by, status, standard_cost
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PLANNED', ?)
         `, [
-            id,
+            orderId,
             orderNumber,
             bomId,
             finishedProductId,
@@ -240,23 +257,55 @@ const createProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
         // Attempt to reserve materials from the SOURCE warehouse (raw materials)
         let reservationStatus = 'PLANNED';
         let reservationNotes = '';
+        // Check if autoPurchaseOnProduction is enabled
+        let autoPurchaseEnabled = false;
+        try {
+            const [configRows] = yield db_1.pool.query('SELECT config FROM system_config LIMIT 1');
+            if (configRows.length > 0 && configRows[0].config) {
+                const config = typeof configRows[0].config === 'string' ? JSON.parse(configRows[0].config) : configRows[0].config;
+                autoPurchaseEnabled = ((_a = config === null || config === void 0 ? void 0 : config.modules) === null || _a === void 0 ? void 0 : _a.autoPurchaseOnProduction) === true;
+            }
+        }
+        catch (e) { /* ignore config parse error */ }
         try {
             // Pass rawMaterialWarehouseId to only reserve from the raw materials warehouse
-            const reservationResult = yield reservationController_1.reservationController.createReservations(id, bomId, Number(qtyPlanned), rawMaterialWarehouseId || undefined);
+            const reservationResult = yield reservationController_1.reservationController.createReservations(orderId, bomId, Number(qtyPlanned), rawMaterialWarehouseId || undefined);
             if (reservationResult.success) {
                 reservationStatus = 'CONFIRMED';
             }
+            else if (autoPurchaseEnabled) {
+                // Auto-purchase enabled: keep as CONFIRMED since materials will be bought on start
+                reservationStatus = 'CONFIRMED';
+                reservationNotes = 'سيتم شراء المواد الناقصة تلقائياً عند بدء التصنيع';
+            }
             else {
                 reservationStatus = 'WAITING_MATERIALS';
-                const missing = (_a = reservationResult.insufficientMaterials) === null || _a === void 0 ? void 0 : _a.map((m) => m.productId).join(', ');
+                const missing = (_b = reservationResult.insufficientMaterials) === null || _b === void 0 ? void 0 : _b.map((m) => m.productId).join(', ');
                 reservationNotes = `Missing materials: ${missing}`;
             }
             // Update status based on reservation
-            yield db_1.pool.query('UPDATE production_orders SET status = ?, notes = CONCAT(COALESCE(notes, ""), ?) WHERE id = ?', [reservationStatus, reservationNotes ? `\n[System]: ${reservationNotes}` : '', id]);
+            yield db_1.pool.query('UPDATE production_orders SET status = ?, notes = CONCAT(COALESCE(notes, ""), ?) WHERE id = ?', [reservationStatus, reservationNotes ? `\n[System]: ${reservationNotes}` : '', orderId]);
         }
         catch (err) {
             console.error('Failed to reserve materials:', err);
             // Don't fail the order creation, just leave as PLANNED
+        }
+        // --- Auto-Create Packaging Task ---
+        try {
+            // Check if the finished product has a PRIMARY packaging spec
+            const [specs] = yield db_1.pool.query(`SELECT id FROM product_packaging_specs WHERE product_id = ? AND level = 'PRIMARY' LIMIT 1`, [finishedProductId]);
+            if (specs.length > 0) {
+                const specId = specs[0].id;
+                const taskId = (0, crypto_1.randomUUID)();
+                yield db_1.pool.query(`
+                    INSERT INTO production_order_packaging (id, production_order_id, packaging_spec_id, qty_planned, status)
+                    VALUES (?, ?, ?, ?, 'PENDING')
+                `, [taskId, orderId, specId, qtyPlanned]);
+                console.log(`✅ Created packaging task ${taskId} for production order ${orderId}`);
+            }
+        }
+        catch (err) {
+            console.error('Failed to auto-create packaging task:', err);
         }
         // Return created order
         const [result] = yield db_1.pool.query(`
@@ -264,7 +313,7 @@ const createProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             FROM production_orders po
             LEFT JOIN products p ON po.finished_product_id = p.id
             WHERE po.id = ?
-        `, [id]);
+        `, [orderId]);
         res.json(result[0]);
     }
     catch (error) {
@@ -277,7 +326,7 @@ exports.createProductionOrder = createProductionOrder;
 const updateProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { id } = req.params;
-        const { qtyPlanned, startDate, endDate, notes, warehouseId } = req.body;
+        const { qtyPlanned, startDate, endDate, notes, warehouseId, destWarehouseId } = req.body;
         // Check if order exists and is PLANNED
         const [rows] = yield db_1.pool.query('SELECT status FROM production_orders WHERE id = ?', [id]);
         if (rows.length === 0) {
@@ -290,20 +339,25 @@ const updateProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             // Actually, user might want to update dates even if in progress.
             // Let's allow it.
         }
+        const sanitizeDate = (d) => d ? String(d).split('T')[0] : null;
         yield db_1.pool.query(`
             UPDATE production_orders 
             SET qty_planned = COALESCE(?, qty_planned),
                 start_date = COALESCE(?, start_date),
                 end_date = COALESCE(?, end_date),
                 notes = COALESCE(?, notes),
-                warehouse_id = COALESCE(?, warehouse_id)
+                warehouse_id = COALESCE(?, warehouse_id),
+                source_warehouse_id = COALESCE(?, source_warehouse_id),
+                dest_warehouse_id = COALESCE(?, dest_warehouse_id)
             WHERE id = ?
         `, [
             qtyPlanned,
-            startDate || null,
-            endDate || null,
+            sanitizeDate(startDate),
+            sanitizeDate(endDate),
             notes,
             warehouseId,
+            warehouseId,
+            destWarehouseId,
             id
         ]);
         // Return updated order
@@ -324,7 +378,7 @@ exports.updateProductionOrder = updateProductionOrder;
 // Delete production order
 const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
@@ -351,9 +405,9 @@ const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             // Create reverse stock movement for finished product
             yield connection.query(`
                 INSERT INTO stock_movements (
-                    id, product_id, warehouse_id, qty_change, movement_type,
+                    product_id, warehouse_id, qty_change, movement_type,
                     reference_type, reference_id, notes
-                ) VALUES (UUID(), ?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
+                ) VALUES (?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
             `, [
                 order.finished_product_id,
                 destWarehouse,
@@ -377,14 +431,14 @@ const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
                 if (sourceWarehouse) {
                     yield connection.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                          VALUES (?, ?, ?, ?) 
-                         ON DUPLICATE KEY UPDATE stock = stock + ?`, [(0, uuid_1.v4)(), item.raw_product_id, sourceWarehouse, totalConsumed, totalConsumed]);
+                         ON DUPLICATE KEY UPDATE stock = stock + ?`, [(0, crypto_1.randomUUID)(), item.raw_product_id, sourceWarehouse, totalConsumed, totalConsumed]);
                 }
                 // Create reverse stock movement
                 yield connection.query(`
                     INSERT INTO stock_movements (
-                        id, product_id, warehouse_id, qty_change, movement_type,
+                        product_id, warehouse_id, qty_change, movement_type,
                         reference_type, reference_id, notes
-                    ) VALUES (UUID(), ?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
+                    ) VALUES (?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
                 `, [
                     item.raw_product_id,
                     sourceWarehouse,
@@ -421,15 +475,15 @@ const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
                         // Create new record with the returned amount
                         const [productRow] = yield connection.query('SELECT stock FROM products WHERE id = ?', [item.raw_product_id]);
                         const globalStock = parseFloat((_a = productRow[0]) === null || _a === void 0 ? void 0 : _a.stock) || 0;
-                        yield connection.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, uuid_1.v4)(), item.raw_product_id, sourceWarehouse, globalStock]);
+                        yield connection.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), item.raw_product_id, sourceWarehouse, globalStock]);
                     }
                 }
                 // Create reverse stock movement (return materials)
                 yield connection.query(`
                     INSERT INTO stock_movements (
-                        id, product_id, warehouse_id, qty_change, movement_type,
+                        product_id, warehouse_id, qty_change, movement_type,
                         reference_type, reference_id, notes
-                    ) VALUES (UUID(), ?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
+                    ) VALUES (?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
                 `, [
                     item.raw_product_id,
                     sourceWarehouse,
@@ -475,7 +529,8 @@ const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
 exports.deleteProductionOrder = deleteProductionOrder;
 // Start production
 const startProduction = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    var _a;
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
@@ -561,9 +616,9 @@ const startProduction = (req, res) => __awaiter(void 0, void 0, void 0, function
             // Create stock movement (from SOURCE warehouse)
             yield connection.query(`
                 INSERT INTO stock_movements (
-                    id, product_id, warehouse_id, qty_change, movement_type,
+                    product_id, warehouse_id, qty_change, movement_type,
                     reference_type, reference_id, notes
-                ) VALUES (UUID(), ?, ?, ?, 'PRODUCTION_USE', 'PRODUCTION_ORDER', ?, ?)
+                ) VALUES (?, ?, ?, 'PRODUCTION_USE', 'PRODUCTION_ORDER', ?, ?)
             `, [
                 item.raw_product_id,
                 sourceWarehouse,
@@ -578,6 +633,117 @@ const startProduction = (req, res) => __awaiter(void 0, void 0, void 0, function
             SET status = 'IN_PROGRESS', actual_start_date = NOW()
             WHERE id = ?
         `, [id]);
+        // ==========================================
+        // AUTO PURCHASE INVOICE GENERATION
+        // ==========================================
+        try {
+            // Check system config for autoPurchaseOnProduction flag
+            const [configRows] = yield connection.query('SELECT config FROM system_config LIMIT 1');
+            let autoPurchaseEnabled = false;
+            if (configRows.length > 0 && configRows[0].config) {
+                try {
+                    const config = typeof configRows[0].config === 'string'
+                        ? JSON.parse(configRows[0].config)
+                        : configRows[0].config;
+                    autoPurchaseEnabled = ((_a = config === null || config === void 0 ? void 0 : config.modules) === null || _a === void 0 ? void 0 : _a.autoPurchaseOnProduction) === true;
+                }
+                catch (e) {
+                    // Config parse error - skip
+                }
+            }
+            if (autoPurchaseEnabled) {
+                // Re-fetch BOM items WITH supplier info
+                const [bomItemsWithSupplier] = yield connection.query(`
+                    SELECT bi.*, 
+                           p.name as product_name,
+                           p.sku as product_sku,
+                           p.cost as product_cost,
+                           p.unit as product_unit,
+                           bi.supplier_id,
+                           sup.name as supplier_name
+                    FROM bom_items bi
+                    LEFT JOIN products p ON bi.raw_product_id = p.id
+                    LEFT JOIN partners sup ON bi.supplier_id = sup.id
+                    WHERE bi.bom_id = ?
+                `, [order.bom_id]);
+                // Group items by supplier_id (skip items with no supplier)
+                const supplierGroups = new Map();
+                for (const bomItem of bomItemsWithSupplier) {
+                    if (!bomItem.supplier_id)
+                        continue; // Skip items without supplier
+                    if (!supplierGroups.has(bomItem.supplier_id)) {
+                        supplierGroups.set(bomItem.supplier_id, {
+                            supplierId: bomItem.supplier_id,
+                            supplierName: bomItem.supplier_name || 'مورد',
+                            items: []
+                        });
+                    }
+                    supplierGroups.get(bomItem.supplier_id).items.push(bomItem);
+                }
+                // Create one INVOICE_PURCHASE per supplier
+                for (const [supplierId, group] of supplierGroups) {
+                    const invoiceId = (0, crypto_1.randomUUID)();
+                    const today = new Date().toISOString().split('T')[0];
+                    // Generate invoice number (PUR-XXXXX)
+                    const [existingNums] = yield connection.query(`SELECT number FROM invoices WHERE number LIKE 'PUR-%'`);
+                    let maxNum = 0;
+                    existingNums.forEach((row) => {
+                        if (row.number && row.number.startsWith('PUR-')) {
+                            const suffix = row.number.substring(4);
+                            if (/^\d+$/.test(suffix)) {
+                                const num = parseInt(suffix, 10);
+                                if (num > maxNum)
+                                    maxNum = num;
+                            }
+                        }
+                    });
+                    const invoiceNumber = `PUR-${String(maxNum + 1).padStart(5, '0')}`;
+                    // Calculate lines and total
+                    let invoiceTotal = 0;
+                    const invoiceLines = [];
+                    for (const bomItem of group.items) {
+                        const qtyWithWaste = bomItem.quantity_per_unit * (1 + (bomItem.waste_percent || 0) / 100);
+                        const totalQty = qtyWithWaste * order.qty_planned;
+                        const unitCost = parseFloat(bomItem.product_cost) || 0;
+                        const lineTotal = totalQty * unitCost;
+                        invoiceTotal += lineTotal;
+                        invoiceLines.push({
+                            productId: bomItem.raw_product_id,
+                            productName: bomItem.product_name || '',
+                            quantity: Number(totalQty.toFixed(5)),
+                            price: Number(unitCost.toFixed(2)),
+                            cost: Number(unitCost.toFixed(2)),
+                            total: Number(lineTotal.toFixed(2))
+                        });
+                    }
+                    invoiceTotal = Number(invoiceTotal.toFixed(2));
+                    // Insert the invoice
+                    yield connection.query(`INSERT INTO invoices (id, number, date, type, partnerId, partnerName, total, status, paymentMethod, posted, notes, paidAmount) 
+                         VALUES (?, ?, ?, 'INVOICE_PURCHASE', ?, ?, ?, 'POSTED', 'CREDIT', 1, ?, 0)`, [
+                        invoiceId,
+                        invoiceNumber,
+                        today,
+                        supplierId,
+                        group.supplierName,
+                        invoiceTotal,
+                        `فاتورة شراء تلقائية - أمر تصنيع #${order.order_number}`
+                    ]);
+                    // Insert invoice lines
+                    for (const line of invoiceLines) {
+                        yield connection.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total)
+                             VALUES (?, ?, ?, ?, ?, ?, 0, ?)`, [invoiceId, line.productId, line.productName, line.quantity, line.price, line.cost, line.total]);
+                    }
+                    console.log(`🧾 Auto-created purchase invoice ${invoiceNumber} for supplier "${group.supplierName}" (${invoiceLines.length} items, total: ${invoiceTotal})`);
+                }
+                if (supplierGroups.size > 0) {
+                    console.log(`✅ Auto-created ${supplierGroups.size} purchase invoice(s) for production order ${order.order_number}`);
+                }
+            }
+        }
+        catch (autoPurchaseError) {
+            // Non-critical: log but don't fail the production start
+            console.error('⚠️ Error in auto-purchase invoice generation (non-critical):', autoPurchaseError);
+        }
         yield connection.commit();
         // Return updated order
         const [result] = yield db_1.pool.query('SELECT * FROM production_orders WHERE id = ?', [id]);
@@ -596,7 +762,7 @@ exports.startProduction = startProduction;
 // Finish production
 const finishProduction = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b, _c, _d, _e, _f;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
@@ -607,8 +773,55 @@ const finishProduction = (req, res) => __awaiter(void 0, void 0, void 0, functio
             throw new Error('Production order not found');
         }
         const order = orderRows[0];
-        if (order.status !== 'IN_PROGRESS') {
-            throw new Error('Order must be IN_PROGRESS to finish');
+        // If order is not yet IN_PROGRESS, auto-start it (deduct materials) before finishing
+        if (order.status === 'PLANNED' || order.status === 'CONFIRMED' || order.status === 'WAITING_MATERIALS') {
+            console.log(`⚡ Auto-starting order ${order.order_number} (was ${order.status}) before finishing`);
+            // Get BOM items for material deduction
+            const [autoStartItems] = yield connection.query(`
+                SELECT bi.*, COALESCE(p.stock, 0) as available_stock
+                FROM bom_items bi
+                LEFT JOIN products p ON bi.raw_product_id = p.id
+                WHERE bi.bom_id = ?
+            `, [order.bom_id]);
+            // Consume reservations
+            try {
+                yield reservationController_1.reservationController.consumeReservations(id);
+            }
+            catch (e) { /* ignore */ }
+            // Deduct raw materials (same logic as startProduction)
+            for (const item of autoStartItems) {
+                const qtyWithWaste = item.quantity_per_unit * (1 + (item.waste_percent || 0) / 100);
+                const totalRequired = qtyWithWaste * order.qty_planned;
+                const sourceWarehouse = order.source_warehouse_id || order.warehouse_id;
+                yield connection.query('UPDATE products SET stock = stock - ? WHERE id = ?', [totalRequired, item.raw_product_id]);
+                if (sourceWarehouse) {
+                    const [existingStock] = yield connection.query('SELECT id FROM product_stocks WHERE productId = ? AND warehouseId = ?', [item.raw_product_id, sourceWarehouse]);
+                    if (existingStock.length > 0) {
+                        yield connection.query('UPDATE product_stocks SET stock = stock - ? WHERE productId = ? AND warehouseId = ?', [totalRequired, item.raw_product_id, sourceWarehouse]);
+                    }
+                }
+                yield connection.query(`
+                    INSERT INTO stock_movements (
+                        product_id, warehouse_id, qty_change, movement_type,
+                        reference_type, reference_id, notes
+                    ) VALUES (?, ?, ?, 'PRODUCTION_USE', 'PRODUCTION_ORDER', ?, ?)
+                `, [
+                    item.raw_product_id,
+                    sourceWarehouse,
+                    -totalRequired,
+                    id,
+                    `Auto-start deduction for order ${order.order_number}`
+                ]);
+            }
+            // Mark as IN_PROGRESS
+            yield connection.query(`
+                UPDATE production_orders SET status = 'IN_PROGRESS', actual_start_date = NOW() WHERE id = ?
+            `, [id]);
+            order.status = 'IN_PROGRESS';
+            console.log(`✅ Auto-started order ${order.order_number}`);
+        }
+        else if (order.status !== 'IN_PROGRESS') {
+            throw new Error(`لا يمكن إنهاء أمر التصنيع - الحالة الحالية: ${order.status} (يجب أن يكون قيد التنفيذ)`);
         }
         // === VARIANCE ANALYSIS: Calculate Standard Cost from BOM ===
         const [bomItems] = yield connection.query(`
@@ -692,14 +905,14 @@ const finishProduction = (req, res) => __awaiter(void 0, void 0, void 0, functio
             if (destWarehouse) {
                 yield connection.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                      VALUES (?, ?, ?, ?) 
-                     ON DUPLICATE KEY UPDATE stock = stock + ?`, [(0, uuid_1.v4)(), order.finished_product_id, destWarehouse, goodQty, goodQty]);
+                     ON DUPLICATE KEY UPDATE stock = stock + ?`, [(0, crypto_1.randomUUID)(), order.finished_product_id, destWarehouse, goodQty, goodQty]);
             }
             // Create stock movement for output (to DESTINATION warehouse)
             yield connection.query(`
                 INSERT INTO stock_movements (
-                    id, product_id, warehouse_id, qty_change, movement_type,
+                    product_id, warehouse_id, qty_change, movement_type,
                     reference_type, reference_id, notes, batch_id
-                ) VALUES (UUID(), ?, ?, ?, 'PRODUCTION_OUTPUT', 'PRODUCTION_ORDER', ?, ?, ?)
+                ) VALUES (?, ?, ?, 'PRODUCTION_OUTPUT', 'PRODUCTION_ORDER', ?, ?, ?)
             `, [
                 order.finished_product_id,
                 destWarehouse,
@@ -801,30 +1014,27 @@ const finishProduction = (req, res) => __awaiter(void 0, void 0, void 0, functio
         const completedOrder = result[0];
         res.json(completedOrder);
         // Broadcast real-time update via WebSocket
-        const io = req.app.get('io');
-        if (io) {
-            const user = ((_f = req.user) === null || _f === void 0 ? void 0 : _f.name) || 'System';
-            // Notify about production completion
-            io.emit('production:completed', {
-                orderId: id,
-                orderNumber: completedOrder.order_number,
-                productId: order.finished_product_id,
-                qtyFinished,
-                completedBy: user
-            });
-            // Notify about stock change (for inventory views to refresh)
-            io.emit('stock:updated', {
-                productId: order.finished_product_id,
-                warehouseId: order.warehouse_id,
-                changeType: 'PRODUCTION_OUTPUT',
-                updatedBy: user
-            });
-            // Generic entity change notification
-            io.emit('entity:changed', {
-                entityType: 'products',
-                updatedBy: user
-            });
-        }
+        const user = ((_f = req.user) === null || _f === void 0 ? void 0 : _f.name) || 'System';
+        // Notify about production completion
+        eventBus_1.eventBus.broadcast('production:completed', {
+            orderId: id,
+            orderNumber: completedOrder.order_number,
+            productId: order.finished_product_id,
+            qtyFinished,
+            completedBy: user
+        });
+        // Notify about stock change (for inventory views to refresh)
+        eventBus_1.eventBus.broadcast('stock:updated', {
+            productId: order.finished_product_id,
+            warehouseId: order.warehouse_id,
+            changeType: 'PRODUCTION_OUTPUT',
+            updatedBy: user
+        });
+        // Generic entity change notification
+        eventBus_1.eventBus.broadcast('entity:changed', {
+            entityType: 'products',
+            updatedBy: user
+        });
     }
     catch (error) {
         yield connection.rollback();
@@ -839,7 +1049,7 @@ exports.finishProduction = finishProduction;
 // Cancel production
 const cancelProduction = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
@@ -877,15 +1087,15 @@ const cancelProduction = (req, res) => __awaiter(void 0, void 0, void 0, functio
                         // Create new record with the reversed amount
                         const [productRow] = yield connection.query('SELECT stock FROM products WHERE id = ?', [movement.product_id]);
                         const globalStock = parseFloat((_a = productRow[0]) === null || _a === void 0 ? void 0 : _a.stock) || 0;
-                        yield connection.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, uuid_1.v4)(), movement.product_id, movement.warehouse_id, globalStock]);
+                        yield connection.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [(0, crypto_1.randomUUID)(), movement.product_id, movement.warehouse_id, globalStock]);
                     }
                 }
                 // Create reversal movement
                 yield connection.query(`
                     INSERT INTO stock_movements (
-                        id, product_id, warehouse_id, qty_change, movement_type,
+                        product_id, warehouse_id, qty_change, movement_type,
                         reference_type, reference_id, notes
-                    ) VALUES (UUID(), ?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
+                    ) VALUES (?, ?, ?, 'ADJUSTMENT', 'PRODUCTION_ORDER', ?, ?)
                 `, [
                     movement.product_id,
                     movement.warehouse_id,

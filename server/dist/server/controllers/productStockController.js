@@ -11,7 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deleteProductStock = exports.upsertProductStock = exports.getProductStocksByWarehouse = exports.getProductStocksByProduct = exports.getProductStocks = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
 const getProductStocks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
@@ -95,7 +95,7 @@ const upsertProductStock = (req, res) => __awaiter(void 0, void 0, void 0, funct
         }
         else {
             // Insert new
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             yield conn.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?)', [id, productId, warehouseId, stock]);
             res.status(201).json({ id, productId, warehouseId, stock });
         }

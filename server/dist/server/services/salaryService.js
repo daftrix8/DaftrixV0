@@ -1,37 +1,4 @@
 "use strict";
-var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    var desc = Object.getOwnPropertyDescriptor(m, k);
-    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
-      desc = { enumerable: true, get: function() { return m[k]; } };
-    }
-    Object.defineProperty(o, k2, desc);
-}) : (function(o, m, k, k2) {
-    if (k2 === undefined) k2 = k;
-    o[k2] = m[k];
-}));
-var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
-    Object.defineProperty(o, "default", { enumerable: true, value: v });
-}) : function(o, v) {
-    o["default"] = v;
-});
-var __importStar = (this && this.__importStar) || (function () {
-    var ownKeys = function(o) {
-        ownKeys = Object.getOwnPropertyNames || function (o) {
-            var ar = [];
-            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
-            return ar;
-        };
-        return ownKeys(o);
-    };
-    return function (mod) {
-        if (mod && mod.__esModule) return mod;
-        var result = {};
-        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
-        __setModuleDefault(result, mod);
-        return result;
-    };
-})();
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -52,7 +19,7 @@ const taxService_1 = require("./taxService");
 const getActiveSalaryComponents = () => __awaiter(void 0, void 0, void 0, function* () {
     const [rows] = yield db_1.pool.query(`
     SELECT id, code, name, nameEn, type, category, 
-           isTaxable, isInsuranceSubject, defaultFormula, displayOrder
+           isTaxable, isInsuranceSubject, isActive, defaultFormula, displayOrder
     FROM salary_components 
     WHERE isActive = 1 
     ORDER BY displayOrder ASC
@@ -67,7 +34,7 @@ const getEmployeeSalaryStructure = (employeeId_1, ...args_1) => __awaiter(void 0
     const dateStr = effectiveDate.toISOString().split('T')[0];
     const [rows] = yield db_1.pool.query(`
     SELECT 
-      sc.id, sc.code, sc.name, sc.type, sc.category,
+      sc.id, sc.id as componentId, sc.code, sc.name, sc.type, sc.category,
       sc.isTaxable, sc.isInsuranceSubject,
       COALESCE(ess.amount, 0) as amount,
       COALESCE(ess.percentage, NULL) as percentage,
@@ -223,7 +190,7 @@ exports.calculateEmployeePayroll = calculateEmployeePayroll;
  */
 const setEmployeeSalaryComponent = (employeeId_1, componentId_1, amount_1, effectiveFrom_1, ...args_1) => __awaiter(void 0, [employeeId_1, componentId_1, amount_1, effectiveFrom_1, ...args_1], void 0, function* (employeeId, componentId, amount, effectiveFrom, options = {}) {
     var _a;
-    const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+    const { randomUUID: uuidv4 } = require('crypto');
     const id = uuidv4();
     // Deactivate any existing active entries for this component
     yield db_1.pool.query(`
@@ -275,7 +242,7 @@ exports.createDefaultSalaryStructure = createDefaultSalaryStructure;
  * Create a new salary component
  */
 const createSalaryComponent = (component) => __awaiter(void 0, void 0, void 0, function* () {
-    const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+    const { randomUUID: uuidv4 } = require('crypto');
     const id = uuidv4();
     yield db_1.pool.query(`
     INSERT INTO salary_components 

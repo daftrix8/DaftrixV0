@@ -42,25 +42,48 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getTaxBrackets = exports.calculateTaxPreview = exports.setEmployeeSalaryComponent = exports.getEmployeeSalaryStructure = exports.getSalaryComponents = exports.deleteLeaveRequest = exports.cancelLeaveRequest = exports.rejectLeaveRequest = exports.approveLeaveRequest = exports.createLeaveRequest = exports.getLeaveRequests = exports.updateLeaveBalance = exports.initializeLeaveBalances = exports.getLeaveBalances = exports.deleteLeaveType = exports.updateLeaveType = exports.createLeaveType = exports.getLeaveTypes = exports.updateEmployeeTemplate = exports.removeEmployeeTemplate = exports.getEmployeeTemplates = exports.assignTemplateToEmployee = exports.deletePayrollTemplate = exports.updatePayrollTemplate = exports.createPayrollTemplate = exports.getPayrollTemplates = exports.getLoanHistory = exports.getLoanConstraints = exports.settleLoanEarly = exports.skipLoanInstallment = exports.getLoanInstallments = exports.createLoanWithInstallments = exports.checkLoanEligibility = exports.deleteAdvance = exports.updateAdvance = exports.createAdvance = exports.getAdvances = exports.updatePayrollEntry = exports.approvePayroll = exports.calculatePayroll = exports.deletePayrollCycle = exports.createPayrollCycle = exports.getPayrollEntries = exports.getPayrollCycles = exports.recordAttendance = exports.getAttendance = exports.deleteEmployee = exports.updateEmployee = exports.createEmployee = exports.getEmployees = void 0;
-exports.deleteSalaryComponent = exports.updateSalaryComponent = exports.createSalaryComponent = exports.verifyTreasuryForPayroll = exports.getTreasuryBalance = exports.preflightPayrollApproval = exports.applyAdjustmentToPayroll = exports.approveAdjustment = exports.getPendingAdjustments = exports.createRetroactiveAdjustment = exports.calculateRetroactiveAdjustment = exports.migrateEmployeeSalaryStructure = exports.calculatePayrollPreview = exports.getInsuranceConfig = void 0;
+exports.setEmployeeSalaryComponent = exports.getEmployeeSalaryStructure = exports.getSalaryComponents = exports.deleteLeaveRequest = exports.cancelLeaveRequest = exports.rejectLeaveRequest = exports.approveLeaveRequest = exports.createLeaveRequest = exports.getLeaveRequests = exports.updateLeaveBalance = exports.initializeLeaveBalances = exports.getLeaveBalances = exports.deleteLeaveType = exports.updateLeaveType = exports.createLeaveType = exports.getLeaveTypes = exports.updateEmployeeTemplate = exports.removeEmployeeTemplate = exports.getEmployeeTemplates = exports.assignTemplateToEmployee = exports.deletePayrollTemplate = exports.updatePayrollTemplate = exports.createPayrollTemplate = exports.getPayrollTemplates = exports.getLoanHistory = exports.getLoanConstraints = exports.repayLoan = exports.settleLoanEarly = exports.skipLoanInstallment = exports.getEmployeeLoanInstallments = exports.getLoanInstallments = exports.createLoanWithInstallments = exports.checkLoanEligibility = exports.deleteAdvance = exports.updateAdvance = exports.createAdvance = exports.getAdvances = exports.updatePayrollEntry = exports.approvePayroll = exports.calculatePayroll = exports.deletePayrollCycle = exports.createPayrollCycle = exports.getPayrollEntries = exports.getPayrollCycles = exports.recordAttendance = exports.getAttendance = exports.deleteEmployee = exports.updateEmployee = exports.createEmployee = exports.getEmployees = void 0;
+exports.deletePayrollGLMapping = exports.upsertPayrollGLMapping = exports.getPayrollGLMappings = exports.getAdditionalSalaryStats = exports.bulkApproveAdditionalSalary = exports.cancelAdditionalSalary = exports.rejectAdditionalSalary = exports.approveAdditionalSalary = exports.deleteAdditionalSalary = exports.updateAdditionalSalary = exports.createAdditionalSalary = exports.getAdditionalSalaryEntries = exports.getWorkEntrySummary = exports.resolveWorkEntryConflict = exports.validateWorkEntries = exports.generateWorkEntries = exports.deleteWorkEntry = exports.updateWorkEntry = exports.upsertWorkEntry = exports.getWorkEntries = exports.createWorkEntryType = exports.getWorkEntryTypes = exports.removeStructureAssignment = exports.assignStructureToEmployee = exports.getTemplateAssignments = exports.getEmployeeStructureAssignment = exports.deleteStructureLine = exports.updateStructureLine = exports.addStructureLine = exports.deleteStructureTemplate = exports.updateStructureTemplate = exports.createStructureTemplate = exports.getStructureTemplate = exports.getStructureTemplates = exports.deleteSalaryComponent = exports.updateSalaryComponent = exports.createSalaryComponent = exports.verifyTreasuryForPayroll = exports.getTreasuryBalance = exports.preflightPayrollApproval = exports.applyAdjustmentToPayroll = exports.approveAdjustment = exports.getPendingAdjustments = exports.createRetroactiveAdjustment = exports.calculateRetroactiveAdjustment = exports.migrateEmployeeSalaryStructure = exports.calculatePayrollPreview = exports.getInsuranceConfig = exports.getTaxBrackets = exports.calculateTaxPreview = void 0;
+exports.deleteRuleCategory = exports.updateRuleCategory = exports.createRuleCategory = exports.getRuleCategories = exports.previewPayrollJournal = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
 const loanService = __importStar(require("../services/loanService"));
+const salaryService = __importStar(require("../services/salaryService"));
+const taxService = __importStar(require("../services/taxService"));
+const salaryStructureService = __importStar(require("../services/salaryStructureService"));
 // ==========================================
 // EMPLOYEES
 // ==========================================
 const getEmployees = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
-        const [rows] = yield db_1.pool.query(`
-      SELECT e.*, b.name as branchName, a.name as treasuryName, s.name as salesmanName
-      FROM employees e
-      LEFT JOIN branches b ON e.branchId = b.id
-      LEFT JOIN accounts a ON e.treasuryAccountId = a.id
-      LEFT JOIN salesmen s ON e.salesmanId = s.id
-      ORDER BY e.fullName
-    `);
+        let rows;
+        try {
+            [rows] = yield db_1.pool.query(`
+              SELECT e.*, b.name as branchName, a.name as treasuryName, s.name as salesmanName
+              FROM employees e
+              LEFT JOIN branches b ON e.branchId = b.id
+              LEFT JOIN accounts a ON e.treasuryAccountId = a.id
+              LEFT JOIN salesmen s ON e.salesmanId = s.id
+              ORDER BY e.fullName
+            `);
+        }
+        catch (joinErr) {
+            // If salesmanId column or salesmen table doesn't exist, fall back without it
+            if (((_a = joinErr.message) === null || _a === void 0 ? void 0 : _a.includes('salesmanId')) || joinErr.code === 'ER_BAD_FIELD_ERROR' || joinErr.code === 'ER_NO_SUCH_TABLE') {
+                [rows] = yield db_1.pool.query(`
+                  SELECT e.*, b.name as branchName, a.name as treasuryName, NULL as salesmanName
+                  FROM employees e
+                  LEFT JOIN branches b ON e.branchId = b.id
+                  LEFT JOIN accounts a ON e.treasuryAccountId = a.id
+                  ORDER BY e.fullName
+                `);
+            }
+            else {
+                throw joinErr;
+            }
+        }
         res.json(rows);
     }
     catch (error) {
@@ -70,22 +93,39 @@ const getEmployees = (req, res) => __awaiter(void 0, void 0, void 0, function* (
 });
 exports.getEmployees = getEmployees;
 const createEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { fullName, nationalId, jobTitle, department, employmentType, baseSalary, branchId, treasuryAccountId, status, hireDate, phone, email, address, salesmanId } = req.body;
+    const { fullName, nationalId, jobTitle, department, employmentType, baseSalary, variableSalary, basicSalaryInsurable, personalExemption, insuranceNumber, taxNumber, fingerprintId, branchId, treasuryAccountId, status, hireDate, phone, email, address, salesmanId } = req.body;
+    // Input validation
+    if (!fullName || typeof fullName !== 'string' || fullName.trim().length === 0) {
+        return res.status(400).json({ error: 'اسم الموظف مطلوب' });
+    }
+    if (baseSalary !== undefined && baseSalary !== null && baseSalary !== '') {
+        if (isNaN(Number(baseSalary)) || Number(baseSalary) < 0) {
+            return res.status(400).json({ error: 'الراتب الأساسي يجب أن يكون رقماً صحيحاً' });
+        }
+    }
     // Convert ISO datetime to DATE format (YYYY-MM-DD)
     const parsedHireDate = hireDate ? new Date(hireDate).toISOString().split('T')[0] : null;
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
       INSERT INTO employees (
         id, fullName, nationalId, jobTitle, department, employmentType,
-        baseSalary, branchId, treasuryAccountId, status, hireDate,
+        baseSalary, variableSalary, basicSalaryInsurable, personalExemption,
+        insuranceNumber, taxNumber, fingerprintId,
+        branchId, treasuryAccountId, status, hireDate,
         phone, email, address, salesmanId
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
-            id, fullName, nationalId, jobTitle, department, employmentType || 'MONTHLY',
-            baseSalary || 0, branchId, treasuryAccountId, status || 'ACTIVE', parsedHireDate,
+            id, fullName, nationalId || null, jobTitle || null, department || null, employmentType || 'MONTHLY',
+            baseSalary || 0, variableSalary || 0,
+            basicSalaryInsurable || null, personalExemption || 15000,
+            insuranceNumber || null, taxNumber || null, fingerprintId || null,
+            branchId || null, treasuryAccountId || null, status || 'ACTIVE', parsedHireDate,
             phone || null, email || null, address || null, salesmanId || null
         ]);
+        // Create default salary structure (Basic + Variable if any)
+        yield salaryService.createDefaultSalaryStructure(id, Number(baseSalary) || 0, 0 // Default variable to 0 for now
+        );
         res.status(201).json({ id, message: 'Employee created successfully' });
     }
     catch (error) {
@@ -96,20 +136,25 @@ const createEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function*
 exports.createEmployee = createEmployee;
 const updateEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { id } = req.params;
-    const { fullName, nationalId, jobTitle, department, employmentType, baseSalary, branchId, treasuryAccountId, status, hireDate, phone, email, address, salesmanId } = req.body;
+    const { fullName, nationalId, jobTitle, department, employmentType, baseSalary, variableSalary, basicSalaryInsurable, personalExemption, insuranceNumber, taxNumber, fingerprintId, branchId, treasuryAccountId, status, hireDate, phone, email, address, salesmanId } = req.body;
     // Convert ISO datetime to DATE format (YYYY-MM-DD)
     const parsedHireDate = hireDate ? new Date(hireDate).toISOString().split('T')[0] : null;
     try {
         yield db_1.pool.query(`
       UPDATE employees SET
         fullName = ?, nationalId = ?, jobTitle = ?, department = ?,
-        employmentType = ?, baseSalary = ?, branchId = ?,
-        treasuryAccountId = ?, status = ?, hireDate = ?,
+        employmentType = ?, baseSalary = ?,
+        variableSalary = ?, basicSalaryInsurable = ?, personalExemption = ?,
+        insuranceNumber = ?, taxNumber = ?, fingerprintId = ?,
+        branchId = ?, treasuryAccountId = ?, status = ?, hireDate = ?,
         phone = ?, email = ?, address = ?, salesmanId = ?
       WHERE id = ?
     `, [
-            fullName, nationalId, jobTitle, department, employmentType,
-            baseSalary, branchId, treasuryAccountId, status, parsedHireDate,
+            fullName, nationalId || null, jobTitle || null, department || null, employmentType || 'MONTHLY',
+            baseSalary || 0,
+            variableSalary || 0, basicSalaryInsurable || null, personalExemption || 15000,
+            insuranceNumber || null, taxNumber || null, fingerprintId || null,
+            branchId || null, treasuryAccountId || null, status || 'ACTIVE', parsedHireDate,
             phone || null, email || null, address || null, salesmanId || null, id
         ]);
         res.json({ message: 'Employee updated successfully' });
@@ -121,8 +166,24 @@ const updateEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function*
 });
 exports.updateEmployee = updateEmployee;
 const deleteEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b, _c;
     const { id } = req.params;
     try {
+        // Check for related records before deleting
+        const [attendance] = yield db_1.pool.query('SELECT COUNT(*) as count FROM attendance_records WHERE employeeId = ?', [id]);
+        const [payroll] = yield db_1.pool.query('SELECT COUNT(*) as count FROM payroll_entries WHERE employeeId = ?', [id]);
+        let advanceCount = 0;
+        try {
+            const [advances] = yield db_1.pool.query('SELECT COUNT(*) as count FROM employee_advances WHERE employeeId = ?', [id]);
+            advanceCount = ((_a = advances[0]) === null || _a === void 0 ? void 0 : _a.count) || 0;
+        }
+        catch (e) { /* table might not exist */ }
+        const relatedRecords = (((_b = attendance[0]) === null || _b === void 0 ? void 0 : _b.count) || 0) + (((_c = payroll[0]) === null || _c === void 0 ? void 0 : _c.count) || 0) + advanceCount;
+        if (relatedRecords > 0) {
+            return res.status(400).json({
+                error: `لا يمكن حذف هذا الموظف لأن لديه ${relatedRecords} سجل مرتبط (حضور/رواتب/سلف). قم بتغيير حالته إلى "منهي الخدمة" بدلاً من الحذف.`
+            });
+        }
         yield db_1.pool.query('DELETE FROM employees WHERE id = ?', [id]);
         res.json({ message: 'Employee deleted successfully' });
     }
@@ -168,9 +229,9 @@ const getAttendance = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 });
 exports.getAttendance = getAttendance;
 const recordAttendance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { employeeId, date, checkIn, checkOut, status, isOvertime, overtimeHours, notes, lateMinutes, earlyLeaveMinutes, scheduledCheckIn, scheduledCheckOut } = req.body;
+    const { employeeId, date, checkIn, checkOut, status, isOvertime, overtimeHours, notes, lateMinutes, earlyLeaveMinutes, scheduledCheckIn, scheduledCheckOut, source } = req.body;
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         // Calculate late minutes if checkIn and scheduledCheckIn are provided
         let calculatedLateMinutes = lateMinutes || 0;
         let calculatedEarlyLeaveMinutes = earlyLeaveMinutes || 0;
@@ -202,8 +263,8 @@ const recordAttendance = (req, res) => __awaiter(void 0, void 0, void 0, functio
       INSERT INTO attendance_records (
         id, employeeId, date, checkIn, checkOut, status,
         isOvertime, overtimeHours, lateMinutes, earlyLeaveMinutes,
-        scheduledCheckIn, scheduledCheckOut, notes
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        scheduledCheckIn, scheduledCheckOut, notes, source
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON DUPLICATE KEY UPDATE
         checkIn = VALUES(checkIn),
         checkOut = VALUES(checkOut),
@@ -214,12 +275,17 @@ const recordAttendance = (req, res) => __awaiter(void 0, void 0, void 0, functio
         earlyLeaveMinutes = VALUES(earlyLeaveMinutes),
         scheduledCheckIn = VALUES(scheduledCheckIn),
         scheduledCheckOut = VALUES(scheduledCheckOut),
-        notes = VALUES(notes)
+        notes = VALUES(notes),
+        source = VALUES(source)
     `, [
-            id, employeeId, date, checkIn, checkOut, finalStatus,
+            id, employeeId, date,
+            checkIn || null, // empty string '' is invalid for TIME — use null
+            checkOut || null, // same
+            finalStatus,
             isOvertime || false, overtimeHours || 0,
             calculatedLateMinutes, calculatedEarlyLeaveMinutes,
-            defaultScheduledCheckIn, defaultScheduledCheckOut, notes
+            defaultScheduledCheckIn, defaultScheduledCheckOut, notes,
+            source || 'MANUAL'
         ]);
         res.json({
             message: 'Attendance recorded successfully',
@@ -240,7 +306,7 @@ exports.recordAttendance = recordAttendance;
 const getPayrollCycles = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const [rows] = yield db_1.pool.query(`
-      SELECT * FROM payroll_cycles ORDER BY year DESC, month DESC
+      SELECT * FROM payroll_cycles ORDER BY year DESC, month DESC, payrollType ASC, weekNumber ASC
     `);
         res.json(rows);
     }
@@ -268,18 +334,36 @@ const getPayrollEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
 });
 exports.getPayrollEntries = getPayrollEntries;
 const createPayrollCycle = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { month, year, notes, includeTax, includeInsurance } = req.body;
+    const { month, year, notes, includeTax, includeInsurance, payrollType, weekNumber } = req.body;
+    const isWeekly = payrollType === 'WEEKLY';
+    // For weekly cycles, auto-compute startDate/endDate from year + month + weekNumber
+    let startDate = null;
+    let endDate = null;
+    if (isWeekly && weekNumber) {
+        // Week 1 = days 1-7, Week 2 = days 8-14, etc.
+        const weekStart = (weekNumber - 1) * 7 + 1;
+        const lastDayOfMonth = new Date(year, month, 0).getDate();
+        const weekEnd = Math.min(weekStart + 6, lastDayOfMonth);
+        startDate = `${year}-${String(month).padStart(2, '0')}-${String(weekStart).padStart(2, '0')}`;
+        endDate = `${year}-${String(month).padStart(2, '0')}-${String(weekEnd).padStart(2, '0')}`;
+    }
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
-      INSERT INTO payroll_cycles (id, month, year, status, notes, includeTax, includeInsurance)
-      VALUES (?, ?, ?, 'DRAFT', ?, ?, ?)
-    `, [id, month, year, notes, includeTax !== false, includeInsurance !== false]);
+      INSERT INTO payroll_cycles (id, month, year, status, notes, includeTax, includeInsurance, payrollType, weekNumber, startDate, endDate)
+      VALUES (?, ?, ?, 'DRAFT', ?, ?, ?, ?, ?, ?, ?)
+    `, [
+            id, month, year, notes, includeTax !== false, includeInsurance !== false,
+            isWeekly ? 'WEEKLY' : 'MONTHLY',
+            isWeekly ? weekNumber : null,
+            startDate, endDate
+        ]);
         res.status(201).json({ id, message: 'Payroll cycle created' });
     }
     catch (error) {
         if (error.code === 'ER_DUP_ENTRY') {
-            return res.status(400).json({ error: 'Payroll cycle for this month already exists' });
+            const label = isWeekly ? `الأسبوع ${weekNumber} من هذا الشهر` : 'هذا الشهر';
+            return res.status(400).json({ error: `مسير الرواتب لـ${label} موجود بالفعل` });
         }
         console.error('Error creating payroll cycle:', error);
         return (0, errorHandler_1.handleControllerError)(res, error, 'create payroll cycle');
@@ -288,20 +372,95 @@ const createPayrollCycle = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.createPayrollCycle = createPayrollCycle;
 const deletePayrollCycle = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { id } = req.params;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        // Check status
-        const [cycles] = yield conn.query('SELECT status FROM payroll_cycles WHERE id = ?', [id]);
+        // Check if cycle exists
+        const [cycles] = yield conn.query('SELECT * FROM payroll_cycles WHERE id = ?', [id]);
         if (cycles.length === 0)
             return res.status(404).json({ error: 'Cycle not found' });
-        if (cycles[0].status !== 'DRAFT')
-            return res.status(400).json({ error: 'Cannot delete an approved/paid payroll' });
-        // Delete entries first (if no cascade)
+        const cycle = cycles[0];
+        // If approved/paid, reverse all financial entries first
+        if (cycle.status === 'APPROVED' || cycle.status === 'PAID' || cycle.status === 'CALCULATED') {
+            // PERF: console.log(`🔄 [deletePayroll] Reversing approved payroll cycle ${id} (status: ${cycle.status})`);
+            // 1. Reverse journal entries created for this payroll
+            // Match by cycle ID prefix for precision (avoids matching other cycles with same month/year)
+            const referencePattern = `PAYROLL-${id}%`;
+            const legacyPattern = `PAYROLL-${cycle.month}-${cycle.year}%`;
+            const [journalRows] = yield conn.query('SELECT id FROM journal_entries WHERE referenceId LIKE ? OR referenceId LIKE ?', [referencePattern, legacyPattern]);
+            for (const journal of journalRows) {
+                // Reverse account balances from journal lines
+                const [lines] = yield conn.query('SELECT accountId, debit, credit FROM journal_lines WHERE journalId = ?', [journal.id]);
+                for (const line of lines) {
+                    // Reverse: subtract debit, add credit
+                    yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) - ? + ? WHERE id = ?', [Number(line.debit) || 0, Number(line.credit) || 0, line.accountId]);
+                }
+                // Delete journal lines and entry
+                yield conn.query('DELETE FROM journal_lines WHERE journalId = ?', [journal.id]);
+                yield conn.query('DELETE FROM journal_entries WHERE id = ?', [journal.id]);
+                // PERF: console.log(`  📚 Reversed and deleted journal ${journal.id}`);
+            }
+            // 2. Reverse advance deductions made during approval
+            const [entries] = yield conn.query('SELECT * FROM payroll_entries WHERE payrollId = ?', [id]);
+            for (const entry of entries) {
+                const advanceAmount = parseFloat(entry.advances) || 0;
+                if (advanceAmount <= 0)
+                    continue;
+                try {
+                    // Restore advance remaining amounts
+                    // Find advances that were deducted for this employee
+                    let advanceQuery = `
+                        SELECT id, remainingAmount, totalPaid, status, amount
+                        FROM employee_advances
+                        WHERE employeeId = ? AND (
+                            status = 'ACTIVE' OR status = 'COMPLETED'
+                        )
+                        ORDER BY issueDate ASC
+                    `;
+                    const [advances] = yield conn.query(advanceQuery, [entry.employeeId]);
+                    let remainingToRestore = advanceAmount;
+                    for (const adv of advances) {
+                        if (remainingToRestore <= 0)
+                            break;
+                        const totalPaid = parseFloat(adv.totalPaid) || 0;
+                        const restoreAmount = Math.min(remainingToRestore, totalPaid);
+                        if (restoreAmount > 0) {
+                            const newRemaining = (parseFloat(adv.remainingAmount) || 0) + restoreAmount;
+                            const newTotalPaid = Math.max(0, totalPaid - restoreAmount);
+                            yield conn.query(`
+                                UPDATE employee_advances 
+                                SET remainingAmount = ?, totalPaid = ?, status = 'ACTIVE'
+                                WHERE id = ?
+                            `, [newRemaining, newTotalPaid, adv.id]);
+                            remainingToRestore -= restoreAmount;
+                            // PERF: console.log(`  💰 Restored ${restoreAmount} to advance ${adv.id}`);
+                        }
+                    }
+                }
+                catch (advErr) {
+                    // PERF: console.warn(`Warning restoring advances for employee ${entry.employeeId}:`, advErr);
+                }
+            }
+            // 3. Reverse loan installment deductions
+            try {
+                const startDate = `${cycle.year}-${String(cycle.month).padStart(2, '0')}-01`;
+                const endDate = `${cycle.year}-${String(cycle.month).padStart(2, '0')}-31`;
+                yield conn.query(`
+                    UPDATE loan_installments 
+                    SET status = 'PENDING' 
+                    WHERE payrollId = ? AND status = 'DEDUCTED'
+                `, [id]).catch(() => { });
+            }
+            catch (loanErr) {
+                // PERF: console.warn('Warning restoring loan installments:', loanErr);
+            }
+        }
+        // Delete entries and cycle
         yield conn.query('DELETE FROM payroll_entries WHERE payrollId = ?', [id]);
         yield conn.query('DELETE FROM payroll_cycles WHERE id = ?', [id]);
         yield conn.commit();
-        res.json({ message: 'Payroll cycle deleted' });
+        // PERF: console.log(`✅ [deletePayroll] Successfully deleted payroll cycle ${id} (was ${cycle.status})`);
+        res.json({ message: 'تم حذف دورة الرواتب وعكس القيود المحاسبية بنجاح' });
     }
     catch (error) {
         yield conn.rollback();
@@ -314,9 +473,9 @@ const deletePayrollCycle = (req, res) => __awaiter(void 0, void 0, void 0, funct
 });
 exports.deletePayrollCycle = deletePayrollCycle;
 const calculatePayroll = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e, _f;
     const { id } = req.params; // payrollId
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // 1. Get Payroll Cycle info
@@ -330,77 +489,359 @@ const calculatePayroll = (req, res) => __awaiter(void 0, void 0, void 0, functio
         yield conn.query('DELETE FROM payroll_entries WHERE payrollId = ?', [id]);
         let totalAmount = 0;
         const processedEntries = [];
+        const isWeekly = cycle.payrollType === 'WEEKLY';
+        const lastDay = new Date(cycle.year, cycle.month, 0).getDate();
+        // Use explicit startDate/endDate from cycle if available (weekly), otherwise compute from month/year
+        const startDate = cycle.startDate
+            ? (typeof cycle.startDate === 'string' ? cycle.startDate : new Date(cycle.startDate).toISOString().split('T')[0])
+            : `${cycle.year}-${String(cycle.month).padStart(2, '0')}-01`;
+        const endDate = cycle.endDate
+            ? (typeof cycle.endDate === 'string' ? cycle.endDate : new Date(cycle.endDate).toISOString().split('T')[0])
+            : `${cycle.year}-${String(cycle.month).padStart(2, '0')}-${lastDay}`;
+        // Calculate period length in days
+        const periodDays = isWeekly
+            ? Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / (1000 * 60 * 60 * 24)) + 1
+            : lastDay;
         // 4. Calculate for each employee using Salary Service
         for (const emp of employees) {
-            // Calculate date range for this payroll cycle (assuming full month for now)
-            const startDate = `${cycle.year}-${String(cycle.month).padStart(2, '0')}-01`;
-            const endDate = `${cycle.year}-${String(cycle.month).padStart(2, '0')}-31`; // Approx end date
-            // 4a. Fetch Attendance Stats
-            let attendanceValid = { absentDays: 0, lateMinutes: 0, overtimeHours: 0 };
+            // 4a. Gather attendance data from ALL available sources
+            let paidLeaveDays = 0;
+            let unpaidLeaveDays = 0;
+            let actualWorkedDays = periodDays;
+            let absentDays = 0;
+            let lateMinutes = 0;
+            let overtimeHours = 0;
+            let workingDaysInMonth = periodDays;
+            let dataSourceFound = false;
+            // Source 1: Try attendance_records (most likely to have data)
             try {
-                // Try newer schema first
                 const [stats] = yield conn.query(`
                     SELECT 
                         COUNT(CASE WHEN status = 'ABSENT' THEN 1 END) as absentDays,
+                        COUNT(CASE WHEN status = 'LEAVE' THEN 1 END) as leaveDays,
                         SUM(COALESCE(lateMinutes, 0)) as lateMinutes,
-                        COALESCE(SUM(overtimeHours), 0) as overtimeHours
+                        COALESCE(SUM(overtimeHours), 0) as overtimeHours,
+                        COUNT(*) as totalRecords
                     FROM attendance_records
                     WHERE employeeId = ? AND date BETWEEN ? AND ?
                 `, [emp.id, startDate, endDate]);
-                attendanceValid = {
-                    absentDays: parseFloat((_a = stats[0]) === null || _a === void 0 ? void 0 : _a.absentDays) || 0,
-                    lateMinutes: parseFloat((_b = stats[0]) === null || _b === void 0 ? void 0 : _b.lateMinutes) || 0,
-                    overtimeHours: parseFloat((_c = stats[0]) === null || _c === void 0 ? void 0 : _c.overtimeHours) || 0
-                };
+                const totalRecords = parseInt((_a = stats[0]) === null || _a === void 0 ? void 0 : _a.totalRecords) || 0;
+                if (totalRecords > 0) {
+                    absentDays = parseFloat((_b = stats[0]) === null || _b === void 0 ? void 0 : _b.absentDays) || 0;
+                    const leaveDays = parseFloat((_c = stats[0]) === null || _c === void 0 ? void 0 : _c.leaveDays) || 0;
+                    lateMinutes = parseFloat((_d = stats[0]) === null || _d === void 0 ? void 0 : _d.lateMinutes) || 0;
+                    overtimeHours = parseFloat((_e = stats[0]) === null || _e === void 0 ? void 0 : _e.overtimeHours) || 0;
+                    actualWorkedDays = lastDay - absentDays - leaveDays;
+                    dataSourceFound = true;
+                }
             }
             catch (e) {
-                // Fallback to older schema if needed (count 'LATE' status instances as e.g. 15 mins each if strictly needed, 
-                // but let's stick to what we saw in the view_file for attendance_records)
-                console.warn(`Attendance query warning for ${emp.fullName}`, e);
+                // attendance_records table might not exist
             }
-            // 4b. Fetch Loan Deductions
-            const { total: loanDeductions } = yield loanService.getPendingInstallments(emp.id, startDate, endDate);
-            // 4c. Calculate Payroll using Engine
-            const payrollResult = yield salaryService.calculateEmployeePayroll(emp.id, {
-                baseSalary: parseFloat(emp.baseSalary) || 0,
-                variableSalary: parseFloat(emp.variableSalary) || 0,
-                basicSalaryInsurable: parseFloat(emp.basicSalaryInsurable) || parseFloat(emp.baseSalary) || 0,
-                personalExemption: parseFloat(emp.personalExemption) || 15000
-            }, {
-                workingDays: 30 - attendanceValid.absentDays,
-                absentDays: attendanceValid.absentDays,
-                lateMinutes: attendanceValid.lateMinutes,
-                overtimeHours: attendanceValid.overtimeHours
-            }, loanDeductions, {
-                includeTax: cycle.includeTax !== 0, // MySQL boolean often 0/1
-                includeInsurance: cycle.includeInsurance !== 0
-            });
-            // 4d. Save Entry
-            const entryId = (0, uuid_1.v4)();
-            totalAmount += payrollResult.netSalary;
+            // Source 2: Try work_entries (Beast Mode) — only if no attendance data found
+            if (!dataSourceFound) {
+                try {
+                    const [weSummary] = yield conn.query(`
+                        SELECT 
+                            SUM(CASE WHEN wet.code = 'ATTENDANCE' THEN 1 ELSE 0 END) as attendanceDays,
+                            SUM(CASE WHEN wet.code = 'LEAVE_PAID' OR wet.code = 'SICK_LEAVE' THEN 1 ELSE 0 END) as paidLeaveDays,
+                            SUM(CASE WHEN wet.code = 'LEAVE_UNPAID' THEN 1 ELSE 0 END) as unpaidLeaveDays,
+                            SUM(CASE WHEN wet.code = 'ABSENT' THEN 1 ELSE 0 END) as absentDays,
+                            SUM(CASE WHEN wet.code = 'OVERTIME' THEN we.hours ELSE 0 END) as overtimeHours,
+                            SUM(CASE WHEN wet.isPaid = 1 THEN 1 ELSE 0 END) as totalPaidDays
+                        FROM work_entries we
+                        JOIN work_entry_types wet ON we.workEntryTypeId = wet.id
+                        WHERE we.employeeId = ? AND we.date BETWEEN ? AND ?
+                          AND we.status IN ('VALIDATED', 'DRAFT')
+                    `, [emp.id, startDate, endDate]);
+                    if (((_f = weSummary[0]) === null || _f === void 0 ? void 0 : _f.attendanceDays) !== null && Number(weSummary[0].attendanceDays) > 0) {
+                        paidLeaveDays = Number(weSummary[0].paidLeaveDays) || 0;
+                        unpaidLeaveDays = Number(weSummary[0].unpaidLeaveDays) || 0;
+                        absentDays = Number(weSummary[0].absentDays) || 0;
+                        overtimeHours = Number(weSummary[0].overtimeHours) || 0;
+                        actualWorkedDays = Number(weSummary[0].totalPaidDays) || 30;
+                    }
+                }
+                catch (weErr) {
+                    // work_entries tables don't exist
+                }
+            }
+            // Source 3: Try leave_requests (always check for approved leaves)
+            try {
+                const [leaves] = yield conn.query(`
+                    SELECT lr.*, lt.isPaid
+                    FROM leave_requests lr
+                    JOIN leave_types lt ON lr.leaveTypeId = lt.id
+                    WHERE lr.employeeId = ? AND lr.status = 'APPROVED'
+                      AND lr.startDate <= ? AND lr.endDate >= ?
+                `, [emp.id, endDate, startDate]);
+                for (const leave of leaves) {
+                    const leaveStart = new Date(Math.max(new Date(leave.startDate).getTime(), new Date(startDate).getTime()));
+                    const leaveEnd = new Date(Math.min(new Date(leave.endDate).getTime(), new Date(endDate).getTime()));
+                    const days = Math.ceil((leaveEnd.getTime() - leaveStart.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+                    if (leave.isPaid) {
+                        paidLeaveDays += days;
+                    }
+                    else {
+                        unpaidLeaveDays += days;
+                    }
+                }
+            }
+            catch (leaveErr) {
+                // Leave tables might not exist
+            }
+            // 4b. Fetch Loan/Advance Deductions (wrapped in try/catch)
+            let loanDeductions = 0;
+            let advanceDeductions = 0;
+            try {
+                const result = yield loanService.getPendingInstallments(emp.id, startDate, endDate);
+                loanDeductions = result.total || 0;
+            }
+            catch (loanErr) {
+                // Loan tables might not exist on this client
+                // PERF: console.warn(`Loan query warning for ${emp.fullName}:`, loanErr);
+            }
+            // 4b2. Fetch REGULAR ADVANCES (no installments — deduct monthlyDeduction directly)
+            try {
+                const [activeAdvances] = yield conn.query(`
+                    SELECT id, amount, monthlyDeduction, remainingAmount
+                    FROM employee_advances
+                    WHERE employeeId = ? AND status = 'ACTIVE'
+                      AND (loanType = 'ADVANCE' OR loanType IS NULL)
+                      AND remainingAmount > 0
+                `, [emp.id]);
+                for (const adv of activeAdvances) {
+                    const monthly = parseFloat(adv.monthlyDeduction) || 0;
+                    const remaining = parseFloat(adv.remainingAmount) || 0;
+                    // If monthlyDeduction is set, use it; otherwise deduct the full remaining amount
+                    const deduction = monthly > 0 ? Math.min(monthly, remaining) : remaining;
+                    advanceDeductions += deduction;
+                }
+                if (advanceDeductions > 0) {
+                    // PERF: console.log(`💰 [calculatePayroll] ${emp.fullName}: Regular advance deduction = ${advanceDeductions}`);
+                }
+            }
+            catch (advErr) {
+                // employee_advances table might not have loanType column on older DBs
+                try {
+                    const [activeAdvances] = yield conn.query(`
+                        SELECT id, amount, monthlyDeduction, remainingAmount
+                        FROM employee_advances
+                        WHERE employeeId = ? AND status = 'ACTIVE'
+                          AND remainingAmount > 0
+                    `, [emp.id]);
+                    for (const adv of activeAdvances) {
+                        const monthly = parseFloat(adv.monthlyDeduction) || 0;
+                        const remaining = parseFloat(adv.remainingAmount) || 0;
+                        const deduction = monthly > 0 ? Math.min(monthly, remaining) : remaining;
+                        advanceDeductions += deduction;
+                    }
+                }
+                catch (e) {
+                    // PERF: console.warn(`Advance query warning for ${emp.fullName}:`, e);
+                }
+            }
+            // 4c. Fetch Additional Salary entries (Beast Mode)
+            let additionalEarnings = 0;
+            let additionalDeductions = 0;
+            let additionalBreakdown = [];
+            try {
+                const [additionalEntries] = yield conn.query(`
+                    SELECT ase.*, sc.name as componentName, sc.code as componentCode
+                    FROM additional_salary_entries ase
+                    LEFT JOIN salary_components sc ON ase.componentId = sc.id
+                    WHERE ase.employeeId = ? AND ase.status = 'APPROVED'
+                      AND (
+                        ase.payrollCycleId = ?
+                        OR (ase.payrollCycleId IS NULL AND ase.appliedInCycleId IS NULL AND ase.isRecurring = 0)
+                        OR (ase.isRecurring = 1 AND ase.recurringFrom <= ? AND (ase.recurringTo IS NULL OR ase.recurringTo >= ?))
+                      )
+                `, [emp.id, id, endDate, startDate]);
+                for (const entry of additionalEntries) {
+                    const amount = parseFloat(entry.amount) || 0;
+                    additionalBreakdown.push({
+                        id: entry.id,
+                        name: entry.name,
+                        amount,
+                        type: entry.type,
+                        source: entry.source,
+                        componentName: entry.componentName
+                    });
+                    if (entry.type === 'EARNING') {
+                        additionalEarnings += amount;
+                    }
+                    else {
+                        additionalDeductions += amount;
+                    }
+                }
+                // Mark non-recurring entries as applied
+                const nonRecurringIds = additionalEntries
+                    .filter((e) => !e.isRecurring)
+                    .map((e) => e.id);
+                if (nonRecurringIds.length > 0) {
+                    const placeholders = nonRecurringIds.map(() => '?').join(',');
+                    yield conn.query(`
+                        UPDATE additional_salary_entries 
+                        SET status = 'APPLIED', appliedInCycleId = ?
+                        WHERE id IN (${placeholders})
+                    `, [id, ...nonRecurringIds]);
+                }
+            }
+            catch (addErr) {
+                // Additional salary tables might not exist yet
+            }
+            // ========================================================
+            // 4d. PAYROLL CALCULATION (with Salary Structure Templates)
+            // ========================================================
+            const empMonthlySalary = parseFloat(emp.baseSalary) || 0;
+            // For weekly cycles: use 1/4 of monthly salary as the period base
+            // For weekly employees (employmentType === 'WEEKLY'): baseSalary IS the weekly salary
+            let empBaseSalary;
+            if (isWeekly) {
+                empBaseSalary = emp.employmentType === 'WEEKLY'
+                    ? empMonthlySalary // baseSalary is already the weekly rate
+                    : Math.round((empMonthlySalary / 4) * 100) / 100; // Convert monthly to weekly
+            }
+            else {
+                empBaseSalary = empMonthlySalary;
+            }
+            const dailyRate = isWeekly ? empBaseSalary / 7 : empBaseSalary / 30;
+            const hourlyRate = dailyRate / 8;
+            // --- TRY SALARY STRUCTURE TEMPLATE ---
+            let earningsBreakdown = [];
+            let deductionsBreakdown = [];
+            let templateGross = 0;
+            let templateDeductions = 0;
+            let usedTemplate = false;
+            try {
+                const templateContext = {
+                    BASIC_SALARY: empBaseSalary,
+                    WORKING_DAYS: periodDays,
+                    ABSENT_DAYS: absentDays,
+                    OVERTIME_HOURS: overtimeHours,
+                    WORKING_DAYS_IN_MONTH: periodDays,
+                    ACTUAL_WORKED_DAYS: periodDays - absentDays,
+                };
+                const templateResult = yield salaryStructureService.calculateFromTemplate(emp.id, templateContext, new Date(startDate));
+                if (templateResult.earnings.length > 0) {
+                    usedTemplate = true;
+                    earningsBreakdown = templateResult.earnings;
+                    deductionsBreakdown = templateResult.deductions;
+                    templateGross = templateResult.grossSalary;
+                    templateDeductions = templateResult.totalDeductions;
+                }
+            }
+            catch (tmplErr) {
+                // Template tables might not exist yet — fall back to basic
+                // PERF: console.warn(`Template calc fallback for ${emp.fullName}:`, tmplErr);
+            }
+            // If no template was used, fall back to hardcoded BASIC
+            if (!usedTemplate) {
+                earningsBreakdown = [{
+                        componentId: 'BASIC',
+                        code: 'BASIC',
+                        name: 'الراتب الأساسي',
+                        amount: empBaseSalary,
+                        isTaxable: true,
+                        isInsuranceSubject: true,
+                        category: 'BASIC'
+                    }];
+                templateGross = empBaseSalary;
+            }
+            // --- EARNINGS ---
+            const overtimeMultiplier = 1.5;
+            const overtimeAmount = Math.round(hourlyRate * overtimeHours * overtimeMultiplier * 100) / 100;
+            const incentives = 0; // Will be set manually if needed
+            const grossSalary = Math.round((templateGross + overtimeAmount + incentives + additionalEarnings) * 100) / 100;
+            // --- DEDUCTIONS ---
+            const absenceAmount = Math.round(absentDays * dailyRate * 100) / 100;
+            const unpaidLeaveDeduction = Math.round(unpaidLeaveDays * dailyRate * 100) / 100;
+            // Insurance (only if cycle has includeInsurance enabled)
+            let socialInsurance = 0;
+            let employerInsurance = 0;
+            let insuranceBase = 0;
+            if (cycle.includeInsurance !== 0) {
+                try {
+                    const insResult = yield salaryService.calculateEmployeePayroll(emp.id, {
+                        baseSalary: empBaseSalary,
+                        variableSalary: parseFloat(emp.variableSalary) || 0,
+                        basicSalaryInsurable: parseFloat(emp.basicSalaryInsurable) || empBaseSalary,
+                        personalExemption: parseFloat(emp.personalExemption) || 15000
+                    }, {}, 0, { includeTax: false, includeInsurance: true });
+                    socialInsurance = insResult.socialInsurance;
+                    employerInsurance = insResult.employerInsurance;
+                    insuranceBase = insResult.insuranceBase;
+                }
+                catch (insErr) {
+                    // Insurance calculation failed, skip it
+                    // PERF: console.warn(`Insurance calculation warning for ${emp.fullName}:`, insErr);
+                }
+            }
+            // Tax (only if cycle has includeTax enabled)
+            let incomeTax = 0;
+            let taxBreakdown = [];
+            if (cycle.includeTax !== 0) {
+                try {
+                    const taxResult = yield salaryService.calculateEmployeePayroll(emp.id, {
+                        baseSalary: empBaseSalary,
+                        variableSalary: parseFloat(emp.variableSalary) || 0,
+                        basicSalaryInsurable: parseFloat(emp.basicSalaryInsurable) || empBaseSalary,
+                        personalExemption: parseFloat(emp.personalExemption) || 15000
+                    }, {}, 0, { includeTax: true, includeInsurance: false });
+                    incomeTax = taxResult.incomeTax;
+                    taxBreakdown = taxResult.taxBreakdown;
+                }
+                catch (taxErr) {
+                    // PERF: console.warn(`Tax calculation warning for ${emp.fullName}:`, taxErr);
+                }
+            }
+            // Sum all deductions
+            const totalDeductions = Math.round((absenceAmount +
+                unpaidLeaveDeduction +
+                loanDeductions +
+                advanceDeductions +
+                additionalDeductions +
+                templateDeductions +
+                socialInsurance +
+                incomeTax) * 100) / 100;
+            // --- NET SALARY ---
+            const netSalary = Math.round((grossSalary - totalDeductions) * 100) / 100;
+            // 4e. Save Entry with ALL fields stored explicitly
+            const entryId = (0, crypto_1.randomUUID)();
+            totalAmount += netSalary;
             yield conn.query(`
                 INSERT INTO payroll_entries (
                     id, payrollId, employeeId, baseSalary, 
+                    overtimeHours, overtimeAmount,
                     grossSalary, netSalary,
                     earningsBreakdown, deductionsBreakdown,
                     socialInsurance, employerInsurance,
                     incomeTax, taxBreakdown,
-                    advances,
+                    advances, absenceDays, absenceAmount,
                     insuranceBase,
+                    paidLeaveDays, unpaidLeaveDays, unpaidLeaveDeduction,
+                    workingDaysInMonth, actualWorkedDays,
+                    totalDeductions,
+                    additionalEarnings, additionalDeductions, additionalBreakdown,
+                    department, employeeName,
                     status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
             `, [
-                entryId, id, emp.id, payrollResult.grossSalary, // Note: baseSalary field often conflated with gross in older UI, keeping gross here for display
-                payrollResult.grossSalary,
-                payrollResult.netSalary,
-                JSON.stringify(payrollResult.earnings),
-                JSON.stringify(payrollResult.deductions),
-                payrollResult.socialInsurance,
-                payrollResult.employerInsurance,
-                payrollResult.incomeTax,
-                JSON.stringify(payrollResult.taxBreakdown),
-                loanDeductions,
-                payrollResult.insuranceBase
+                entryId, id, emp.id, empBaseSalary,
+                overtimeHours, overtimeAmount,
+                grossSalary, netSalary,
+                JSON.stringify(earningsBreakdown),
+                JSON.stringify(deductionsBreakdown),
+                socialInsurance, employerInsurance,
+                incomeTax, JSON.stringify(taxBreakdown),
+                loanDeductions + advanceDeductions, absentDays, absenceAmount,
+                insuranceBase,
+                paidLeaveDays, unpaidLeaveDays, unpaidLeaveDeduction,
+                workingDaysInMonth, actualWorkedDays,
+                totalDeductions,
+                additionalEarnings, additionalDeductions,
+                additionalBreakdown.length > 0 ? JSON.stringify(additionalBreakdown) : null,
+                emp.department || null, emp.fullName || null
             ]);
             processedEntries.push(entryId);
         }
@@ -408,10 +849,10 @@ const calculatePayroll = (req, res) => __awaiter(void 0, void 0, void 0, functio
         yield conn.query('UPDATE payroll_cycles SET totalAmount = ? WHERE id = ?', [totalAmount, id]);
         yield conn.commit();
         res.json({
-            message: 'Payroll calculated successfully',
+            message: 'تم حساب الرواتب بنجاح',
             totalAmount,
             employeeCount: processedEntries.length,
-            details: 'Calculated using Formula Engine V2'
+            details: 'Calculated using Formula Engine V3 (Beast Mode)'
         });
     }
     catch (error) {
@@ -427,17 +868,84 @@ exports.calculatePayroll = calculatePayroll;
 const approvePayroll = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     const { id } = req.params;
-    const { treasuryAccountId, expenseAccountId, entryIds } = req.body;
+    let { treasuryAccountId, expenseAccountId, entryIds } = req.body;
+    // Auto-detect accounts if not provided
     if (!treasuryAccountId || !expenseAccountId) {
-        return res.status(400).json({ error: 'Missing treasury or expense account' });
+        // PERF: console.log('⚙️ [approvePayroll] Auto-detecting treasury/expense accounts...');
+        const autoConn = yield (0, db_1.getConnection)();
+        try {
+            // Strategy 1: Check payroll_gl_mappings for configured accounts
+            try {
+                const [mappings] = yield autoConn.query(`
+                    SELECT mappingType, debitAccountId, creditAccountId 
+                    FROM payroll_gl_mappings 
+                    WHERE mappingType IN ('SALARY_EXPENSE', 'NET_SALARY', 'BASIC_SALARY')
+                    LIMIT 5
+                `);
+                for (const m of mappings) {
+                    if (!expenseAccountId && m.debitAccountId)
+                        expenseAccountId = m.debitAccountId;
+                    if (!treasuryAccountId && m.creditAccountId)
+                        treasuryAccountId = m.creditAccountId;
+                }
+            }
+            catch (e) {
+                // Table may not exist
+            }
+            // Strategy 2: Find by account type and code patterns
+            if (!treasuryAccountId) {
+                const [treasuryRows] = yield autoConn.query(`
+                    SELECT id FROM accounts 
+                    WHERE type = 'ASSET' AND (code LIKE '101%' OR code LIKE '102%' OR name LIKE '%خزينة%' OR name LIKE '%صندوق%')
+                    ORDER BY code ASC LIMIT 1
+                `);
+                if (treasuryRows.length > 0)
+                    treasuryAccountId = treasuryRows[0].id;
+            }
+            if (!expenseAccountId) {
+                const [expenseRows] = yield autoConn.query(`
+                    SELECT id FROM accounts 
+                    WHERE type = 'EXPENSE' AND (name LIKE '%رواتب%' OR name LIKE '%أجور%' OR name LIKE '%مرتبات%' OR code LIKE '4%')
+                    ORDER BY code ASC LIMIT 1
+                `);
+                if (expenseRows.length > 0)
+                    expenseAccountId = expenseRows[0].id;
+            }
+            // Strategy 3: Fallback to any ASSET / EXPENSE account
+            if (!treasuryAccountId) {
+                const [anyAsset] = yield autoConn.query(`SELECT id FROM accounts WHERE type = 'ASSET' ORDER BY code ASC LIMIT 1`);
+                if (anyAsset.length > 0)
+                    treasuryAccountId = anyAsset[0].id;
+            }
+            if (!expenseAccountId) {
+                const [anyExpense] = yield autoConn.query(`SELECT id FROM accounts WHERE type = 'EXPENSE' ORDER BY code ASC LIMIT 1`);
+                if (anyExpense.length > 0)
+                    expenseAccountId = anyExpense[0].id;
+            }
+            // PERF: console.log(`⚙️ [approvePayroll] Auto-detected: treasury=${treasuryAccountId}, expense=${expenseAccountId}`);
+        }
+        finally {
+            autoConn.release();
+        }
+        // If still no accounts found, error out
+        if (!treasuryAccountId || !expenseAccountId) {
+            return res.status(400).json({
+                error: 'لا يمكن تحديد حسابات الخزينة أو المصروفات تلقائياً. يرجى إنشاء حسابات في شجرة الحسابات أولاً.',
+                details: { treasuryAccountId, expenseAccountId }
+            });
+        }
     }
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        const [cycleRows] = yield conn.query('SELECT * FROM payroll_cycles WHERE id = ?', [id]);
+        const [cycleRows] = yield conn.query('SELECT * FROM payroll_cycles WHERE id = ? FOR UPDATE', [id]);
         if (cycleRows.length === 0)
             throw new Error('Payroll cycle not found');
         const cycle = cycleRows[0];
+        if (cycle.status === 'APPROVED' || cycle.status === 'PAID') {
+            yield conn.rollback();
+            return res.status(409).json({ error: 'CONCURRENT_MODIFICATION: تم اعتماد دورة الرواتب هذه بالفعل.' });
+        }
         // Get entries - either all or specific ones based on entryIds
         let entries;
         let isPartialPayment = false;
@@ -458,12 +966,26 @@ const approvePayroll = (req, res) => __awaiter(void 0, void 0, void 0, function*
         }
         let totalNet = 0;
         for (const entry of entries) {
-            totalNet += parseFloat(entry.netSalary);
+            const salary = Number(entry.netSalary) || 0;
+            totalNet += salary;
         }
+        // PERF: console.log(`💰 [approvePayroll] totalNet=${totalNet}, entries=${entries.length}, entryNetSalaries=${entries.map((e: any) => e.netSalary).join(',')}`);
+        if (totalNet <= 0) {
+            yield conn.rollback();
+            return res.status(400).json({ error: 'إجمالي الرواتب يساوي صفر - تحقق من بيانات الموظفين' });
+        }
+        // Get account names for journal lines
+        const [accountRows] = yield conn.query('SELECT id, name FROM accounts WHERE id IN (?, ?)', [expenseAccountId, treasuryAccountId]);
+        const accountNameMap = {};
+        for (const acc of accountRows) {
+            accountNameMap[acc.id] = acc.name;
+        }
+        const expenseAccountName = accountNameMap[expenseAccountId] || 'مصروفات رواتب';
+        const treasuryAccountName = accountNameMap[treasuryAccountId] || 'الخزينة';
         // Create Journal Entry
         // Debit: Salaries Expense
         // Credit: Treasury
-        const journalId = (0, uuid_1.v4)();
+        const journalId = (0, crypto_1.randomUUID)();
         const date = new Date().toISOString().slice(0, 19).replace('T', ' ');
         // Include employee count in description for partial payments
         const description = isPartialPayment
@@ -475,18 +997,21 @@ const approvePayroll = (req, res) => __awaiter(void 0, void 0, void 0, function*
     `, [
             journalId, date,
             description,
-            `PAYROLL-${cycle.month}-${cycle.year}${isPartialPayment ? '-PARTIAL' : ''}`
+            `PAYROLL-${id}${isPartialPayment ? '-PARTIAL' : ''}`
         ]);
-        // Debit Line
+        // Debit Line (Expense)
         yield conn.query(`
-      INSERT INTO journal_lines (journalId, accountId, debit, credit)
-      VALUES (?, ?, ?, 0)
-    `, [journalId, expenseAccountId, totalNet]);
-        // Credit Line
+      INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
+      VALUES (?, ?, ?, ?, 0)
+    `, [journalId, expenseAccountId, expenseAccountName, totalNet]);
+        // Credit Line (Treasury)
         yield conn.query(`
-      INSERT INTO journal_lines (journalId, accountId, debit, credit)
-      VALUES (?, ?, 0, ?)
-    `, [journalId, treasuryAccountId, totalNet]);
+      INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
+      VALUES (?, ?, ?, 0, ?)
+    `, [journalId, treasuryAccountId, treasuryAccountName, totalNet]);
+        // Update Account Balances (keep in sync with journal entries)
+        yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?', [totalNet, expenseAccountId]);
+        yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) - ? WHERE id = ?', [totalNet, treasuryAccountId]);
         // Update only the paid entries status
         const paidEntryIds = entries.map((e) => e.id);
         if (paidEntryIds.length > 0) {
@@ -499,9 +1024,12 @@ const approvePayroll = (req, res) => __awaiter(void 0, void 0, void 0, function*
         if (pendingCount[0].count === 0) {
             yield conn.query(`
           UPDATE payroll_cycles 
-          SET status = 'APPROVED', approvedAt = ?, approvedBy = ? 
+          SET status = 'APPROVED', approvedAt = ?, approvedBy = ?, version = version + 1
           WHERE id = ?
         `, [date, (_a = req.user) === null || _a === void 0 ? void 0 : _a.id, id]);
+        }
+        else {
+            yield conn.query(`UPDATE payroll_cycles SET version = version + 1 WHERE id = ?`, [id]);
         }
         // Update Loan Installments (New System)
         try {
@@ -512,7 +1040,65 @@ const approvePayroll = (req, res) => __awaiter(void 0, void 0, void 0, function*
             }
         }
         catch (loanError) {
-            console.warn('Could not update loan installments:', loanError);
+            // PERF: console.warn('Could not update loan installments:', loanError);
+        }
+        // Deduct regular advances (reduce remainingAmount, mark COMPLETED when fully paid)
+        try {
+            for (const entry of entries) {
+                const advanceAmount = parseFloat(entry.advances) || 0;
+                if (advanceAmount <= 0)
+                    continue;
+                // Get active regular advances for this employee
+                let activeAdvances = [];
+                try {
+                    const [rows] = yield conn.query(`
+                        SELECT id, monthlyDeduction, remainingAmount
+                        FROM employee_advances
+                        WHERE employeeId = ? AND status = 'ACTIVE'
+                          AND (loanType = 'ADVANCE' OR loanType IS NULL)
+                          AND remainingAmount > 0
+                        ORDER BY issueDate ASC
+                    `, [entry.employeeId]);
+                    activeAdvances = rows;
+                }
+                catch (e) {
+                    // Fallback without loanType filter
+                    const [rows] = yield conn.query(`
+                        SELECT id, monthlyDeduction, remainingAmount
+                        FROM employee_advances
+                        WHERE employeeId = ? AND status = 'ACTIVE'
+                          AND remainingAmount > 0
+                        ORDER BY issueDate ASC
+                    `, [entry.employeeId]);
+                    activeAdvances = rows;
+                }
+                let remainingToDeduct = advanceAmount;
+                for (const adv of activeAdvances) {
+                    if (remainingToDeduct <= 0)
+                        break;
+                    const monthly = parseFloat(adv.monthlyDeduction) || 0;
+                    const remaining = parseFloat(adv.remainingAmount) || 0;
+                    const deduction = monthly > 0 ? Math.min(monthly, remaining) : remaining;
+                    const actualDeduction = Math.min(deduction, remainingToDeduct);
+                    const newRemaining = Math.round((remaining - actualDeduction) * 100) / 100;
+                    yield conn.query(`
+                        UPDATE employee_advances 
+                        SET remainingAmount = ?, totalPaid = COALESCE(totalPaid, 0) + ?
+                        WHERE id = ?
+                    `, [newRemaining, actualDeduction, adv.id]);
+                    // Mark as COMPLETED if fully paid
+                    if (newRemaining <= 0) {
+                        yield conn.query(`
+                            UPDATE employee_advances SET status = 'COMPLETED' WHERE id = ?
+                        `, [adv.id]);
+                    }
+                    remainingToDeduct -= actualDeduction;
+                    // PERF: console.log(`✅ [approvePayroll] Deducted ${actualDeduction} from advance ${adv.id}, remaining: ${newRemaining}`);
+                }
+            }
+        }
+        catch (advError) {
+            // PERF: console.warn('Could not update advance deductions:', advError);
         }
         yield conn.commit();
         res.json({
@@ -539,7 +1125,7 @@ exports.approvePayroll = approvePayroll;
 const updatePayrollEntry = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { entryId } = req.params;
     const body = req.body;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get current entry
@@ -567,7 +1153,7 @@ const updatePayrollEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const absenceAmount = body.absenceAmount !== undefined ? parseFloat(body.absenceAmount) : dailyRate * absenceDays;
         const paidLeaveDays = body.paidLeaveDays !== undefined ? parseFloat(body.paidLeaveDays) : parseFloat(entry.paidLeaveDays) || 0;
         const unpaidLeaveDays = body.unpaidLeaveDays !== undefined ? parseFloat(body.unpaidLeaveDays) : parseFloat(entry.unpaidLeaveDays) || 0;
-        const unpaidLeaveAmount = body.unpaidLeaveAmount !== undefined ? parseFloat(body.unpaidLeaveAmount) : dailyRate * unpaidLeaveDays;
+        const unpaidLeaveDeduction = body.unpaidLeaveDeduction !== undefined ? parseFloat(body.unpaidLeaveDeduction) : parseFloat(entry.unpaidLeaveDeduction) || dailyRate * unpaidLeaveDays;
         const hourDeductions = body.hourDeductions !== undefined ? parseFloat(body.hourDeductions) : parseFloat(entry.hourDeductions) || 0;
         const penaltyDays = body.penaltyDays !== undefined ? parseFloat(body.penaltyDays) : parseFloat(entry.penaltyDays) || 0;
         const penalties = body.penalties !== undefined ? parseFloat(body.penalties) : parseFloat(entry.penalties) || 0;
@@ -626,8 +1212,11 @@ const updatePayrollEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         // Calculate totals
         const otherAllowances = allowances.reduce((sum, a) => sum + Number(a.amount || 0), 0);
         const otherDeductions = deductions.reduce((sum, d) => sum + Number(d.amount || 0), 0);
+        // Insurance and tax (preserve existing values unless manually edited)
+        const socialInsurance = body.socialInsurance !== undefined ? parseFloat(body.socialInsurance) : parseFloat(entry.socialInsurance) || 0;
+        const incomeTax = body.incomeTax !== undefined ? parseFloat(body.incomeTax) : parseFloat(entry.incomeTax) || 0;
         const grossSalary = baseSalary + overtimeAmount + incentives + bonus + otherAllowances;
-        const totalDeductions = absenceAmount + unpaidLeaveAmount + purchases + advances + hourDeductions + penalties + otherDeductions + salesmanDeficitDeduction;
+        const totalDeductions = absenceAmount + unpaidLeaveDeduction + purchases + advances + hourDeductions + penalties + otherDeductions + salesmanDeficitDeduction + socialInsurance + incomeTax;
         const netSalary = grossSalary - totalDeductions;
         // Update the entry with all fields
         yield conn.query(`
@@ -635,8 +1224,9 @@ const updatePayrollEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 baseSalary = ?, dailyRate = ?, overtimeRate = ?, overtimeHours = ?, overtimeAmount = ?,
                 incentives = ?, bonus = ?, allowances = ?, grossSalary = ?,
                 purchases = ?, advances = ?, absenceDays = ?, absenceAmount = ?,
-                paidLeaveDays = ?, unpaidLeaveDays = ?, unpaidLeaveAmount = ?,
+                paidLeaveDays = ?, unpaidLeaveDays = ?, unpaidLeaveDeduction = ?,
                 hourDeductions = ?, penaltyDays = ?, penalties = ?, deductions = ?, totalDeductions = ?,
+                socialInsurance = ?, incomeTax = ?,
                 netSalary = ?, notes = ?, salesmanDeficitDeduction = ?,
                 earningsBreakdown = ?, deductionsBreakdown = ?
             WHERE id = ?
@@ -644,8 +1234,9 @@ const updatePayrollEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
             baseSalary, dailyRate, overtimeRate, overtimeHours, overtimeAmount,
             incentives, bonus, JSON.stringify(allowances), grossSalary,
             purchases, advances, absenceDays, absenceAmount,
-            paidLeaveDays, unpaidLeaveDays, unpaidLeaveAmount,
+            paidLeaveDays, unpaidLeaveDays, unpaidLeaveDeduction,
             hourDeductions, penaltyDays, penalties, JSON.stringify(deductions), totalDeductions,
+            socialInsurance, incomeTax,
             netSalary, notes, salesmanDeficitDeduction,
             JSON.stringify(earningsBreakdown), JSON.stringify(deductionsBreakdown),
             entryId
@@ -661,8 +1252,9 @@ const updatePayrollEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 id: entryId, baseSalary, dailyRate, overtimeRate, overtimeHours, overtimeAmount,
                 incentives, bonus, allowances, grossSalary,
                 purchases, advances, absenceDays, absenceAmount,
-                paidLeaveDays, unpaidLeaveDays, unpaidLeaveAmount,
+                paidLeaveDays, unpaidLeaveDays, unpaidLeaveDeduction,
                 hourDeductions, penaltyDays, penalties, deductions, totalDeductions,
+                socialInsurance, incomeTax,
                 netSalary, notes, salesmanDeficitDeduction
             },
             cycleTotal: newTotal
@@ -741,36 +1333,50 @@ const createAdvanceAccountingEntry = (connection, advanceId, amount, employeeId,
     const [employees] = yield connection.query('SELECT fullName as name FROM employees WHERE id = ?', [employeeId]);
     const employeeName = ((_a = employees[0]) === null || _a === void 0 ? void 0 : _a.name) || 'Employee';
     // 2. Find "Employee Advances/Loans" Account (Debit)
-    // Robust Approach: Fetch all accounts and filter in JS to avoid SQL nuances
     const [allAccounts] = yield connection.query('SELECT id, code, name FROM accounts');
-    let loanAccount = allAccounts.find((a) => (a.name && (a.name.includes('سلف') || a.name.includes('قرض') || a.name.includes('موظف') || a.name.includes('عامل'))) ||
+    let loanAccount = allAccounts.find((a) => (a.name && (a.name.includes('سلف') || a.name.includes('قرض'))) ||
         (a.name && (a.name.toLowerCase().includes('loan') || a.name.toLowerCase().includes('advance'))));
+    // Fallback 1: Look for account codes starting with 112 (common for employee receivables)
     if (!loanAccount) {
         loanAccount = allAccounts.find((a) => a.code && String(a.code).startsWith('112'));
     }
+    // Fallback 2: Look for 104 (other current assets)
     if (!loanAccount) {
         loanAccount = allAccounts.find((a) => a.code && String(a.code).startsWith('104'));
     }
-    // Last resort: Any Debit account (Asset) - usually starts with 1
+    // Fallback 3: AUTO-CREATE the Employee Advances account
     if (!loanAccount) {
-        loanAccount = allAccounts.find((a) => a.code && String(a.code).startsWith('1'));
+        const newAccountId = (0, crypto_1.randomUUID)();
+        const newAccountCode = '1120'; // Standard code for employee receivables
+        yield connection.query(`
+            INSERT INTO accounts (id, code, name, type, parentId, balance, isActive)
+            VALUES (?, ?, ?, 'ASSET', NULL, 0, 1)
+        `, [newAccountId, newAccountCode, 'سلف وقروض الموظفين']);
+        loanAccount = { id: newAccountId, code: newAccountCode, name: 'سلف وقروض الموظفين' };
     }
-    let loanAccountId = loanAccount === null || loanAccount === void 0 ? void 0 : loanAccount.id;
+    const loanAccountId = loanAccount === null || loanAccount === void 0 ? void 0 : loanAccount.id;
+    const loanAccountName = (loanAccount === null || loanAccount === void 0 ? void 0 : loanAccount.name) || 'سلف وقروض الموظفين';
     // 3. Identify Financial Account (Credit) = Treasury/Bank
     let creditAccountId = null;
+    let creditAccountName = '';
     if (paymentMethod === 'BANK') {
         const [banks] = yield connection.query('SELECT id, name, accountId FROM banks WHERE id = ?', [financialAccountId]);
         if (banks[0]) {
             creditAccountId = banks[0].accountId;
+            creditAccountName = banks[0].name;
             yield connection.query('UPDATE banks SET balance = balance - ? WHERE id = ?', [amount, financialAccountId]);
         }
     }
     else {
+        // CASH - financialAccountId is the treasury account ID directly
         creditAccountId = financialAccountId;
+        const creditAccount = allAccounts.find((a) => a.id === financialAccountId);
+        creditAccountName = (creditAccount === null || creditAccount === void 0 ? void 0 : creditAccount.name) || 'الخزينة';
     }
     if (creditAccountId && loanAccountId) {
-        const journalId = (0, uuid_1.v4)();
+        const journalId = (0, crypto_1.randomUUID)();
         const description = `صرف ${type === 'LOAN' ? 'قرض' : 'سلفة'} للموظف ${employeeName}`;
+        // Create Journal Entry Header
         yield connection.query(`
             INSERT INTO journal_entries (id, date, description, referenceId, createdBy)
             VALUES (?, ?, ?, ?, ?)
@@ -781,32 +1387,37 @@ const createAdvanceAccountingEntry = (connection, advanceId, amount, employeeId,
             advanceId,
             (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System'
         ]);
-        // Debit: Employee Loan Account
+        // Debit: Employee Loan Account (including accountName for display)
         yield connection.query(`
-            INSERT INTO journal_lines (journalId, accountId, debit, credit)
-            VALUES (?, ?, ?, 0)
-        `, [journalId, loanAccountId, amount]);
-        // Credit: Treasury/Bank
+            INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
+            VALUES (?, ?, ?, ?, 0)
+        `, [journalId, loanAccountId, loanAccountName, amount]);
+        // Credit: Treasury/Bank (including accountName for display)
         yield connection.query(`
-            INSERT INTO journal_lines (journalId, accountId, debit, credit)
-            VALUES (?, ?, 0, ?)
-        `, [journalId, creditAccountId, amount]);
+            INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
+            VALUES (?, ?, ?, 0, ?)
+        `, [journalId, creditAccountId, creditAccountName, amount]);
+        // Update Account Balances
         yield connection.query('UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?', [amount, loanAccountId]);
         yield connection.query('UPDATE accounts SET balance = COALESCE(balance, 0) - ? WHERE id = ?', [amount, creditAccountId]);
-        console.log('✅ Accounting Entry Created Successfully:', journalId);
     }
     else {
-        console.warn('⚠️ MISSING ACCOUNTS - Cannot create journal entry', { loanAccountId, creditAccountId });
+        console.error('❌ MISSING ACCOUNTS - Cannot create journal entry', {
+            loanAccountId,
+            creditAccountId,
+            paymentMethod,
+            financialAccountId
+        });
+        throw new Error('تعذر إنشاء القيد المحاسبي: حساب الخزينة/البنك غير مرتبط بحساب محاسبي. يرجى مراجعة إعدادات الحسابات.');
     }
 });
 const createAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { employeeId, type, amount, reason, issueDate, monthlyDeduction, paymentMethod, financialAccountId } = req.body;
-    console.log('🚀 createAdvance Request Body:', req.body);
     const user = req.user;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield connection.query(`
           INSERT INTO employee_advances (
             id, employeeId, type, amount, reason, issueDate, 
@@ -817,11 +1428,10 @@ const createAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             monthlyDeduction || 0, amount
         ]);
         if (paymentMethod && financialAccountId) {
-            console.log('💳 Payment details provided, creating accounting entry...');
-            yield createAdvanceAccountingEntry(connection, id, parseFloat(amount), employeeId, issueDate, paymentMethod, financialAccountId, 'ADVANCE', user);
+            yield createAdvanceAccountingEntry(connection, id, parseFloat(amount), employeeId, issueDate, paymentMethod, financialAccountId, type || 'ADVANCE', user);
         }
         else {
-            console.warn('⚠️ No payment method provided, skipping accounting entry.');
+            // PERF: console.warn('⚠️ No payment method provided, skipping accounting entry.');
         }
         yield connection.commit();
         res.status(201).json({ id, message: 'Advance created successfully' });
@@ -838,16 +1448,20 @@ const createAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 exports.createAdvance = createAdvance;
 const updateAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { id } = req.params;
-    const { monthlyDeduction, status, totalPaid, remainingAmount } = req.body;
+    const { type, amount, reason, issueDate, monthlyDeduction, status, totalPaid, remainingAmount } = req.body;
     try {
         yield db_1.pool.query(`
           UPDATE employee_advances SET
+            type = COALESCE(?, type),
+            amount = COALESCE(?, amount),
+            reason = COALESCE(?, reason),
+            issueDate = COALESCE(?, issueDate),
             monthlyDeduction = COALESCE(?, monthlyDeduction),
             status = COALESCE(?, status),
             totalPaid = COALESCE(?, totalPaid),
             remainingAmount = COALESCE(?, remainingAmount)
           WHERE id = ?
-        `, [monthlyDeduction, status, totalPaid, remainingAmount, id]);
+        `, [type, amount, reason, issueDate, monthlyDeduction, status, totalPaid, remainingAmount, id]);
         res.json({ message: 'Advance updated successfully' });
     }
     catch (error) {
@@ -857,13 +1471,63 @@ const updateAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 });
 exports.updateAdvance = updateAdvance;
 const deleteAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     const { id } = req.params;
+    const conn = yield (0, db_1.getConnection)();
     try {
-        yield db_1.pool.query('DELETE FROM employee_advances WHERE id = ?', [id]);
-        res.json({ message: 'Advance deleted successfully' });
+        yield conn.beginTransaction();
+        // 1. Reverse the journal entry created for this advance
+        const [journalRows] = yield conn.query('SELECT id FROM journal_entries WHERE referenceId = ?', [id]);
+        if (journalRows.length > 0) {
+            const journalId = journalRows[0].id;
+            // Reverse account balances from journal lines
+            const [lines] = yield conn.query('SELECT accountId, debit, credit FROM journal_lines WHERE journalId = ?', [journalId]);
+            for (const line of lines) {
+                // Reverse: subtract debit, add credit
+                yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) - ? + ? WHERE id = ?', [line.debit, line.credit, line.accountId]);
+            }
+            // Delete journal lines and entry
+            yield conn.query('DELETE FROM journal_lines WHERE journalId = ?', [journalId]);
+            yield conn.query('DELETE FROM journal_entries WHERE id = ?', [journalId]);
+        }
+        // 1b. Reverse bank balance if advance was paid via bank
+        try {
+            const [advanceRows] = yield conn.query('SELECT amount FROM employee_advances WHERE id = ?', [id]);
+            const advAmount = parseFloat((_a = advanceRows[0]) === null || _a === void 0 ? void 0 : _a.amount) || 0;
+            if (advAmount > 0) {
+                // Find banks whose GL accountId was credited (debit=0, credit>0) in the journal
+                // If the credit line's accountId belongs to a bank, restore that bank's balance
+                if (journalRows.length > 0) {
+                    const journalId = journalRows[0].id;
+                    // The credit line was the treasury/bank side
+                    const [creditLines] = yield conn.query('SELECT jl.accountId FROM journal_lines jl WHERE jl.journalId = ? AND jl.credit > 0', [journalId]);
+                    for (const cl of creditLines) {
+                        const [bankRows] = yield conn.query('SELECT id FROM banks WHERE accountId = ?', [cl.accountId]);
+                        if (bankRows.length > 0) {
+                            yield conn.query('UPDATE banks SET balance = balance + ? WHERE id = ?', [advAmount, bankRows[0].id]);
+                            // PERF: console.log(`🏦 Restored ${advAmount} to bank ${bankRows[0].id}`);
+                        }
+                    }
+                }
+            }
+        }
+        catch (bankErr) {
+            // PERF: console.warn('Warning restoring bank balance on advance delete:', bankErr);
+        }
+        // 2. Delete installments
+        yield conn.query('DELETE FROM loan_installments WHERE loanId = ?', [id]).catch(() => { });
+        // 3. Delete loan history
+        yield conn.query('DELETE FROM loan_history WHERE loanId = ?', [id]).catch(() => { });
+        // 4. Delete the advance record itself
+        yield conn.query('DELETE FROM employee_advances WHERE id = ?', [id]);
+        yield conn.commit();
+        conn.release();
+        res.json({ message: 'تم حذف السلفة وعكس القيد المحاسبي بنجاح' });
     }
     catch (error) {
-        console.error('Error deleting advance:', error);
+        yield conn.rollback();
+        conn.release();
+        console.error('Error deleting advance with reversal:', error);
         return (0, errorHandler_1.handleControllerError)(res, error, 'delete advance');
     }
 });
@@ -890,13 +1554,15 @@ exports.checkLoanEligibility = checkLoanEligibility;
  * Create a new loan with installments
  */
 const createLoanWithInstallments = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { employeeId, type, loanType, amount, reason, issueDate, numberOfMonths, allowSkip, maxSkipCount, paymentMethod, financialAccountId } = req.body;
+    const { employeeId, type, loanType, amount, reason, issueDate: rawIssueDate, startDate, numberOfMonths, numberOfInstallments, allowSkip, maxSkipCount, paymentMethod, financialAccountId } = req.body;
+    const issueDate = rawIssueDate || startDate || new Date().toISOString().split('T')[0];
+    const numMonthsRaw = numberOfMonths || numberOfInstallments;
     const user = req.user;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         // Validate eligibility first
-        const eligibility = yield loanService.checkLoanEligibility(employeeId, parseFloat(amount), parseInt(numberOfMonths) || 1);
+        const eligibility = yield loanService.checkLoanEligibility(employeeId, parseFloat(amount), parseInt(numMonthsRaw) || 1);
         if (!eligibility.eligible && loanType === 'LOAN') {
             connection.release();
             return res.status(400).json({
@@ -904,8 +1570,8 @@ const createLoanWithInstallments = (req, res) => __awaiter(void 0, void 0, void 
                 reasons: eligibility.reasons
             });
         }
-        const id = (0, uuid_1.v4)();
-        const numMonths = parseInt(numberOfMonths) || 1;
+        const id = (0, crypto_1.randomUUID)();
+        const numMonths = parseInt(numMonthsRaw) || 1;
         const monthlyDeduction = parseFloat(amount) / numMonths;
         // Create the loan record
         yield connection.query(`
@@ -963,6 +1629,28 @@ const getLoanInstallments = (req, res) => __awaiter(void 0, void 0, void 0, func
 });
 exports.getLoanInstallments = getLoanInstallments;
 /**
+ * Bulk: Get all installments for all of an employee's loans in one query.
+ * Eliminates the N+1 problem of fetching installments per-loan.
+ */
+const getEmployeeLoanInstallments = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { employeeId } = req.params;
+    try {
+        const [rows] = yield db_1.pool.query(`
+            SELECT li.*, ea.loanType, ea.type, ea.issueDate AS loanStartDate, ea.amount AS loanAmount
+            FROM loan_installments li
+            JOIN employee_advances ea ON li.loanId = ea.id
+            WHERE ea.employeeId = ?
+            ORDER BY li.dueDate, li.installmentNumber
+        `, [employeeId]);
+        res.json(rows);
+    }
+    catch (error) {
+        console.error('Error fetching employee loan installments:', error);
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch employee loan installments');
+    }
+});
+exports.getEmployeeLoanInstallments = getEmployeeLoanInstallments;
+/**
  * Skip an installment
  */
 const skipLoanInstallment = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
@@ -985,7 +1673,11 @@ const settleLoanEarly = (req, res) => __awaiter(void 0, void 0, void 0, function
     const { loanId } = req.params;
     const { settlementAmount, userId, notes } = req.body;
     try {
-        yield loanService.settleLoanEarly(loanId, parseFloat(settlementAmount), userId, notes);
+        const parsedAmount = parseFloat(settlementAmount);
+        if (isNaN(parsedAmount) || parsedAmount <= 0) {
+            return res.status(400).json({ error: 'مبلغ التسوية غير صحيح' });
+        }
+        yield loanService.settleLoanEarly(loanId, parsedAmount, userId, notes);
         res.json({ message: 'تم تسوية القرض بنجاح' });
     }
     catch (error) {
@@ -994,6 +1686,103 @@ const settleLoanEarly = (req, res) => __awaiter(void 0, void 0, void 0, function
     }
 });
 exports.settleLoanEarly = settleLoanEarly;
+/**
+ * Partial loan repayment (مردودات سلف)
+ */
+const repayLoan = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    const { loanId } = req.params;
+    const { amount, notes } = req.body;
+    const user = req.user;
+    const userId = (user === null || user === void 0 ? void 0 : user.id) || (user === null || user === void 0 ? void 0 : user.name) || 'system';
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        yield conn.beginTransaction();
+        // 1. Execute the loan repayment (updates balance, installments, history)
+        const parsedRepayAmount = parseFloat(amount);
+        if (isNaN(parsedRepayAmount) || parsedRepayAmount <= 0) {
+            conn.release();
+            return res.status(400).json({ error: 'مبلغ السداد غير صحيح' });
+        }
+        const result = yield loanService.repayLoan(loanId, parsedRepayAmount, userId, notes);
+        // 2. Create accounting journal entry (REVERSE of loan creation)
+        // Dr Cash/Treasury (money comes back), Cr Employee Loans (loan balance decreases)
+        try {
+            const repaymentAmount = parsedRepayAmount;
+            // Get loan details (employee info)
+            const [loans] = yield conn.query('SELECT employeeId FROM employee_advances WHERE id = ?', [loanId]);
+            const employeeId = (_a = loans[0]) === null || _a === void 0 ? void 0 : _a.employeeId;
+            let employeeName = 'موظف';
+            if (employeeId) {
+                const [emps] = yield conn.query('SELECT fullName as name FROM employees WHERE id = ?', [employeeId]);
+                employeeName = ((_b = emps[0]) === null || _b === void 0 ? void 0 : _b.name) || 'موظف';
+            }
+            // Find Employee Loans account (same logic as createAdvanceAccountingEntry)
+            const [allAccounts] = yield conn.query('SELECT id, code, name FROM accounts');
+            let loanAccount = allAccounts.find((a) => (a.name && (a.name.includes('سلف') || a.name.includes('قرض'))) ||
+                (a.name && (a.name.toLowerCase().includes('loan') || a.name.toLowerCase().includes('advance'))));
+            if (!loanAccount) {
+                loanAccount = allAccounts.find((a) => a.code && String(a.code).startsWith('112'));
+            }
+            if (!loanAccount) {
+                loanAccount = allAccounts.find((a) => a.code && String(a.code).startsWith('104'));
+            }
+            // Find Cash/Treasury account (default treasury)
+            let cashAccount = allAccounts.find((a) => a.name && (a.name.includes('خزينة') || a.name.includes('الخزنة') || a.name.includes('صندوق')));
+            if (!cashAccount) {
+                cashAccount = allAccounts.find((a) => a.name && (a.name.toLowerCase().includes('cash') || a.name.toLowerCase().includes('treasury')));
+            }
+            if (!cashAccount) {
+                cashAccount = allAccounts.find((a) => a.code && String(a.code).startsWith('101'));
+            }
+            if (loanAccount && cashAccount) {
+                const journalId = (0, crypto_1.randomUUID)();
+                const description = `سداد سلفة/قرض - ${employeeName}`;
+                const today = new Date().toISOString().split('T')[0];
+                // Journal Entry Header
+                yield conn.query(`
+                    INSERT INTO journal_entries (id, date, description, referenceId, createdBy)
+                    VALUES (?, ?, ?, ?, ?)
+                `, [journalId, today, description, `REPAY-${loanId.substring(0, 30)}`, (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'System']);
+                // Debit: Cash/Treasury (money received)
+                yield conn.query(`
+                    INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
+                    VALUES (?, ?, ?, ?, 0)
+                `, [journalId, cashAccount.id, cashAccount.name, repaymentAmount]);
+                // Credit: Employee Loans (loan balance decreases)
+                yield conn.query(`
+                    INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit)
+                    VALUES (?, ?, ?, 0, ?)
+                `, [journalId, loanAccount.id, loanAccount.name, repaymentAmount]);
+                // Update Account Balances
+                yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?', [repaymentAmount, cashAccount.id]);
+                yield conn.query('UPDATE accounts SET balance = COALESCE(balance, 0) - ? WHERE id = ?', [repaymentAmount, loanAccount.id]);
+                // PERF: console.log(`✅ [repayLoan] Journal entry created: Dr ${cashAccount.name} ${repaymentAmount} / Cr ${loanAccount.name} ${repaymentAmount}`);
+            }
+            else {
+                console.warn('⚠️ [repayLoan] Could not find loan or cash accounts, skipping journal entry', {
+                    loanAccount: loanAccount === null || loanAccount === void 0 ? void 0 : loanAccount.name,
+                    cashAccount: cashAccount === null || cashAccount === void 0 ? void 0 : cashAccount.name
+                });
+            }
+        }
+        catch (jeError) {
+            console.error('⚠️ [repayLoan] Error creating journal entry (continuing):', jeError.message);
+            // Don't fail the whole operation if journal entry fails
+        }
+        yield conn.commit();
+        res.json(Object.assign({ message: result.isCompleted ? 'تم سداد السلفة بالكامل' : 'تم تسجيل السداد بنجاح' }, result));
+    }
+    catch (error) {
+        yield conn.rollback();
+        console.error('Error repaying loan:', error);
+        return (0, errorHandler_1.handleControllerError)(res, error, 'repay loan');
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.repayLoan = repayLoan;
 /**
  * Get loan constraints configuration
  */
@@ -1046,6 +1835,9 @@ const getPayrollTemplates = (req, res) => __awaiter(void 0, void 0, void 0, func
         res.json(rows);
     }
     catch (error) {
+        if (error.code === 'ER_NO_SUCH_TABLE') {
+            return res.json([]);
+        }
         console.error('Error fetching templates:', error);
         return (0, errorHandler_1.handleControllerError)(res, error, 'fetch templates');
     }
@@ -1054,7 +1846,7 @@ exports.getPayrollTemplates = getPayrollTemplates;
 const createPayrollTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { name, type, calculationType, amount, percentage, description, isActive } = req.body;
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
           INSERT INTO payroll_templates (
             id, name, type, calculationType, amount, percentage, description, isActive
@@ -1105,7 +1897,7 @@ exports.deletePayrollTemplate = deletePayrollTemplate;
 const assignTemplateToEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { employeeId, templateId, customAmount } = req.body;
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
           INSERT INTO employee_payroll_templates (id, employeeId, templateId, customAmount, isActive)
           VALUES (?, ?, ?, ?, TRUE)
@@ -1187,7 +1979,7 @@ exports.getLeaveTypes = getLeaveTypes;
 const createLeaveType = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { name, nameEn, isPaid, defaultDays, carryOver, maxCarryOverDays, color, requiresDocument } = req.body;
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
             INSERT INTO leave_types (id, name, nameEn, isPaid, defaultDays, carryOver, maxCarryOverDays, color, isActive, requiresDocument)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, TRUE, ?)
@@ -1219,8 +2011,18 @@ const updateLeaveType = (req, res) => __awaiter(void 0, void 0, void 0, function
 });
 exports.updateLeaveType = updateLeaveType;
 const deleteLeaveType = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
     const { id } = req.params;
     try {
+        // Check if leave type is referenced by any balances or requests
+        const [balanceRefs] = yield db_1.pool.query('SELECT COUNT(*) as count FROM leave_balances WHERE leaveTypeId = ?', [id]);
+        const [requestRefs] = yield db_1.pool.query('SELECT COUNT(*) as count FROM leave_requests WHERE leaveTypeId = ?', [id]);
+        const totalRefs = (((_a = balanceRefs[0]) === null || _a === void 0 ? void 0 : _a.count) || 0) + (((_b = requestRefs[0]) === null || _b === void 0 ? void 0 : _b.count) || 0);
+        if (totalRefs > 0) {
+            return res.status(400).json({
+                error: `لا يمكن حذف نوع الإجازة لوجود ${totalRefs} سجل مرتبط به (أرصدة أو طلبات). يمكنك تعطيله بدلاً من حذفه.`
+            });
+        }
         yield db_1.pool.query('DELETE FROM leave_types WHERE id = ?', [id]);
         res.json({ message: 'Leave type deleted successfully' });
     }
@@ -1266,22 +2068,24 @@ const initializeLeaveBalances = (req, res) => __awaiter(void 0, void 0, void 0, 
         // Get all active employees and leave types
         const [employees] = yield db_1.pool.query('SELECT id FROM employees WHERE status = ?', ['ACTIVE']);
         const [leaveTypes] = yield db_1.pool.query('SELECT id, defaultDays FROM leave_types WHERE isActive = TRUE');
+        // Batch INSERT IGNORE — avoids N+1 queries
         let created = 0;
+        const values = [];
+        const placeholders = [];
         for (const emp of employees) {
             for (const lt of leaveTypes) {
-                // Check if balance already exists
-                const [existing] = yield db_1.pool.query(`
-                    SELECT id FROM leave_balances WHERE employeeId = ? AND leaveTypeId = ? AND year = ?
-                `, [emp.id, lt.id, targetYear]);
-                if (existing.length === 0) {
-                    const id = (0, uuid_1.v4)();
-                    yield db_1.pool.query(`
-                        INSERT INTO leave_balances (id, employeeId, leaveTypeId, year, allocated, used, carriedOver)
-                        VALUES (?, ?, ?, ?, ?, 0, 0)
-                    `, [id, emp.id, lt.id, targetYear, lt.defaultDays || 0]);
-                    created++;
-                }
+                const id = (0, crypto_1.randomUUID)();
+                placeholders.push('(?, ?, ?, ?, ?, 0, 0)');
+                values.push(id, emp.id, lt.id, targetYear, lt.defaultDays || 0);
             }
+        }
+        if (placeholders.length > 0) {
+            // INSERT IGNORE skips rows that violate the UNIQUE constraint
+            const [result] = yield db_1.pool.query(`
+                INSERT IGNORE INTO leave_balances (id, employeeId, leaveTypeId, year, allocated, used, carriedOver)
+                VALUES ${placeholders.join(', ')}
+            `, values);
+            created = result.affectedRows || 0;
         }
         res.json({ message: `Initialized ${created} leave balances for year ${targetYear}` });
     }
@@ -1349,7 +2153,7 @@ exports.getLeaveRequests = getLeaveRequests;
 const createLeaveRequest = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { employeeId, leaveTypeId, startDate, endDate, days, reason, notes } = req.body;
     try {
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
             INSERT INTO leave_requests (id, employeeId, leaveTypeId, startDate, endDate, days, reason, status, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
@@ -1366,33 +2170,62 @@ const approveLeaveRequest = (req, res) => __awaiter(void 0, void 0, void 0, func
     var _a;
     const { id } = req.params;
     const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+    const conn = yield (0, db_1.getConnection)();
     try {
+        yield conn.beginTransaction();
         // Get leave request details
-        const [requests] = yield db_1.pool.query(`
+        const [requests] = yield conn.query(`
             SELECT lr.*, lt.isPaid FROM leave_requests lr
             JOIN leave_types lt ON lr.leaveTypeId = lt.id
             WHERE lr.id = ?
         `, [id]);
         if (requests.length === 0) {
-            return res.status(404).json({ error: 'Leave request not found' });
+            yield conn.rollback();
+            return res.status(404).json({ error: 'طلب الإجازة غير موجود' });
         }
         const request = requests[0];
+        // Guard: Only PENDING requests can be approved
+        if (request.status !== 'PENDING') {
+            yield conn.rollback();
+            return res.status(400).json({ error: `لا يمكن اعتماد طلب بحالة ${request.status}. يجب أن يكون الطلب معلقاً.` });
+        }
         const year = new Date(request.startDate).getFullYear();
-        // Update leave balance (deduct used days)
-        yield db_1.pool.query(`
+        // Lock the balance row and check sufficiency
+        const [balances] = yield conn.query(`
+            SELECT allocated, used, carriedOver FROM leave_balances
+            WHERE employeeId = ? AND leaveTypeId = ? AND year = ?
+            FOR UPDATE
+        `, [request.employeeId, request.leaveTypeId, year]);
+        if (balances.length > 0) {
+            const bal = balances[0];
+            const remaining = (parseFloat(bal.allocated) || 0) + (parseFloat(bal.carriedOver) || 0) - (parseFloat(bal.used) || 0);
+            if (remaining < parseFloat(request.days)) {
+                yield conn.rollback();
+                return res.status(400).json({
+                    error: `رصيد الإجازات غير كافي. المتبقي: ${remaining} يوم، المطلوب: ${request.days} يوم`
+                });
+            }
+        }
+        // Deduct from leave balance
+        yield conn.query(`
             UPDATE leave_balances SET used = used + ?
             WHERE employeeId = ? AND leaveTypeId = ? AND year = ?
         `, [request.days, request.employeeId, request.leaveTypeId, year]);
         // Update request status
-        yield db_1.pool.query(`
+        yield conn.query(`
             UPDATE leave_requests SET status = 'APPROVED', approvedBy = ?, approvedAt = NOW()
             WHERE id = ?
         `, [userId, id]);
-        res.json({ message: 'Leave request approved successfully' });
+        yield conn.commit();
+        res.json({ message: 'تم اعتماد طلب الإجازة بنجاح' });
     }
     catch (error) {
+        yield conn.rollback();
         console.error('Error approving leave request:', error);
         return (0, errorHandler_1.handleControllerError)(res, error, 'approve leave request');
+    }
+    finally {
+        conn.release();
     }
 });
 exports.approveLeaveRequest = approveLeaveRequest;
@@ -1416,26 +2249,39 @@ const rejectLeaveRequest = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.rejectLeaveRequest = rejectLeaveRequest;
 const cancelLeaveRequest = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { id } = req.params;
+    const conn = yield (0, db_1.getConnection)();
     try {
+        yield conn.beginTransaction();
         // Get request details to reverse balance if already approved
-        const [requests] = yield db_1.pool.query(`SELECT * FROM leave_requests WHERE id = ?`, [id]);
-        if (requests.length === 0)
-            return res.status(404).json({ error: 'Request not found' });
+        const [requests] = yield conn.query(`SELECT * FROM leave_requests WHERE id = ?`, [id]);
+        if (requests.length === 0) {
+            yield conn.rollback();
+            return res.status(404).json({ error: 'طلب الإجازة غير موجود' });
+        }
         const request = requests[0];
+        if (request.status === 'CANCELLED') {
+            yield conn.rollback();
+            return res.status(400).json({ error: 'الطلب ملغى بالفعل' });
+        }
         if (request.status === 'APPROVED') {
             const year = new Date(request.startDate).getFullYear();
-            // Restore balance
-            yield db_1.pool.query(`
-                UPDATE leave_balances SET used = used - ?
+            // Restore balance atomically
+            yield conn.query(`
+                UPDATE leave_balances SET used = GREATEST(used - ?, 0)
                 WHERE employeeId = ? AND leaveTypeId = ? AND year = ?
             `, [request.days, request.employeeId, request.leaveTypeId, year]);
         }
-        yield db_1.pool.query(`UPDATE leave_requests SET status = 'CANCELLED' WHERE id = ?`, [id]);
-        res.json({ message: 'Leave request cancelled' });
+        yield conn.query(`UPDATE leave_requests SET status = 'CANCELLED' WHERE id = ?`, [id]);
+        yield conn.commit();
+        res.json({ message: 'تم إلغاء طلب الإجازة بنجاح' });
     }
     catch (error) {
+        yield conn.rollback();
         console.error('Error cancelling leave request:', error);
         return (0, errorHandler_1.handleControllerError)(res, error, 'cancel leave request');
+    }
+    finally {
+        conn.release();
     }
 });
 exports.cancelLeaveRequest = cancelLeaveRequest;
@@ -1454,8 +2300,7 @@ exports.deleteLeaveRequest = deleteLeaveRequest;
 // ==========================================
 // SALARY COMPONENTS & STRUCTURE (Phase 2)
 // ==========================================
-const salaryService = __importStar(require("../services/salaryService"));
-const taxService = __importStar(require("../services/taxService"));
+// Imports moved to top
 // Get all salary components
 const getSalaryComponents = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
@@ -1723,3 +2568,442 @@ const deleteSalaryComponent = (req, res) => __awaiter(void 0, void 0, void 0, fu
     }
 });
 exports.deleteSalaryComponent = deleteSalaryComponent;
+// ==========================================
+// SALARY STRUCTURE TEMPLATES (Beast Mode)
+// ==========================================
+const structureService = __importStar(require("../services/salaryStructureService"));
+const workEntryService = __importStar(require("../services/workEntryService"));
+const additionalSalaryService = __importStar(require("../services/additionalSalaryService"));
+const payrollGLService = __importStar(require("../services/payrollGLService"));
+// --- Structure Templates ---
+const getStructureTemplates = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const templates = yield structureService.getStructureTemplates();
+        res.json(templates);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch structure templates');
+    }
+});
+exports.getStructureTemplates = getStructureTemplates;
+const getStructureTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const template = yield structureService.getStructureTemplate(req.params.id);
+        if (!template)
+            return res.status(404).json({ error: 'Template not found' });
+        res.json(template);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch structure template');
+    }
+});
+exports.getStructureTemplate = getStructureTemplate;
+const createStructureTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield structureService.createStructureTemplate(req.body);
+        res.status(201).json({ id, message: 'تم إنشاء هيكل الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'create structure template');
+    }
+});
+exports.createStructureTemplate = createStructureTemplate;
+const updateStructureTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield structureService.updateStructureTemplate(req.params.id, req.body);
+        res.json({ message: 'تم تحديث هيكل الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'update structure template');
+    }
+});
+exports.updateStructureTemplate = updateStructureTemplate;
+const deleteStructureTemplate = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield structureService.deleteStructureTemplate(req.params.id);
+        res.json({ message: 'تم حذف هيكل الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'delete structure template');
+    }
+});
+exports.deleteStructureTemplate = deleteStructureTemplate;
+// --- Structure Lines ---
+const addStructureLine = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield structureService.addStructureLine(req.params.templateId, req.body);
+        res.status(201).json({ id, message: 'تم إضافة مكون الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'add structure line');
+    }
+});
+exports.addStructureLine = addStructureLine;
+const updateStructureLine = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield structureService.updateStructureLine(req.params.lineId, req.body);
+        res.json({ message: 'تم تحديث مكون الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'update structure line');
+    }
+});
+exports.updateStructureLine = updateStructureLine;
+const deleteStructureLine = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield structureService.deleteStructureLine(req.params.lineId);
+        res.json({ message: 'تم حذف مكون الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'delete structure line');
+    }
+});
+exports.deleteStructureLine = deleteStructureLine;
+// --- Employee ↔ Structure Assignment ---
+const getEmployeeStructureAssignment = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const assignment = yield structureService.getEmployeeAssignment(req.params.employeeId);
+        res.json(assignment || {});
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch employee structure assignment');
+    }
+});
+exports.getEmployeeStructureAssignment = getEmployeeStructureAssignment;
+const getTemplateAssignments = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const assignments = yield structureService.getTemplateAssignments(req.params.templateId);
+        res.json(assignments);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch template assignments');
+    }
+});
+exports.getTemplateAssignments = getTemplateAssignments;
+const assignStructureToEmployee = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield structureService.assignTemplateToEmployee(req.body);
+        res.status(201).json({ id, message: 'تم تعيين هيكل الراتب للموظف بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'assign structure to employee');
+    }
+});
+exports.assignStructureToEmployee = assignStructureToEmployee;
+const removeStructureAssignment = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield structureService.removeAssignment(req.params.assignmentId);
+        res.json({ message: 'تم إلغاء تعيين هيكل الراتب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'remove structure assignment');
+    }
+});
+exports.removeStructureAssignment = removeStructureAssignment;
+// ==========================================
+// WORK ENTRIES (Beast Mode)
+// ==========================================
+const getWorkEntryTypes = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const types = yield workEntryService.getWorkEntryTypes();
+        res.json(types);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch work entry types');
+    }
+});
+exports.getWorkEntryTypes = getWorkEntryTypes;
+const createWorkEntryType = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield workEntryService.createWorkEntryType(req.body);
+        res.status(201).json({ id, message: 'تم إنشاء نوع إدخال العمل بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'create work entry type');
+    }
+});
+exports.createWorkEntryType = createWorkEntryType;
+const getWorkEntries = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { employeeId, startDate, endDate, status, payrollCycleId } = req.query;
+        const entries = yield workEntryService.getWorkEntries({
+            employeeId: employeeId,
+            startDate: startDate || new Date().toISOString().slice(0, 10),
+            endDate: endDate || new Date().toISOString().slice(0, 10),
+            status: status,
+            payrollCycleId: payrollCycleId
+        });
+        res.json(entries);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch work entries');
+    }
+});
+exports.getWorkEntries = getWorkEntries;
+const upsertWorkEntry = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield workEntryService.upsertWorkEntry(req.body);
+        res.status(201).json({ id, message: 'تم حفظ إدخال العمل بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'upsert work entry');
+    }
+});
+exports.upsertWorkEntry = upsertWorkEntry;
+const updateWorkEntry = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield workEntryService.updateWorkEntry(req.params.id, req.body);
+        res.json({ message: 'تم تحديث إدخال العمل بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'update work entry');
+    }
+});
+exports.updateWorkEntry = updateWorkEntry;
+const deleteWorkEntry = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield workEntryService.deleteWorkEntry(req.params.id);
+        res.json({ message: 'تم حذف إدخال العمل بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'delete work entry');
+    }
+});
+exports.deleteWorkEntry = deleteWorkEntry;
+const generateWorkEntries = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { payrollCycleId, month, year } = req.body;
+        const result = yield workEntryService.generateWorkEntries(payrollCycleId, month, year);
+        res.json(Object.assign({ message: `تم توليد ${result.generated} إدخال عمل لـ ${result.employees} موظف` }, result));
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'generate work entries');
+    }
+});
+exports.generateWorkEntries = generateWorkEntries;
+const validateWorkEntries = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { startDate, endDate, employeeId } = req.body;
+        const result = yield workEntryService.validateWorkEntries(startDate, endDate, employeeId);
+        res.json(Object.assign({ message: `تم اعتماد ${result.validated} إدخال عمل` }, result));
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'validate work entries');
+    }
+});
+exports.validateWorkEntries = validateWorkEntries;
+const resolveWorkEntryConflict = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { workEntryTypeId, hours, version } = req.body;
+        yield workEntryService.resolveConflict(req.params.id, workEntryTypeId, hours, version);
+        res.json({ message: 'تم حل التعارض بنجاح' });
+    }
+    catch (error) {
+        if (error instanceof Error && error.message.includes('CONCURRENT_MODIFICATION')) {
+            return res.status(409).json({ message: error.message });
+        }
+        return (0, errorHandler_1.handleControllerError)(res, error, 'resolve conflict');
+    }
+});
+exports.resolveWorkEntryConflict = resolveWorkEntryConflict;
+const getWorkEntrySummary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { employeeId, startDate, endDate } = req.query;
+        const summary = yield workEntryService.getWorkEntrySummary(employeeId, startDate, endDate);
+        res.json(summary);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'get work entry summary');
+    }
+});
+exports.getWorkEntrySummary = getWorkEntrySummary;
+// ==========================================
+// ADDITIONAL SALARY (Beast Mode)
+// ==========================================
+const getAdditionalSalaryEntries = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const entries = yield additionalSalaryService.getAdditionalSalaryEntries({
+            employeeId: req.query.employeeId,
+            payrollCycleId: req.query.payrollCycleId,
+            status: req.query.status,
+            type: req.query.type
+        });
+        res.json(entries);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch additional salary entries');
+    }
+});
+exports.getAdditionalSalaryEntries = getAdditionalSalaryEntries;
+const createAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const id = yield additionalSalaryService.createAdditionalSalary(Object.assign(Object.assign({}, req.body), { createdBy: (_a = req.user) === null || _a === void 0 ? void 0 : _a.id }));
+        res.status(201).json({ id, message: 'تم إنشاء إدخال الراتب الإضافي بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'create additional salary');
+    }
+});
+exports.createAdditionalSalary = createAdditionalSalary;
+const updateAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield additionalSalaryService.updateAdditionalSalary(req.params.id, req.body);
+        res.json({ message: 'تم تحديث إدخال الراتب الإضافي بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'update additional salary');
+    }
+});
+exports.updateAdditionalSalary = updateAdditionalSalary;
+const deleteAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield additionalSalaryService.deleteAdditionalSalary(req.params.id);
+        res.json({ message: 'تم حذف إدخال الراتب الإضافي بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'delete additional salary');
+    }
+});
+exports.deleteAdditionalSalary = deleteAdditionalSalary;
+const approveAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        yield additionalSalaryService.approveAdditionalSalary(req.params.id, ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || 'system');
+        res.json({ message: 'تم اعتماد إدخال الراتب الإضافي بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'approve additional salary');
+    }
+});
+exports.approveAdditionalSalary = approveAdditionalSalary;
+const rejectAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        yield additionalSalaryService.rejectAdditionalSalary(req.params.id, ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || 'system');
+        res.json({ message: 'تم رفض إدخال الراتب الإضافي' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'reject additional salary');
+    }
+});
+exports.rejectAdditionalSalary = rejectAdditionalSalary;
+const cancelAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield additionalSalaryService.cancelAdditionalSalary(req.params.id);
+        res.json({ message: 'تم إلغاء إدخال الراتب الإضافي' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'cancel additional salary');
+    }
+});
+exports.cancelAdditionalSalary = cancelAdditionalSalary;
+const bulkApproveAdditionalSalary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const { ids } = req.body;
+        const count = yield additionalSalaryService.bulkApprove(ids, ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || 'system');
+        res.json({ message: `تم اعتماد ${count} إدخال بنجاح`, approvedCount: count });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'bulk approve additional salary');
+    }
+});
+exports.bulkApproveAdditionalSalary = bulkApproveAdditionalSalary;
+const getAdditionalSalaryStats = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const stats = yield additionalSalaryService.getStats();
+        res.json(stats);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'get additional salary stats');
+    }
+});
+exports.getAdditionalSalaryStats = getAdditionalSalaryStats;
+// ==========================================
+// COMPONENT-LEVEL GL INTEGRATION (Beast Mode)
+// ==========================================
+const getPayrollGLMappings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const mappings = yield payrollGLService.getGLMappings();
+        res.json(mappings);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch payroll GL mappings');
+    }
+});
+exports.getPayrollGLMappings = getPayrollGLMappings;
+const upsertPayrollGLMapping = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield payrollGLService.upsertGLMapping(req.body);
+        res.json({ id, message: 'تم حفظ ربط الحساب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'upsert GL mapping');
+    }
+});
+exports.upsertPayrollGLMapping = upsertPayrollGLMapping;
+const deletePayrollGLMapping = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield payrollGLService.deleteGLMapping(req.params.id);
+        res.json({ message: 'تم حذف ربط الحساب بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'delete GL mapping');
+    }
+});
+exports.deletePayrollGLMapping = deletePayrollGLMapping;
+const previewPayrollJournal = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { treasuryAccountId, entryIds } = req.body;
+        const result = yield payrollGLService.buildPayrollJournalEntries(req.params.cycleId, treasuryAccountId, entryIds);
+        res.json(result);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'preview payroll journal');
+    }
+});
+exports.previewPayrollJournal = previewPayrollJournal;
+// ==========================================
+// RULE CATEGORIES (Beast Mode)
+// ==========================================
+const getRuleCategories = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const categories = yield payrollGLService.getRuleCategories();
+        res.json(categories);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch rule categories');
+    }
+});
+exports.getRuleCategories = getRuleCategories;
+const createRuleCategory = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const id = yield payrollGLService.createRuleCategory(req.body);
+        res.status(201).json({ id, message: 'تم إنشاء فئة القاعدة بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'create rule category');
+    }
+});
+exports.createRuleCategory = createRuleCategory;
+const updateRuleCategory = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield payrollGLService.updateRuleCategory(req.params.id, req.body);
+        res.json({ message: 'تم تحديث فئة القاعدة بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'update rule category');
+    }
+});
+exports.updateRuleCategory = updateRuleCategory;
+const deleteRuleCategory = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        yield payrollGLService.deleteRuleCategory(req.params.id);
+        res.json({ message: 'تم حذف فئة القاعدة بنجاح' });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'delete rule category');
+    }
+});
+exports.deleteRuleCategory = deleteRuleCategory;

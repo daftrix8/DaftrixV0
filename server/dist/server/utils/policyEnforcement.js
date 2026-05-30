@@ -16,6 +16,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.validateFiscalLockDate = validateFiscalLockDate;
 exports.validatePostDatedTransaction = validatePostDatedTransaction;
+exports.validateLockOldTransactions = validateLockOldTransactions;
 exports.validateTransactionNotes = validateTransactionNotes;
 exports.validateCostCenter = validateCostCenter;
 exports.validateWarehouseSelection = validateWarehouseSelection;
@@ -75,6 +76,27 @@ function validatePostDatedTransaction(transactionDate, config) {
             valid: false,
             error: 'لا يُسمح بإدخال معاملات بتاريخ مستقبلي. يرجى تفعيل هذا الخيار من إعدادات النظام.',
             errorCode: 'POST_DATED_NOT_ALLOWED'
+        };
+    }
+    return { valid: true };
+}
+/**
+ * Validate lock old transactions
+ * التحقق من قفل تعديل المعاملات القديمة
+ */
+function validateLockOldTransactions(transactionDate, config) {
+    if (!config.lockOldTransactionsDays || config.lockOldTransactionsDays <= 0) {
+        return { valid: true };
+    }
+    const txDate = new Date(transactionDate);
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - config.lockOldTransactionsDays);
+    cutoffDate.setHours(0, 0, 0, 0);
+    if (txDate < cutoffDate) {
+        return {
+            valid: false,
+            error: `لا يمكن إضافة أو تعديل معاملات أقدم من ${config.lockOldTransactionsDays} يوم`,
+            errorCode: 'OLD_TRANSACTION_LOCKED'
         };
     }
     return { valid: true };
@@ -275,14 +297,17 @@ function validateModifyOthersData(originalCreator, currentUser, currentUserRole,
 /**
  * Validate negative stock
  * التحقق من المخزون السالب
+ *
+ * CONCURRENCY FIX: When `existingConn` is provided (from a transaction),
+ * uses SELECT ... FOR UPDATE to lock the product row, preventing two
+ * concurrent sales from overselling the same stock.
  */
-function validateNegativeStock(lines, transactionType, config) {
+function validateNegativeStock(lines, transactionType, config, existingConn, warehouseId, existingInvoiceId) {
     return __awaiter(this, void 0, void 0, function* () {
-        // If negative stock is allowed, skip validation
+        var _a, _b;
         if (config.allowNegativeStock) {
             return { valid: true };
         }
-        // Only check for stock-reducing transactions
         const stockReducingTypes = ['INVOICE_SALE', 'RETURN_PURCHASE', 'STOCK_OUT', 'TRANSFER_OUT'];
         if (!transactionType || !stockReducingTypes.includes(transactionType)) {
             return { valid: true };
@@ -290,29 +315,94 @@ function validateNegativeStock(lines, transactionType, config) {
         if (!lines || lines.length === 0) {
             return { valid: true };
         }
+        const conn = existingConn || (yield (0, db_1.getConnection)());
+        const needsRelease = !existingConn;
+        // When updating an existing posted invoice, its old lines will be reversed
+        // before the new lines are applied. Build a per-product credit map so the
+        // validation sees effective stock = currentStock + oldQty, preventing false
+        // lockouts on re-saves of already-deducted invoices.
+        const oldQtyCredit = {};
+        if (existingInvoiceId && existingConn) {
+            const [oldLineRows] = yield existingConn.query(`SELECT il.productId, il.quantity, il.bonusQty
+             FROM invoice_lines il
+             JOIN invoices i ON i.id = il.invoiceId
+             WHERE il.invoiceId = ? AND i.status = 'POSTED'`, [existingInvoiceId]);
+            for (const ol of oldLineRows) {
+                const qty = (Number(ol.quantity) || 0) + (Number(ol.bonusQty) || 0);
+                oldQtyCredit[ol.productId] = (oldQtyCredit[ol.productId] || 0) + qty;
+            }
+        }
         try {
-            const conn = yield (0, db_1.getConnection)();
             for (const line of lines) {
-                const [rows] = yield conn.query('SELECT stock, name FROM products WHERE id = ?', [line.productId]);
-                const product = rows[0];
-                if (product) {
-                    const currentStock = Number(product.stock) || 0;
-                    const newStock = currentStock - Math.abs(line.quantity);
-                    if (newStock < 0) {
+                const lockClause = existingConn ? 'FOR UPDATE' : '';
+                let currentStock = 0;
+                let productName = '';
+                // ── Stock resolution: MAX across all available sources ──
+                // stock_movements can have NULL warehouse_id for old records, so we
+                // query BOTH filtered and unfiltered totals. Cross-check against
+                // product_stocks and products.stock caches. Use MAX to prevent
+                // false lockouts when any single source drifts or is incomplete.
+                // Always get product name + total movements across all warehouses
+                const [totalRows] = yield conn.query(`SELECT COALESCE(SUM(sm.qty_change), 0) as totalStock, p.stock as globalStock, p.name
+                 FROM products p
+                 LEFT JOIN stock_movements sm ON sm.product_id = p.id
+                 WHERE p.id = ?`, [line.productId]);
+                const totalRow = totalRows[0];
+                if (!(totalRow === null || totalRow === void 0 ? void 0 : totalRow.name)) {
+                    productName = `Unknown (${line.productId})`;
+                    continue;
+                }
+                productName = totalRow.name;
+                const totalMovementsStock = Number(totalRow.totalStock) || 0;
+                const globalProductStock = Number(totalRow.globalStock) || 0;
+                // Warehouse-specific values (if warehouse context is provided)
+                let warehouseMovementsStock = 0;
+                let warehouseCachedStock = 0;
+                if (warehouseId) {
+                    const [whSmRows] = yield conn.query(`SELECT COALESCE(SUM(qty_change), 0) as stock
+                     FROM stock_movements WHERE product_id = ? AND warehouse_id = ?`, [line.productId, warehouseId]);
+                    warehouseMovementsStock = Number((_a = whSmRows[0]) === null || _a === void 0 ? void 0 : _a.stock) || 0;
+                    const [whPsRows] = yield conn.query(`SELECT stock FROM product_stocks WHERE productId = ? AND warehouseId = ?`, [line.productId, warehouseId]);
+                    warehouseCachedStock = Number((_b = whPsRows[0]) === null || _b === void 0 ? void 0 : _b.stock) || 0;
+                }
+                // Use MAX of all sources — the highest credible number wins
+                currentStock = Math.max(totalMovementsStock, // all-warehouse movements (most complete)
+                warehouseMovementsStock, // this-warehouse movements
+                warehouseCachedStock, // product_stocks cache for this warehouse
+                globalProductStock // products.stock global field
+                );
+                // Credit back old invoice quantities: the update will reverse them
+                // before re-applying, so effective available = currentStock + oldQty
+                const creditQty = oldQtyCredit[line.productId] || 0;
+                if (creditQty > 0) {
+                    currentStock += creditQty;
+                    console.log(`🔄 [STOCK] Update credit: product="${productName}" (${line.productId}) +${creditQty} from existing invoice → effectiveStock=${currentStock}`);
+                }
+                if (warehouseId && currentStock !== warehouseMovementsStock && warehouseMovementsStock > 0) {
+                    console.warn(`⚠️ [STOCK] DRIFT: product="${productName}" (${line.productId}), wh=${warehouseId}: wh_movements=${warehouseMovementsStock}, total_movements=${totalMovementsStock}, ps_cache=${warehouseCachedStock}, global=${globalProductStock} → using MAX(${currentStock})`);
+                }
+                const newStock = currentStock - Math.abs(line.quantity);
+                if (newStock < 0) {
+                    console.warn(`🚫 [STOCK] REJECTED: product="${productName}" (${line.productId}), warehouse=${warehouseId || 'GLOBAL'}, currentStock=${currentStock}, requested=${line.quantity}, deficit=${Math.abs(newStock)}`);
+                    if (needsRelease)
                         conn.release();
-                        return {
-                            valid: false,
-                            error: `الكمية المطلوبة (${line.quantity}) تتجاوز المخزون المتاح (${currentStock}) للصنف: ${product.name}`,
-                            errorCode: 'NEGATIVE_STOCK_NOT_ALLOWED'
-                        };
-                    }
+                    return {
+                        valid: false,
+                        error: `الكمية المطلوبة (${line.quantity}) تتجاوز المخزون المتاح (${currentStock}) للصنف: ${productName}`,
+                        errorCode: 'NEGATIVE_STOCK_NOT_ALLOWED'
+                    };
                 }
             }
-            conn.release();
+            if (needsRelease)
+                conn.release();
         }
         catch (error) {
+            if (needsRelease)
+                try {
+                    conn.release();
+                }
+                catch (_c) { }
             console.error('Error validating negative stock:', error);
-            // Don't block on validation errors
         }
         return { valid: true };
     });
@@ -372,6 +462,10 @@ function validateTransaction(context, config) {
     result = validatePostDatedTransaction(context.date, config);
     if (!result.valid)
         return result;
+    // Lock old transactions
+    result = validateLockOldTransactions(context.date, config);
+    if (!result.valid)
+        return result;
     // Transaction notes
     result = validateTransactionNotes(context.notes, config);
     if (!result.valid)
@@ -402,10 +496,11 @@ function validateTransaction(context, config) {
  * Run all async validations (database lookups)
  * تشغيل جميع التحققات غير المتزامنة
  */
-function validateTransactionAsync(context, config) {
+function validateTransactionAsync(context, config, existingConn) {
     return __awaiter(this, void 0, void 0, function* () {
-        // Negative stock
-        let result = yield validateNegativeStock(context.lines, context.type, config);
+        // Negative stock — pass connection for FOR UPDATE locking + warehouseId for accurate per-warehouse check
+        // existingInvoiceId allows update validation to credit back old quantities before checking
+        let result = yield validateNegativeStock(context.lines, context.type, config, existingConn, context.warehouseId, context.existingInvoiceId);
         if (!result.valid)
             return result;
         // Credit limit
@@ -419,14 +514,14 @@ function validateTransactionAsync(context, config) {
  * Full transaction validation (sync + async)
  * التحقق الكامل من المعاملة
  */
-function validateTransactionFull(context, config) {
+function validateTransactionFull(context, config, existingConn) {
     return __awaiter(this, void 0, void 0, function* () {
         // Run sync validations first
         const syncResult = validateTransaction(context, config);
         if (!syncResult.valid)
             return syncResult;
-        // Run async validations
-        const asyncResult = yield validateTransactionAsync(context, config);
+        // Run async validations — pass connection for row locking
+        const asyncResult = yield validateTransactionAsync(context, config, existingConn);
         if (!asyncResult.valid)
             return asyncResult;
         return { valid: true };

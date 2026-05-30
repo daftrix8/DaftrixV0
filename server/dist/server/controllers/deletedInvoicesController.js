@@ -16,6 +16,7 @@ const errorHandler_1 = require("../utils/errorHandler");
 const getDeletedInvoices = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
+        const authReq = req;
         // Pagination parameters
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 50;
@@ -29,6 +30,13 @@ const getDeletedInvoices = (req, res) => __awaiter(void 0, void 0, void 0, funct
         // Build WHERE clause
         const conditions = [];
         const params = [];
+        // ═══════════════════════════════════════════
+        // MANDATORY: Fiscal Year Hard Boundary
+        // ═══════════════════════════════════════════
+        if (authReq.fiscalYearFilter) {
+            conditions.push('deletedAt >= ? AND deletedAt <= ?');
+            params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         if (type) {
             conditions.push('type = ?');
             params.push(type);
@@ -119,6 +127,14 @@ exports.getDeletedInvoiceById = getDeletedInvoiceById;
 const getDeletedInvoicesStats = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
+        const authReq = req;
+        // Build fiscal year constraint for stats
+        let fyWhere = '';
+        const fyParams = [];
+        if (authReq.fiscalYearFilter) {
+            fyWhere = 'WHERE deletedAt >= ? AND deletedAt <= ?';
+            fyParams.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         // Get statistics
         const [stats] = yield conn.query(`
             SELECT 
@@ -127,30 +143,36 @@ const getDeletedInvoicesStats = (req, res) => __awaiter(void 0, void 0, void 0, 
                 COUNT(DISTINCT deletedBy) as totalDeleters,
                 MAX(deletedAt) as lastDeletion
             FROM deleted_invoices
-        `);
+            ${fyWhere}
+        `, fyParams);
         // Get by type
         const [byType] = yield conn.query(`
             SELECT type, COUNT(*) as count, SUM(total) as totalValue
             FROM deleted_invoices
+            ${fyWhere}
             GROUP BY type
             ORDER BY count DESC
-        `);
+        `, fyParams);
         // Get by user (top deleters)
         const [byUser] = yield conn.query(`
             SELECT deletedBy, COUNT(*) as count, SUM(total) as totalValue
             FROM deleted_invoices
+            ${fyWhere}
             GROUP BY deletedBy
             ORDER BY count DESC
             LIMIT 10
-        `);
-        // Get recent deletions (last 7 days)
+        `, fyParams);
+        // Get recent deletions (last 7 days within fiscal year)
+        const recentWhere = fyWhere
+            ? fyWhere + ' AND deletedAt >= DATE_SUB(NOW(), INTERVAL 7 DAY)'
+            : 'WHERE deletedAt >= DATE_SUB(NOW(), INTERVAL 7 DAY)';
         const [recentDeletions] = yield conn.query(`
             SELECT DATE(deletedAt) as date, COUNT(*) as count, SUM(total) as totalValue
             FROM deleted_invoices
-            WHERE deletedAt >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+            ${recentWhere}
             GROUP BY DATE(deletedAt)
             ORDER BY date DESC
-        `);
+        `, fyParams);
         conn.release();
         res.json({
             summary: stats[0],

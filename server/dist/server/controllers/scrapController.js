@@ -11,7 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deleteScrap = exports.updateScrapDisposal = exports.createScrap = exports.getScrapStats = exports.getScrap = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
 /**
  * Scrap Controller
@@ -148,7 +148,7 @@ const createScrap = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         if (!productionOrderId || !productId || !quantity) {
             return res.status(400).json({ message: 'Production order, product, and quantity are required' });
         }
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         const totalValue = (unitCost || 0) * quantity;
         yield db_1.pool.query(`
             INSERT INTO production_scrap (

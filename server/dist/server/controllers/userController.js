@@ -14,14 +14,60 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.deleteUser = exports.updatePreferences = exports.updateUser = exports.createUser = exports.getUsers = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const auditController_1 = require("./auditController");
 const bcryptjs_1 = __importDefault(require("bcryptjs"));
 const errorHandler_1 = require("../utils/errorHandler");
+const eventBus_1 = require("../utils/eventBus");
+// Run-once migration: ensure plain_password column exists
+let _plainPwColReady = false;
+const ensurePlainPasswordColumn = () => __awaiter(void 0, void 0, void 0, function* () {
+    if (_plainPwColReady)
+        return;
+    try {
+        yield db_1.pool.query('SELECT plain_password FROM users LIMIT 0');
+    }
+    catch (_a) {
+        yield db_1.pool.query('ALTER TABLE users ADD COLUMN plain_password VARCHAR(255) NULL');
+        console.log('✅ Added plain_password column to users table');
+    }
+    _plainPwColReady = true;
+});
+// Run-once migration: ensure branchId column exists
+let _branchIdColReady = false;
+const ensureBranchIdColumn = () => __awaiter(void 0, void 0, void 0, function* () {
+    if (_branchIdColReady)
+        return;
+    try {
+        yield db_1.pool.query('SELECT branchId FROM users LIMIT 0');
+    }
+    catch (_a) {
+        yield db_1.pool.query('ALTER TABLE users ADD COLUMN branchId VARCHAR(36) NULL DEFAULT NULL');
+        console.log('✅ Added branchId column to users table');
+    }
+    _branchIdColReady = true;
+});
+// Run-once migration: ensure defaultTreasuryId column exists
+let _defaultTreasuryIdColReady = false;
+const ensureDefaultTreasuryIdColumn = () => __awaiter(void 0, void 0, void 0, function* () {
+    if (_defaultTreasuryIdColReady)
+        return;
+    try {
+        yield db_1.pool.query('SELECT defaultTreasuryId FROM users LIMIT 0');
+    }
+    catch (_a) {
+        yield db_1.pool.query('ALTER TABLE users ADD COLUMN defaultTreasuryId VARCHAR(36) NULL DEFAULT NULL');
+        console.log('✅ Added defaultTreasuryId column to users table');
+    }
+    _defaultTreasuryIdColReady = true;
+});
 const getUsers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        // Filter out hidden users (like master admin) from the list
-        const [rows] = yield db_1.pool.query('SELECT * FROM users WHERE isHidden = FALSE OR isHidden IS NULL');
+        yield ensurePlainPasswordColumn();
+        yield ensureBranchIdColumn();
+        yield ensureDefaultTreasuryIdColumn();
+        // Include plain_password and branchId for admin visibility
+        const [rows] = yield db_1.pool.query('SELECT id, name, email, username, plain_password, role, status, permissions, lastLogin, avatar, salesmanId, preferences, branchId, defaultTreasuryId, isHidden FROM users WHERE isHidden = FALSE OR isHidden IS NULL');
         const users = rows.map(row => (Object.assign(Object.assign({}, row), { permissions: row.permissions ? JSON.parse(row.permissions) : [], preferences: row.preferences ? (typeof row.preferences === 'string' ? JSON.parse(row.preferences) : row.preferences) : {} })));
         res.json(users);
     }
@@ -32,30 +78,62 @@ const getUsers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
 });
 exports.getUsers = getUsers;
 const createUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    var _a;
+    const connection = yield (0, db_1.getConnection)();
     try {
+        yield ensurePlainPasswordColumn();
+        yield ensureBranchIdColumn();
         yield connection.beginTransaction();
         const user = req.body;
-        const id = user.id || (0, uuid_1.v4)();
+        const id = user.id || (0, crypto_1.randomUUID)();
         const permissions = JSON.stringify(user.permissions || []);
         const preferences = JSON.stringify(user.preferences || {});
+        // Normalize empty email to NULL — email has UNIQUE constraint, empty strings conflict
+        const email = ((_a = user.email) === null || _a === void 0 ? void 0 : _a.trim()) || null;
+        const branchId = user.branchId || null;
+        const defaultTreasuryId = user.defaultTreasuryId || null;
+        // Pre-check for duplicate username or email to give clear error
+        if (user.username) {
+            const [existingUsername] = yield connection.query('SELECT id FROM users WHERE username = ? LIMIT 1', [user.username]);
+            if (existingUsername.length > 0) {
+                yield connection.rollback();
+                return res.status(409).json({
+                    code: 'DUPLICATE_ENTRY',
+                    message: `اسم المستخدم "${user.username}" مستخدم مسبقاً، يرجى اختيار اسم آخر`
+                });
+            }
+        }
+        if (email) {
+            const [existingEmail] = yield connection.query('SELECT id FROM users WHERE email = ? LIMIT 1', [email]);
+            if (existingEmail.length > 0) {
+                yield connection.rollback();
+                return res.status(409).json({
+                    code: 'DUPLICATE_ENTRY',
+                    message: `البريد الإلكتروني "${email}" مستخدم مسبقاً`
+                });
+            }
+        }
         // Hash password if provided
         let hashedPassword = user.password;
         if (user.password) {
             const salt = yield bcryptjs_1.default.genSalt(10);
             hashedPassword = yield bcryptjs_1.default.hash(user.password, salt);
         }
-        yield connection.query('INSERT INTO users (id, name, email, username, password, role, status, permissions, lastLogin, avatar, salesmanId, preferences) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, user.name, user.email, user.username, hashedPassword, user.role, user.status, permissions, user.lastLogin ? new Date(user.lastLogin) : null, user.avatar, user.salesmanId || null, preferences]);
+        yield connection.query('INSERT INTO users (id, name, email, username, password, plain_password, role, status, permissions, lastLogin, avatar, salesmanId, preferences, branchId, defaultTreasuryId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, user.name, email, user.username, hashedPassword, user.password || null, user.role, user.status, permissions, user.lastLogin ? new Date(user.lastLogin) : null, user.avatar, user.salesmanId || null, preferences, branchId, defaultTreasuryId]);
         yield connection.commit();
         // Log audit trail
         const creator = req.body.creator || 'System';
         yield (0, auditController_1.logAction)(creator, 'USER', 'CREATE', `Created User: ${user.name}`, `Role: ${user.role}, Email: ${user.email}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'users', updatedBy: creator });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'users', updatedBy: creator });
+        // Re-fetch from DB so response includes plain_password
+        const [savedRows] = yield db_1.pool.query('SELECT id, name, email, username, plain_password, role, status, permissions, lastLogin, avatar, salesmanId, preferences, branchId, defaultTreasuryId FROM users WHERE id = ?', [id]);
+        const savedUser = savedRows[0];
+        if (savedUser) {
+            savedUser.permissions = savedUser.permissions ? JSON.parse(savedUser.permissions) : [];
+            savedUser.preferences = savedUser.preferences ? (typeof savedUser.preferences === 'string' ? JSON.parse(savedUser.preferences) : savedUser.preferences) : {};
         }
-        res.status(201).json(Object.assign(Object.assign({}, user), { id }));
+        res.status(201).json(savedUser || Object.assign(Object.assign({}, user), { id }));
     }
     catch (error) {
         yield connection.rollback();
@@ -67,20 +145,32 @@ const createUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
 });
 exports.createUser = createUser;
 const updateUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    var _a;
+    const connection = yield (0, db_1.getConnection)();
     try {
+        yield ensurePlainPasswordColumn();
+        yield ensureBranchIdColumn();
         yield connection.beginTransaction();
         const { id } = req.params;
         const user = req.body;
         const permissions = JSON.stringify(user.permissions || []);
-        // Hash password if it's being updated and not already hashed
-        let hashedPassword = user.password;
-        if (user.password && !user.password.startsWith('$2')) {
+        // Normalize empty email to NULL — email has UNIQUE constraint, empty strings would conflict
+        const email = ((_a = user.email) === null || _a === void 0 ? void 0 : _a.trim()) || null;
+        const branchId = user.branchId || null;
+        const defaultTreasuryId = user.defaultTreasuryId || null;
+        // Build UPDATE dynamically — only include password if a new one is provided
+        // This prevents wiping the existing bcrypt hash when editing name/email/permissions
+        let updateSql = 'UPDATE users SET name=?, email=?, username=?, role=?, status=?, permissions=?, lastLogin=?, avatar=?, salesmanId=?, branchId=?, defaultTreasuryId=?';
+        let params = [user.name, email, user.username, user.role, user.status, permissions, user.lastLogin ? new Date(user.lastLogin) : null, user.avatar, user.salesmanId || null, branchId, defaultTreasuryId];
+        // Only update password if a new plaintext password is explicitly provided
+        // Skip if: empty, undefined, null, or already a bcrypt hash (starts with $2)
+        if (user.password && typeof user.password === 'string' && user.password.trim() !== '' && !user.password.startsWith('$2')) {
             const salt = yield bcryptjs_1.default.genSalt(10);
-            hashedPassword = yield bcryptjs_1.default.hash(user.password, salt);
+            const hashedPassword = yield bcryptjs_1.default.hash(user.password, salt);
+            updateSql += ', password=?, plain_password=?';
+            params.push(hashedPassword, user.password);
+            console.log(`🔑 [USER] Password updated for user: ${user.username}`);
         }
-        let updateSql = 'UPDATE users SET name=?, email=?, username=?, password=?, role=?, status=?, permissions=?, lastLogin=?, avatar=?, salesmanId=?';
-        let params = [user.name, user.email, user.username, hashedPassword, user.role, user.status, permissions, user.lastLogin ? new Date(user.lastLogin) : null, user.avatar, user.salesmanId || null];
         // Only update preferences if present in body
         if (user.preferences !== undefined) {
             const preferences = JSON.stringify(user.preferences);
@@ -95,11 +185,15 @@ const updateUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         const updater = req.body.updater || 'System';
         yield (0, auditController_1.logAction)(updater, 'USER', 'UPDATE', `Updated User: ${user.name}`, `Role: ${user.role}`);
         // Broadcast real-time update
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:changed', { entityType: 'users', updatedBy: updater });
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'users', updatedBy: updater });
+        // Re-fetch the saved user from DB so response includes plain_password and all fields
+        const [savedRows] = yield db_1.pool.query('SELECT id, name, email, username, plain_password, role, status, permissions, lastLogin, avatar, salesmanId, preferences, branchId, defaultTreasuryId FROM users WHERE id = ?', [id]);
+        const savedUser = savedRows[0];
+        if (savedUser) {
+            savedUser.permissions = savedUser.permissions ? JSON.parse(savedUser.permissions) : [];
+            savedUser.preferences = savedUser.preferences ? (typeof savedUser.preferences === 'string' ? JSON.parse(savedUser.preferences) : savedUser.preferences) : {};
         }
-        res.json(Object.assign(Object.assign({}, user), { id }));
+        res.json(savedUser || Object.assign(Object.assign({}, user), { id }));
     }
     catch (error) {
         yield connection.rollback();
@@ -111,16 +205,14 @@ const updateUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
 });
 exports.updateUser = updateUser;
 const updatePreferences = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         const { id } = req.params;
-        const { preferences } = req.body; // Expect partial or full preferences object
+        const { preferences } = req.body;
         if (!preferences) {
             return res.status(400).json({ message: 'Preferences required' });
         }
-        // We can merge with existing preferences or overwrite. 
-        // Let's merge for safer updates (e.g. only updating invoices settings, keeping others).
-        // First get existing
+        // Merge with existing preferences for safer updates
         const [rows] = yield connection.query('SELECT preferences FROM users WHERE id=?', [id]);
         if (rows.length === 0) {
             return res.status(404).json({ message: 'User not found' });
@@ -139,24 +231,26 @@ const updatePreferences = (req, res) => __awaiter(void 0, void 0, void 0, functi
 });
 exports.updatePreferences = updatePreferences;
 const deleteUser = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
-    const connection = yield db_1.pool.getConnection();
+    var _a, _b, _c;
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
+        const requestingUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        // Prevent self-deletion
+        if (requestingUserId && requestingUserId === id) {
+            return res.status(400).json({ message: 'لا يمكنك حذف حسابك بنفسك' });
+        }
         // Get user name before deletion
         const [users] = yield connection.query('SELECT name FROM users WHERE id=?', [id]);
-        const userName = ((_a = users[0]) === null || _a === void 0 ? void 0 : _a.name) || id;
+        const userName = ((_b = users[0]) === null || _b === void 0 ? void 0 : _b.name) || id;
         yield connection.query('DELETE FROM users WHERE id=?', [id]);
         yield connection.commit();
         // Log audit trail
-        const deleter = ((_b = req.body) === null || _b === void 0 ? void 0 : _b.deleter) || 'System';
+        const deleter = ((_c = req.body) === null || _c === void 0 ? void 0 : _c.deleter) || 'System';
         yield (0, auditController_1.logAction)(deleter, 'USER', 'DELETE', `Deleted User: ${userName}`, `ID: ${id}`);
         // Broadcast real-time deletion
-        const io = req.app.get('io');
-        if (io) {
-            io.emit('entity:deleted', { entityType: 'users', entityId: id, deletedBy: deleter });
-        }
+        eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'users', entityId: id, deletedBy: deleter });
         res.json({ message: 'User deleted' });
     }
     catch (error) {

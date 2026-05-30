@@ -137,6 +137,139 @@ function addPerformanceIndexes() {
                     console.error('❌ Error adding paymentBreakdown column:', err.message);
                 }
             }
+            // ═══════════════════════════════════════════════════════════
+            // COMPOSITE INDEXES — target real query patterns on 30K+ rows
+            // ═══════════════════════════════════════════════════════════
+            // 10. Partner balance calculation: WHERE partnerId=? AND status IN (...) AND type IN (...)
+            try {
+                yield conn.query(`CREATE INDEX idx_inv_partner_status ON invoices(partnerId, status, type)`);
+                console.log('✅ Added composite index idx_inv_partner_status');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_inv_partner_status already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 11. Partner statement date filtering: WHERE partnerId=? AND date >= ? AND date <= ?
+            try {
+                yield conn.query(`CREATE INDEX idx_inv_partner_date ON invoices(partnerId, date)`);
+                console.log('✅ Added composite index idx_inv_partner_date');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_inv_partner_date already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 12. Dashboard KPIs: WHERE date >= ? AND type IN (...)
+            try {
+                yield conn.query(`CREATE INDEX idx_inv_date_type ON invoices(date, type)`);
+                console.log('✅ Added composite index idx_inv_date_type');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_inv_date_type already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 13. Balance aggregation: WHERE status IN (...) AND type IN (...)
+            try {
+                yield conn.query(`CREATE INDEX idx_inv_status_type ON invoices(status, type)`);
+                console.log('✅ Added composite index idx_inv_status_type');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_inv_status_type already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 14. Commission reports: WHERE salesmanId=? AND date >= ? AND status=?
+            try {
+                yield conn.query(`CREATE INDEX idx_inv_salesman_date ON invoices(salesmanId, date, status)`);
+                console.log('✅ Added composite index idx_inv_salesman_date');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_inv_salesman_date already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 15. Profit reports: JOINs on invoice_lines.productId
+            try {
+                yield conn.query(`CREATE INDEX idx_invlines_product ON invoice_lines(productId, invoiceId)`);
+                console.log('✅ Added composite index idx_invlines_product');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_invlines_product already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 16. Account ledger: JOINs on journal_lines.accountId
+            try {
+                yield conn.query(`CREATE INDEX idx_journal_lines_account ON journal_lines(accountId, journalId)`);
+                console.log('✅ Added composite index idx_journal_lines_account');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_journal_lines_account already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 17. Stock recalculation: WHERE product_id=? AND warehouse_id=?
+            try {
+                yield conn.query(`CREATE INDEX idx_stock_movements_product_wh ON stock_movements(product_id, warehouse_id)`);
+                console.log('✅ Added composite index idx_stock_movements_product_wh');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_stock_movements_product_wh already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 18. Stock recalculation NOT EXISTS check: WHERE reference_id=? AND product_id=?
+            try {
+                yield conn.query(`CREATE INDEX idx_stock_movements_ref ON stock_movements(reference_id, product_id)`);
+                console.log('✅ Added composite index idx_stock_movements_ref');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_stock_movements_ref already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
+            // 19. Partner cheque lookups: WHERE partnerId=? AND status=?
+            try {
+                yield conn.query(`CREATE INDEX idx_cheques_partner ON cheques(partnerId, status)`);
+                console.log('✅ Added composite index idx_cheques_partner');
+            }
+            catch (err) {
+                if (err.message.includes('Duplicate key name')) {
+                    console.log('ℹ️ Index idx_cheques_partner already exists');
+                }
+                else {
+                    console.error('❌ Error:', err.message);
+                }
+            }
             console.log('\n✨ Performance optimization complete!');
             console.log('Your queries should now be significantly faster.\n');
         }

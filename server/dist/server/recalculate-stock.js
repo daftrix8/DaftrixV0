@@ -13,7 +13,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const promise_1 = require("mysql2/promise");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const dotenv_1 = __importDefault(require("dotenv"));
 dotenv_1.default.config();
 const pool = (0, promise_1.createPool)({
@@ -55,7 +55,7 @@ function recalculateStock() {
                     if (change !== 0) {
                         yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                          VALUES (?, ?, ?, ?) 
-                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, uuid_1.v4)(), line.productId, inv.warehouseId, change, change]);
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), line.productId, inv.warehouseId, change, change]);
                     }
                 }
             }
@@ -70,22 +70,22 @@ function recalculateStock() {
                     if (p.type === 'STOCK_PERMIT_IN' && p.destWarehouseId) {
                         yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                          VALUES (?, ?, ?, ?) 
-                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, uuid_1.v4)(), item.productId, p.destWarehouseId, qty, qty]);
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), item.productId, p.destWarehouseId, qty, qty]);
                     }
                     else if (p.type === 'STOCK_PERMIT_OUT' && p.sourceWarehouseId) {
                         yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                          VALUES (?, ?, ?, ?) 
-                         ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, uuid_1.v4)(), item.productId, p.sourceWarehouseId, qty, qty]);
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), item.productId, p.sourceWarehouseId, qty, qty]);
                     }
                     else if (p.type === 'STOCK_TRANSFER' && p.sourceWarehouseId && p.destWarehouseId) {
                         // Out from Source
                         yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                          VALUES (?, ?, ?, ?) 
-                         ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, uuid_1.v4)(), item.productId, p.sourceWarehouseId, qty, qty]);
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), item.productId, p.sourceWarehouseId, qty, qty]);
                         // In to Dest
                         yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
                          VALUES (?, ?, ?, ?) 
-                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, uuid_1.v4)(), item.productId, p.destWarehouseId, qty, qty]);
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), item.productId, p.destWarehouseId, qty, qty]);
                     }
                 }
             }

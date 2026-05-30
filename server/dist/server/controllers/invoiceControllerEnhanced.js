@@ -19,6 +19,8 @@ const dataFiltering_1 = require("../utils/dataFiltering");
 const errorHandler_1 = require("../utils/errorHandler");
 const invoiceCascadeDelete_1 = require("../utils/invoiceCascadeDelete");
 const auditController_1 = require("./auditController");
+const eventBus_1 = require("../utils/eventBus");
+const policyEnforcement_1 = require("../utils/policyEnforcement");
 /**
  * GET /api/invoices - List invoices with user filtering
  */
@@ -50,6 +52,11 @@ const getInvoices = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                 // User can only see their own invoices
                 conditions.push('createdBy = ?');
                 params.push(userFilterOptions.userName);
+            }
+            // FISCAL YEAR DATA ISOLATION — always enforce as a hard boundary
+            if (authReq.fiscalYearFilter) {
+                conditions.push('date >= ? AND date <= ?');
+                params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
             }
             if (conditions.length > 0) {
                 whereClause = 'WHERE ' + conditions.join(' AND ');
@@ -100,7 +107,7 @@ exports.getInvoices = getInvoices;
  * POST /api/invoices - Create invoice with policy validation
  */
 const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b, _c;
     try {
         const conn = yield (0, db_1.getConnection)();
         const authReq = req;
@@ -111,6 +118,13 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         try {
             const invoice = req.body;
             const currentUser = (userFilterOptions === null || userFilterOptions === void 0 ? void 0 : userFilterOptions.userName) || user.name || user.username;
+            // Closed fiscal year write protection
+            if (((_a = authReq.fiscalYearFilter) === null || _a === void 0 ? void 0 : _a.status) === 'CLOSED') {
+                return res.status(403).json({
+                    error: 'FISCAL_YEAR_CLOSED',
+                    message: `السنة المالية ${authReq.fiscalYearFilter.name} مقفلة. لا يمكن إضافة فواتير جديدة.`
+                });
+            }
             // Permission Check
             const isSales = invoice.type === 'SALE' || invoice.type === 'RETURN_SALE';
             const permissionId = isSales ? 'sales.create' : 'purchase.create';
@@ -128,13 +142,39 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     return res.status(403).json({
                         error: 'TRANSACTION_LIMIT_EXCEEDED',
                         message: validation.reason,
-                        limit: ((_a = systemConfig.transactionLimits) === null || _a === void 0 ? void 0 : _a[user.role]) || 0
+                        limit: ((_b = systemConfig.transactionLimits) === null || _b === void 0 ? void 0 : _b[user.role]) || 0
                     });
                 }
                 // Check if needs approval
                 if ((0, dataFiltering_1.needsApproval)(invoice.total, systemConfig)) {
                     invoice.status = 'PENDING_APPROVAL';
                     invoice.requiresApproval = true;
+                }
+            }
+            // === POLICY ENFORCEMENT: Full server-side validation ===
+            if (systemConfig) {
+                const policyContext = {
+                    type: invoice.type,
+                    date: invoice.date,
+                    total: invoice.total,
+                    partnerId: invoice.partnerId,
+                    notes: invoice.notes,
+                    costCenterId: invoice.costCenterId,
+                    warehouseId: invoice.warehouseId,
+                    currentUser: currentUser,
+                    currentUserRole: user.role,
+                    lines: (_c = invoice.lines) === null || _c === void 0 ? void 0 : _c.map((l) => ({
+                        productId: l.productId,
+                        quantity: l.quantity || 0,
+                        cost: l.cost
+                    }))
+                };
+                const policyResult = yield (0, policyEnforcement_1.validateTransactionFull)(policyContext, systemConfig);
+                if (!policyResult.valid) {
+                    return res.status(403).json({
+                        error: policyResult.errorCode || 'POLICY_VIOLATION',
+                        message: policyResult.error
+                    });
                 }
             }
             yield conn.beginTransaction();
@@ -210,7 +250,7 @@ exports.createInvoice = createInvoice;
  * PUT /api/invoices/:id - Update invoice with ownership check
  */
 const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b;
     try {
         const conn = yield (0, db_1.getConnection)();
         const authReq = req;
@@ -254,6 +294,41 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         error: 'PERMISSION_DENIED',
                         message: 'You do not have permission to apply discounts',
                         requiredPermission: 'sales.discount'
+                    });
+                }
+            }
+            // === POLICY ENFORCEMENT: Check posted invoice edit ===
+            if (authReq.systemConfig) {
+                const editCheck = (0, policyEnforcement_1.validateEditPostedInvoice)(existingInvoice.posted, authReq.systemConfig);
+                if (!editCheck.valid) {
+                    return res.status(403).json({
+                        error: editCheck.errorCode || 'POLICY_VIOLATION',
+                        message: editCheck.error
+                    });
+                }
+                // Also run full policy validation on new data
+                const policyContext = {
+                    type: invoice.type,
+                    date: invoice.date,
+                    total: invoice.total,
+                    partnerId: invoice.partnerId,
+                    notes: invoice.notes,
+                    costCenterId: invoice.costCenterId,
+                    warehouseId: invoice.warehouseId,
+                    createdBy: existingInvoice.createdBy,
+                    currentUser: userFilterOptions.userName,
+                    currentUserRole: user.role,
+                    lines: (_b = invoice.lines) === null || _b === void 0 ? void 0 : _b.map((l) => ({
+                        productId: l.productId,
+                        quantity: l.quantity || 0,
+                        cost: l.cost
+                    }))
+                };
+                const policyResult = yield (0, policyEnforcement_1.validateTransactionFull)(policyContext, authReq.systemConfig);
+                if (!policyResult.valid) {
+                    return res.status(403).json({
+                        error: policyResult.errorCode || 'POLICY_VIOLATION',
+                        message: policyResult.error
                     });
                 }
             }
@@ -369,6 +444,17 @@ const deleteInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         // Get the user name for deletion
         const deletedBy = userFilterOptions.userName || user.name || user.username || 'System';
+        // === POLICY ENFORCEMENT: Check posted invoice delete ===
+        if (authReq.systemConfig) {
+            const deleteCheck = (0, policyEnforcement_1.validateDeletePostedInvoice)(existingInvoice.posted, authReq.systemConfig);
+            if (!deleteCheck.valid) {
+                conn.release();
+                return res.status(403).json({
+                    error: deleteCheck.errorCode || 'POLICY_VIOLATION',
+                    message: deleteCheck.error
+                });
+            }
+        }
         // Start transaction for cascade delete
         yield conn.beginTransaction();
         try {
@@ -388,12 +474,9 @@ const deleteInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 `سندات محذوفة: ${cascadeResult.deletedReceipts + cascadeResult.deletedPayments} | ` +
                 `قيود محذوفة: ${cascadeResult.deletedJournals}`);
             // Broadcast real-time update
-            const io = req.app.get('io');
-            if (io) {
-                io.emit('entity:changed', { entityType: 'invoice', action: 'delete', updatedBy: deletedBy });
-                io.emit('entity:changed', { entityType: 'journal', action: 'delete', updatedBy: deletedBy });
-                io.emit('entity:changed', { entityType: 'accounts', action: 'update', updatedBy: deletedBy });
-            }
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', action: 'delete', updatedBy: deletedBy });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'journal', action: 'delete', updatedBy: deletedBy });
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'accounts', action: 'update', updatedBy: deletedBy });
             res.json({
                 message: 'Invoice deleted successfully',
                 cascade: {
@@ -544,15 +627,11 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
             }
             yield conn.commit();
             // Emit real-time update
-            const io = req.app.get('io');
-            if (io) {
-                io.emit('entity:changed', {
-                    entityType: 'invoice',
-                    action: 'transfer',
-                    updatedBy: currentUser,
-                    targetUser: targetUserName
-                });
-            }
+            eventBus_1.eventBus.broadcast('entity:changed', {
+                entityType: 'invoice',
+                action: 'transfer',
+                targetUser: targetUserName
+            });
             const successful = results.filter(r => r.success).length;
             const failed = results.filter(r => !r.success).length;
             res.json({

@@ -79,7 +79,7 @@ const getRouting = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
 exports.getRouting = getRouting;
 // Create routing with steps
 const createRouting = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id, code, name, productId, description, isActive, steps } = req.body;
@@ -156,7 +156,7 @@ const createRouting = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 exports.createRouting = createRouting;
 // Update routing
 const updateRouting = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { id } = req.params;

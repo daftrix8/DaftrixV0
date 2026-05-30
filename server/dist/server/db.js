@@ -45,55 +45,394 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.pool = void 0;
+exports.SCHEMA_VERSION = exports.connectionSweepMiddleware = exports.requestContext = exports.heavyPool = exports.pool = void 0;
+exports.startPoolHealthMonitor = startPoolHealthMonitor;
+exports.startPoolKeepalive = startPoolKeepalive;
 exports.getConnection = getConnection;
+exports.safeGetConnection = safeGetConnection;
+exports.getHeavyConnection = getHeavyConnection;
+exports.safePoolQuery = safePoolQuery;
 exports.initDB = initDB;
 const promise_1 = __importDefault(require("mysql2/promise"));
 const dotenv_1 = __importDefault(require("dotenv"));
+const async_hooks_1 = require("async_hooks");
 const seedData_1 = require("./seedData");
 dotenv_1.default.config();
-console.log('DB Config:', {
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    database: process.env.DB_NAME,
-    port: process.env.DB_PORT || 3306,
-    hasPassword: !!process.env.DB_PASSWORD
-});
-exports.pool = promise_1.default.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    port: Number(process.env.DB_PORT) || 3306,
-    waitForConnections: true,
-    connectionLimit: 10,
-    decimalNumbers: true,
-    authPlugins: {
+// SECURITY: Only log DB config in development (H2 fix)
+if (process.env.NODE_ENV === 'development') {
+    console.log('DB Config:', {
+        host: process.env.DB_HOST,
+        user: process.env.DB_USER,
+        database: process.env.DB_NAME,
+        port: process.env.DB_PORT || 3306,
+        hasPassword: !!process.env.DB_PASSWORD
+    });
+}
+// ═══════════════════════════════════════════════════════════
+// MAIN POOL — Reserved for user-facing operations
+// Invoices, payments, partner statements, product lookups
+// These must NEVER be blocked by background operations
+// ═══════════════════════════════════════════════════════════
+const poolConfig = Object.assign(Object.assign({ host: process.env.DB_HOST, user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_NAME, port: Number(process.env.DB_PORT) || 3306, waitForConnections: true, connectionLimit: 25, maxIdle: 5, idleTimeout: 300000, queueLimit: 100, connectTimeout: 30000, enableKeepAlive: true, keepAliveInitialDelay: 5000, decimalNumbers: true, charset: 'UTF8MB4_UNICODE_CI' }, (process.env.DB_SSL === 'true' ? { ssl: { rejectUnauthorized: false } } : {})), { authPlugins: {
         mysql_clear_password: () => () => Buffer.from(process.env.DB_PASSWORD + '\0')
-    }
+    } });
+exports.pool = promise_1.default.createPool(poolConfig);
+// ═══════════════════════════════════════════════════════════
+// POOL-LEVEL SESSION INIT — Runs ONCE per physical connection creation
+// Previously these 4 queries ran on EVERY getConnection() checkout,
+// wasting 4 round-trips per request. Now they run once when MySQL
+// creates the connection, and the session variables persist.
+// ═══════════════════════════════════════════════════════════
+exports.pool.on('connection', (connection) => {
+    connection.query('SET innodb_lock_wait_timeout = 10', (err) => { if (err)
+        console.warn('DB config error:', err.message); });
+    connection.query('SET SESSION max_execution_time = 25000', (err) => { });
+    connection.query('SET SESSION wait_timeout = 28800', (err) => { });
+    connection.query('SET SESSION interactive_timeout = 28800', (err) => { });
+    // Fix collation mismatch: MariaDB 11.x defaults to uca1400_ai_ci but our tables use unicode_ci
+    connection.query("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci", (err) => { });
+    connection.query("SET collation_connection = utf8mb4_unicode_ci", (err) => { });
+    // MVCC FIX: Prevent "Record has changed since last read" false conflicts on MariaDB
+    // system-versioned or row-versioned tables. KEEP mode tells MariaDB not to reject
+    // concurrent modifications when system versioning detects row changes.
+    connection.query('SET SESSION system_versioning_alter_history = KEEP', (err) => { });
 });
+// ═══════════════════════════════════════════════════════════
+// HEAVY POOL — Isolated for background / expensive operations
+// Stock recalculation, heavy reports, bulk data fetches
+// Limited to 10 connections so it can NEVER starve the main pool
+// ═══════════════════════════════════════════════════════════
+exports.heavyPool = promise_1.default.createPool(Object.assign(Object.assign({}, poolConfig), { connectionLimit: 10, maxIdle: 3, queueLimit: 50 }));
+// Heavy pool gets longer query timeouts
+exports.heavyPool.on('connection', (connection) => {
+    connection.query('SET innodb_lock_wait_timeout = 30', (err) => { });
+    connection.query('SET SESSION max_execution_time = 120000', (err) => { });
+    connection.query('SET SESSION wait_timeout = 28800', (err) => { });
+    connection.query('SET SESSION interactive_timeout = 28800', (err) => { });
+    connection.query("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci", (err) => { });
+    connection.query("SET collation_connection = utf8mb4_unicode_ci", (err) => { });
+    connection.query('SET SESSION system_versioning_alter_history = KEEP', (err) => { });
+});
+// ── POOL HEALTH MONITOR ──────────────────────────────────
+// Logs pool utilization every 60s when there's pressure
+// Helps detect exhaustion before it becomes a hang
+let _healthInterval = null;
+function startPoolHealthMonitor() {
+    if (_healthInterval)
+        return;
+    _healthInterval = setInterval(() => {
+        var _a, _b, _c, _d, _e, _f;
+        const mainPool = exports.pool.pool;
+        const bgPool = exports.heavyPool.pool;
+        // Only log when there's actual pressure (queued requests or high utilization)
+        const mainActive = ((_a = mainPool === null || mainPool === void 0 ? void 0 : mainPool._allConnections) === null || _a === void 0 ? void 0 : _a.length) || 0;
+        const mainFree = ((_b = mainPool === null || mainPool === void 0 ? void 0 : mainPool._freeConnections) === null || _b === void 0 ? void 0 : _b.length) || 0;
+        const mainQueued = ((_c = mainPool === null || mainPool === void 0 ? void 0 : mainPool._connectionQueue) === null || _c === void 0 ? void 0 : _c.length) || 0;
+        const bgActive = ((_d = bgPool === null || bgPool === void 0 ? void 0 : bgPool._allConnections) === null || _d === void 0 ? void 0 : _d.length) || 0;
+        const bgFree = ((_e = bgPool === null || bgPool === void 0 ? void 0 : bgPool._freeConnections) === null || _e === void 0 ? void 0 : _e.length) || 0;
+        const bgQueued = ((_f = bgPool === null || bgPool === void 0 ? void 0 : bgPool._connectionQueue) === null || _f === void 0 ? void 0 : _f.length) || 0;
+        // Log if any queue has items OR utilization is > 60%
+        if (mainQueued > 0 || bgQueued > 0 || (mainActive - mainFree) > 15) {
+            console.log(`📊 [Pool Health] Main: ${mainActive - mainFree}/${25} active, ${mainQueued} queued | Heavy: ${bgActive - bgFree}/${10} active, ${bgQueued} queued`);
+        }
+    }, 60000);
+    // Don't keep the process alive just for health checks
+    if (_healthInterval.unref)
+        _healthInterval.unref();
+}
+// ── POOL KEEPALIVE PINGER ────────────────────────────────
+// MariaDB default wait_timeout is 28800s (8h). After that, idle connections
+// are silently killed server-side, causing PROTOCOL_CONNECTION_LOST errors
+// when the pool tries to reuse them. TCP keepalive is NOT enough — we need
+// to send actual MySQL-level pings to keep connections alive.
+// Runs every 4 minutes — well within the 8h window.
+let _keepaliveInterval = null;
+function startPoolKeepalive() {
+    if (_keepaliveInterval)
+        return;
+    _keepaliveInterval = setInterval(() => __awaiter(this, void 0, void 0, function* () {
+        try {
+            // Ping the main pool
+            yield exports.pool.query('SELECT 1');
+            // Ping the heavy pool
+            yield exports.heavyPool.query('SELECT 1');
+        }
+        catch (err) {
+            // Non-critical — connection will be recreated on next real request
+            console.warn('⚠️ [Keepalive] Ping failed (will auto-reconnect):', err.code || err.message);
+        }
+    }), 4 * 60 * 1000); // Every 4 minutes
+    if (_keepaliveInterval.unref)
+        _keepaliveInterval.unref();
+    console.log('💓 [Keepalive] Pool keepalive pinger started (every 4 min)');
+}
+// ── POOL ERROR HANDLER ──────────────────────────────────────
+// Catches 'PROTOCOL_CONNECTION_LOST', 'ECONNRESET', etc. at the pool level
+// so they don't bubble up as uncaught exceptions and crash the server.
+let _lastPoolErrorLog = 0;
+exports.pool.on('connection', (connection) => {
+    connection.on('error', (err) => {
+        const now = Date.now();
+        // Throttle: log at most once per 60s to avoid console flooding from normal idle drops
+        if (now - _lastPoolErrorLog > 60000) {
+            _lastPoolErrorLog = now;
+            console.warn('⚠️ [DB Pool] Connection error (will auto-reconnect):', err.code || err.message);
+        }
+    });
+});
+// Same handler for the heavy pool
+exports.heavyPool.on('connection', (connection) => {
+    connection.on('error', (err) => {
+        const now = Date.now();
+        if (now - _lastPoolErrorLog > 60000) {
+            _lastPoolErrorLog = now;
+            console.warn('⚠️ [Heavy Pool] Connection error (will auto-reconnect):', err.code || err.message);
+        }
+    });
+});
+// ---------------------------------------------------------
+// CONNECTION LEAK SWEEPER
+// ---------------------------------------------------------
+// We use AsyncLocalStorage to track all DB connections acquired during a single HTTP request.
+// If a controller crashes or forgets to release a connection, this middleware sweeps it up.
+exports.requestContext = new async_hooks_1.AsyncLocalStorage();
+const connectionSweepMiddleware = (req, res, next) => {
+    const connections = new Set();
+    // Clean up function to release all untracked connections
+    const cleanup = () => {
+        if (connections.size > 0) {
+            console.warn(`🧹 [DB Sweep] Releasing ${connections.size} leaked connections for ${req.method} ${req.url}`);
+        }
+        for (const proxyConn of connections) {
+            try {
+                proxyConn.release();
+            }
+            catch (e) {
+                console.error(`Error sweeping connection:`, e);
+            }
+        }
+        connections.clear();
+    };
+    // Run the request inside the AsyncLocalStorage context
+    exports.requestContext.run(connections, () => {
+        // Hook into response finish and close events
+        res.on('finish', cleanup);
+        res.on('close', cleanup);
+        // Expose the connection set so getConnection() can store thread IDs
+        const origAdd = connections.add.bind(connections);
+        connections.add = function (conn) {
+            origAdd(conn);
+            return this;
+        };
+        next();
+    });
+};
+exports.connectionSweepMiddleware = connectionSweepMiddleware;
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function getConnection() {
     return __awaiter(this, arguments, void 0, function* (maxRetries = 5) {
+        var _a;
         for (let i = 0; i < maxRetries; i++) {
             try {
                 const conn = yield exports.pool.getConnection();
-                // console.log('✅ Database connected');
-                return conn;
+                // Guard: pool can return undefined when in a bad state
+                if (!conn) {
+                    console.error(`❌ Pool returned undefined connection (attempt ${i + 1})`);
+                    continue;
+                }
+                // Validate connection is alive before returning to caller.
+                // ping() is ~0.5ms and prevents "closed state" / "write after end" errors
+                // on stale connections that were silently dropped by the server.
+                try {
+                    yield conn.ping();
+                }
+                catch (_b) {
+                    try {
+                        conn.destroy();
+                    }
+                    catch (_c) { }
+                    continue; // Get a fresh connection from the pool
+                }
+                // Automatically track connection for current HTTP request
+                let proxyReleased = false;
+                const proxy = new Proxy(conn, {
+                    get(target, prop) {
+                        if (prop === 'release') {
+                            return function () {
+                                if (proxyReleased) {
+                                    // Silently ignore double release to prevent crashes
+                                    return;
+                                }
+                                proxyReleased = true;
+                                const trackedConnections = exports.requestContext.getStore();
+                                if (trackedConnections) {
+                                    trackedConnections.delete(proxy);
+                                }
+                                return target.release();
+                            };
+                        }
+                        const val = target[prop];
+                        return typeof val === 'function' ? val.bind(target) : val;
+                    }
+                });
+                const trackedConnections = exports.requestContext.getStore();
+                if (trackedConnections) {
+                    trackedConnections.add(proxy);
+                    // Store the MySQL thread ID so requestTimeout can KILL QUERY on timeout
+                    const threadId = ((_a = conn === null || conn === void 0 ? void 0 : conn.connection) === null || _a === void 0 ? void 0 : _a.threadId) || (conn === null || conn === void 0 ? void 0 : conn.threadId);
+                    if (threadId) {
+                        trackedConnections._lastThreadId = threadId;
+                    }
+                }
+                return proxy;
             }
             catch (error) {
-                console.error(`❌ DB connection attempt ${i + 1} failed`);
+                console.error(`❌ DB connection attempt ${i + 1} failed:`, (error === null || error === void 0 ? void 0 : error.message) || error);
                 if (i === maxRetries - 1)
                     throw error;
-                yield sleep(5000 * (i + 1)); // Exponential backoff: 5s, 10s, 15s...
+                yield sleep(2000 * (i + 1)); // 2s, 4s, 6s...
             }
         }
         throw new Error('Failed to obtain database connection after retries');
     });
 }
+// Helper to safely get a connection - wraps getConnection with an extra
+// guard against the pool returning undefined (causes 'once' is undefined crashes)
+function safeGetConnection() {
+    return __awaiter(this, arguments, void 0, function* (maxRetries = 5) {
+        var _a, _b;
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                const conn = yield getConnection(maxRetries);
+                if (!conn) {
+                    console.error(`❌ Pool returned undefined connection (attempt ${i + 1})`);
+                    yield sleep(2000 * (i + 1));
+                    continue;
+                }
+                return conn;
+            }
+            catch (error) {
+                // Catch the 'once' undefined error specifically and retry
+                if (((_a = error === null || error === void 0 ? void 0 : error.message) === null || _a === void 0 ? void 0 : _a.includes('once')) || ((_b = error === null || error === void 0 ? void 0 : error.message) === null || _b === void 0 ? void 0 : _b.includes('closed state'))) {
+                    console.error(`❌ Connection pool in bad state (attempt ${i + 1}), retrying...`);
+                    yield sleep(3000 * (i + 1));
+                    continue;
+                }
+                throw error;
+            }
+        }
+        throw new Error('Failed to obtain safe database connection after retries');
+    });
+}
+// ═══════════════════════════════════════════════════════════
+// HEAVY CONNECTION — Uses the isolated heavy pool
+// For: stock recalculation, heavy reports, bulk data operations
+// These connections have longer query timeouts (120s vs 25s)
+// and will NEVER compete with invoice/payment operations
+// ═══════════════════════════════════════════════════════════
+function getHeavyConnection() {
+    return __awaiter(this, arguments, void 0, function* (maxRetries = 5) {
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                const conn = yield exports.heavyPool.getConnection();
+                if (!conn) {
+                    console.error(`❌ Heavy pool returned undefined connection (attempt ${i + 1})`);
+                    continue;
+                }
+                try {
+                    yield conn.ping();
+                }
+                catch (_a) {
+                    try {
+                        conn.destroy();
+                    }
+                    catch ( /* ignore */_b) { /* ignore */ }
+                    continue;
+                }
+                // Session variables are now set at pool-level via heavyPool.on('connection')
+                let proxyReleased = false;
+                const proxy = new Proxy(conn, {
+                    get(target, prop) {
+                        if (prop === 'release') {
+                            return function () {
+                                if (proxyReleased)
+                                    return;
+                                proxyReleased = true;
+                                return target.release();
+                            };
+                        }
+                        const val = target[prop];
+                        return typeof val === 'function' ? val.bind(target) : val;
+                    }
+                });
+                return proxy;
+            }
+            catch (error) {
+                console.error(`❌ Heavy DB connection attempt ${i + 1} failed:`, (error === null || error === void 0 ? void 0 : error.message) || error);
+                if (i === maxRetries - 1)
+                    throw error;
+                yield sleep(2000 * (i + 1));
+            }
+        }
+        throw new Error('Failed to obtain heavy database connection after retries');
+    });
+}
+// ═══════════════════════════════════════════════════════════
+// SAFE POOL QUERY — For fire-and-forget / Phase B operations
+// pool.query() can fail with "write after end" or "closed state"
+// when the pool returns a stale connection. This wrapper catches
+// those errors and retries with a fresh explicit connection.
+// Returns [rows, fields] like pool.query, or throws after retries.
+// ═══════════════════════════════════════════════════════════
+function safePoolQuery(sql_1, params_1) {
+    return __awaiter(this, arguments, void 0, function* (sql, params, maxRetries = 2) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            try {
+                if (attempt === 0) {
+                    // First attempt: use pool.query() (auto-acquires and auto-releases)
+                    return yield exports.pool.query(sql, params);
+                }
+                else {
+                    // Retry: get an explicit connection, ping it, then query
+                    let conn = null;
+                    try {
+                        conn = yield safeGetConnection();
+                        const result = yield conn.query(sql, params);
+                        conn.release();
+                        return result;
+                    }
+                    catch (retryErr) {
+                        if (conn)
+                            try {
+                                conn.destroy();
+                            }
+                            catch ( /* force-destroy bad connection */_a) { /* force-destroy bad connection */ }
+                        throw retryErr; // Pass to outer catch so sleep and retry logic handles it
+                    }
+                }
+            }
+            catch (err) {
+                const msg = (err === null || err === void 0 ? void 0 : err.message) || '';
+                const isConnectionDead = msg.includes('write after end')
+                    || msg.includes('closed state')
+                    || msg.includes('PROTOCOL_CONNECTION_LOST')
+                    || msg.includes('ECONNRESET')
+                    || msg.includes('once'); // "Cannot read properties of undefined (reading 'once')"
+                if (isConnectionDead && attempt < maxRetries) {
+                    console.warn(`⚠️ [safePoolQuery] Connection error on attempt ${attempt + 1}, retrying: ${msg.substring(0, 80)}`);
+                    yield sleep(500 * (attempt + 1));
+                    continue;
+                }
+                throw err; // Non-connection error or final retry exhausted
+            }
+        }
+        throw new Error('safePoolQuery: should not reach here');
+    });
+}
+exports.SCHEMA_VERSION = 72; // Bump this when adding new migrations
 function initDB() {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a;
+        var _a, _b, _c, _d;
         let conn;
         try {
             // Connect without database selected to create it if not exists
@@ -103,11 +442,176 @@ function initDB() {
                 password: process.env.DB_PASSWORD,
                 port: Number(process.env.DB_PORT) || 3306,
             });
-            yield rootConn.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME}\``);
+            yield rootConn.query(`CREATE DATABASE IF NOT EXISTS \`${process.env.DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+            // Ensure charset is correct even on existing databases
+            yield rootConn.query(`ALTER DATABASE \`${process.env.DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+            // Ensure MariaDB can handle our total pool size (25 main + 10 heavy = 35)
+            // plus headroom for admin connections and monitoring
+            try {
+                yield rootConn.query('SET GLOBAL max_connections = 100');
+                console.log('✅ MariaDB max_connections set to 100 (35 pool + 65 headroom)');
+            }
+            catch (e) {
+                // May fail if user doesn't have SUPER privilege — that's OK, admin can set it manually
+                console.warn('⚠️ Could not set max_connections (may need SUPER privilege):', e === null || e === void 0 ? void 0 : e.message);
+            }
             yield rootConn.end();
             // Now connect to the database
             conn = yield exports.pool.getConnection();
             console.log("Connected to MariaDB/MySQL");
+            // Check if schema is already up-to-date (skip migrations for fast startup)
+            let needsMigrations = true;
+            try {
+                const [versionRows] = yield conn.query(`SELECT value FROM schema_meta WHERE \`key\` = 'schema_version' LIMIT 1`);
+                const currentVersion = parseInt(((_a = versionRows[0]) === null || _a === void 0 ? void 0 : _a.value) || '0', 10);
+                if (currentVersion >= exports.SCHEMA_VERSION) {
+                    // DOUBLE CHECK: Even if schema_meta says it's up to date, verify critical tables exist
+                    const [tableCheck] = yield conn.query("SHOW TABLES LIKE 'users'");
+                    if (tableCheck.length === 0) {
+                        console.warn('⚠️ schema_meta claims v' + currentVersion + ' but tables are missing! Forcing full database rebuild...');
+                        needsMigrations = true;
+                    }
+                    else {
+                        needsMigrations = false;
+                        console.log(`✅ Schema v${currentVersion} is up-to-date (required: v${exports.SCHEMA_VERSION}). Skipping migrations.`);
+                    }
+                }
+                else {
+                    console.log(`🔄 Schema v${currentVersion} → v${exports.SCHEMA_VERSION}. Running migrations...`);
+                }
+            }
+            catch (_e) {
+                // schema_meta table doesn't exist yet — first run, needs full init
+                console.log('🆕 First run (or empty database) detected. Running full database initialization...');
+            }
+            // Disable foreign key checks during table creation to avoid order dependency issues
+            yield conn.query('SET FOREIGN_KEY_CHECKS = 0');
+            if (!needsMigrations) {
+                // Fast path: only run CREATE TABLE IF NOT EXISTS (instant for existing tables)
+                // and skip all ALTER TABLE migrations
+                // ── ALWAYS ensure AI tables exist (they were added after many existing deployments) ──
+                try {
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS ai_chat_messages (
+          id VARCHAR(36) PRIMARY KEY, userId VARCHAR(36) NOT NULL,
+          role ENUM('user','assistant') NOT NULL DEFAULT 'user', message TEXT NOT NULL,
+          intent VARCHAR(50) DEFAULT NULL, contextSummary VARCHAR(500) DEFAULT NULL,
+          sessionId VARCHAR(36) DEFAULT NULL, feedback ENUM('positive','negative','corrected') DEFAULT NULL,
+          feedbackNote TEXT DEFAULT NULL, provider VARCHAR(20) DEFAULT NULL, model VARCHAR(100) DEFAULT NULL,
+          createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_ai_chat_user (userId, createdAt), INDEX idx_ai_chat_session (sessionId, createdAt)
+        )`);
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS ai_chat_sessions (
+          id VARCHAR(36) PRIMARY KEY, userId VARCHAR(36) NOT NULL,
+          lastIntent VARCHAR(50) DEFAULT 'general', lastPartnerId VARCHAR(36) DEFAULT NULL,
+          lastPartnerName VARCHAR(255) DEFAULT NULL, lastEntityType VARCHAR(20) DEFAULT NULL,
+          lastTopic VARCHAR(50) DEFAULT NULL, conversationTone VARCHAR(10) DEFAULT 'ar',
+          metadata JSON DEFAULT NULL,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_ai_session_user (userId, updatedAt)
+        )`);
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS ai_usage_log (
+          id INT AUTO_INCREMENT PRIMARY KEY, userId VARCHAR(36) DEFAULT NULL,
+          provider VARCHAR(20) NOT NULL, model VARCHAR(100) NOT NULL, intent VARCHAR(50) DEFAULT NULL,
+          inputTokensEst INT DEFAULT 0, outputTokensEst INT DEFAULT 0, latencyMs INT DEFAULT 0,
+          cached BOOLEAN DEFAULT FALSE, error BOOLEAN DEFAULT FALSE,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_ai_usage_daily (createdAt, provider), INDEX idx_ai_usage_user (userId, createdAt)
+        )`);
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS ai_knowledge_base (
+          id INT AUTO_INCREMENT PRIMARY KEY, title VARCHAR(255) NOT NULL, titleAr VARCHAR(255) DEFAULT NULL,
+          content MEDIUMTEXT NOT NULL,
+          contentType ENUM('policy','procedure','faq','report','manual','note') NOT NULL DEFAULT 'note',
+          category VARCHAR(100) DEFAULT 'general', tags JSON DEFAULT NULL, priority TINYINT DEFAULT 0,
+          isActive BOOLEAN DEFAULT TRUE, createdBy VARCHAR(36) DEFAULT NULL, updatedBy VARCHAR(36) DEFAULT NULL,
+          metadata JSON DEFAULT NULL,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP, updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          FULLTEXT INDEX ft_kb_content (title, titleAr, content),
+          INDEX idx_kb_type (contentType, isActive), INDEX idx_kb_category (category, isActive)
+        )`);
+                }
+                catch (aiErr) {
+                    console.warn('⚠️ AI table fast-path creation warning:', aiErr === null || aiErr === void 0 ? void 0 : aiErr.message);
+                }
+                // ── Knowledge Base articles table (user-facing FAQ) ──
+                try {
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS kb_articles (
+          id VARCHAR(36) PRIMARY KEY,
+          question TEXT NOT NULL,
+          answer MEDIUMTEXT NOT NULL,
+          category VARCHAR(100) NOT NULL,
+          keywords JSON DEFAULT NULL,
+          attachments JSON DEFAULT NULL,
+          viewCount INT DEFAULT 0,
+          isFeatured BOOLEAN DEFAULT FALSE,
+          isActive BOOLEAN DEFAULT TRUE,
+          createdBy VARCHAR(36),
+          updatedBy VARCHAR(36),
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          FULLTEXT INDEX ft_kb_search (question, answer),
+          INDEX idx_kb_category (category, isActive),
+          INDEX idx_kb_featured (isFeatured, isActive)
+        )`);
+                }
+                catch (kbErr) {
+                    console.warn('⚠️ kb_articles fast-path creation warning:', kbErr === null || kbErr === void 0 ? void 0 : kbErr.message);
+                }
+                // ── WhatsApp Cloud API tables ──
+                try {
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS whatsapp_settings (
+          id            VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+          isEnabled     BOOLEAN DEFAULT FALSE,
+          phoneNumberId VARCHAR(100) NOT NULL DEFAULT '',
+          accessToken   TEXT NOT NULL,
+          wabaId        VARCHAR(100) NOT NULL DEFAULT '',
+          webhookToken  VARCHAR(255) NOT NULL DEFAULT '',
+          sendOnInvoiceConfirm BOOLEAN DEFAULT TRUE,
+          sendOnPaymentRecord  BOOLEAN DEFAULT TRUE,
+          sendPOSReceipt       BOOLEAN DEFAULT FALSE,
+          createdAt     DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )`);
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS whatsapp_message_log (
+          id              VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+          direction       ENUM('outbound','inbound') NOT NULL,
+          toPhone         VARCHAR(30),
+          fromPhone       VARCHAR(30),
+          messageType     ENUM('text','template','document','image') NOT NULL,
+          templateName    VARCHAR(100),
+          status          ENUM('pending','sent','delivered','read','failed') DEFAULT 'pending',
+          wamid           VARCHAR(200),
+          errorMessage    TEXT,
+          referenceType   VARCHAR(50),
+          referenceId     VARCHAR(36),
+          payload         JSON,
+          createdAt       DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt       DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_wa_log_ref (referenceType, referenceId),
+          INDEX idx_wa_log_status (status),
+          INDEX idx_wa_log_wamid (wamid)
+        )`);
+                }
+                catch (waErr) {
+                    console.warn('⚠️ WhatsApp table fast-path creation warning:', waErr === null || waErr === void 0 ? void 0 : waErr.message);
+                }
+                yield conn.query('SET FOREIGN_KEY_CHECKS = 1');
+                conn.release();
+                conn = null;
+                // Seed data (also fast - checks before inserting)
+                yield seedInitialData();
+                // NOTE: cleanupPhantomSafes() REMOVED on 2026-05-01 — it deletes accounts
+                // with hardcoded IDs (10102, 10202, 10203) which could exist legitimately
+                // in other client databases. Run manually via CLI if needed.
+                yield fixLongInvoiceNumbers();
+                yield fixDirtyInvoiceNumbers();
+                return;
+            }
+            console.log("Foreign key checks disabled for initialization");
+            // Force consistent collation for all new tables to match existing ones (MariaDB 12 fix)
+            // Without this, new tables may get a different default collation, causing errno 150 on FK constraints
+            yield conn.query("SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci");
+            yield conn.query("SET collation_connection = utf8mb4_unicode_ci");
             // Products Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS products (
@@ -131,6 +635,37 @@ function initDB() {
         leadTimeDays INT DEFAULT 0
       )
     `);
+            // Migration: Expand image column from TEXT (64KB) to LONGTEXT (4GB) for base64 images
+            yield conn.query(`ALTER TABLE products MODIFY COLUMN image LONGTEXT`).catch(() => { });
+            // FULLTEXT Search Indices
+            yield conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS search_vector TEXT GENERATED ALWAYS AS (REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(COALESCE(LOWER(name), ''), 'أ','ا'), 'إ','ا'), 'آ','ا'), 'ة','ه'), 'ى','ي'), 'ؤ','و'), 'ئ','ي')) STORED`).catch(() => { });
+            yield conn.query(`CREATE FULLTEXT INDEX IF NOT EXISTS ft_index_search_vector ON products(search_vector)`).catch(() => { });
+            // Migration: Add columns that may be missing in older schemas
+            // Note: Using try/catch instead of IF NOT EXISTS (MariaDB-only syntax)
+            yield conn.query(`ALTER TABLE products ADD COLUMN trackSerials BOOLEAN DEFAULT FALSE`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN trackInventory BOOLEAN DEFAULT TRUE`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN embedding JSON COMMENT 'Semantic 384-dimensional vector'`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN warrantyMonths INT DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN isActive BOOLEAN DEFAULT TRUE`).catch(() => { });
+            // Ceramic module columns
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramic_size VARCHAR(100)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramic_color VARCHAR(100)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramic_color_grade VARCHAR(100)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramic_color_desc VARCHAR(255)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramic_name VARCHAR(255)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramic_pattern VARCHAR(100)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramicItemDesc VARCHAR(255)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN ceramicGroup VARCHAR(100)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN minStock INT DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN description TEXT`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN avg_cost DECIMAL(15,2) DEFAULT 0`).catch(() => { });
+            // Variant Groups: link products to their variant group
+            yield conn.query(`ALTER TABLE products ADD COLUMN variantGroupId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`ALTER TABLE products ADD COLUMN variantAttributes JSON COMMENT '{"size":"XL","color":"red"}'`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_products_variantGroupId ON products(variantGroupId)`).catch(() => { });
+            // Subcategory support: optional child category under categoryId
+            yield conn.query(`ALTER TABLE products ADD COLUMN subcategoryId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_products_subcategoryId ON products(subcategoryId)`).catch(() => { });
             // Partners Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS partners (
@@ -167,6 +702,37 @@ function initDB() {
     `).catch(() => {
                 // Ignore error if column already exists
             });
+            // Add priceListId column to partners table for default price list assignment
+            yield conn.query(`
+      ALTER TABLE partners 
+      ADD COLUMN IF NOT EXISTS priceListId VARCHAR(36)
+    `).catch(() => {
+                // Ignore error if column already exists
+            });
+            // Add sequential code column to partners table (كود الشريك التسلسلي)
+            // Use VARCHAR(50) to support alphanumeric codes (was INT which caused overflow issues)
+            yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS code VARCHAR(50) DEFAULT NULL`).catch(() => { });
+            // Migrate INT -> VARCHAR if column already exists as INT
+            yield conn.query(`ALTER TABLE partners MODIFY COLUMN code VARCHAR(50) DEFAULT NULL`).catch(() => { });
+            // Backfill existing partners that don't have a code yet
+            try {
+                const [uncoded] = yield conn.query(`SELECT COUNT(*) as cnt FROM partners WHERE code IS NULL`);
+                if (((_b = uncoded[0]) === null || _b === void 0 ? void 0 : _b.cnt) > 0) {
+                    // Assign sequential codes ordered by name to existing partners
+                    yield conn.query(`
+          SET @row_number = (SELECT COALESCE(MAX(code), 0) FROM partners WHERE code IS NOT NULL)
+        `);
+                    yield conn.query(`
+          UPDATE partners SET code = (@row_number := @row_number + 1) WHERE code IS NULL ORDER BY name
+        `);
+                    console.log(`✅ Backfilled ${uncoded[0].cnt} partners with sequential codes`);
+                }
+            }
+            catch (e) {
+                console.warn('⚠️ Partner code backfill skipped:', e === null || e === void 0 ? void 0 : e.message);
+            }
+            // Add unique index on code (after backfill to avoid conflicts)
+            yield conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_code ON partners(code)`).catch(() => { });
             // Accounts Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS accounts (
@@ -178,6 +744,9 @@ function initDB() {
         openingBalance DECIMAL(15, 2) DEFAULT 0
       )
     `);
+            // Migration: Add subType column for schema-driven account classification
+            // Replaces fragile hardcoded code matching (e.g., a.code === '109') with explicit subtypes
+            yield conn.query(`ALTER TABLE accounts ADD COLUMN IF NOT EXISTS subType VARCHAR(50) DEFAULT NULL COMMENT 'Account classification: CASH, BANK, FIXED_ASSET, COGS, etc.'`).catch(() => { });
             // Invoices Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS invoices (
@@ -203,69 +772,437 @@ function initDB() {
         FOREIGN KEY (partnerId) REFERENCES partners(id) ON DELETE SET NULL
       )
     `);
-            // Add costCenterId column if it doesn't exist (migration for existing databases)
+            // ========================================
+            // BATCH: Invoice column migrations (run in parallel for speed)
+            // ========================================
+            yield Promise.all([
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS costCenterId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS priceListId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS paidAmount DECIMAL(15, 2) DEFAULT 0`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS salesmanId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS number VARCHAR(50)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS createdBy VARCHAR(255)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS referenceInvoiceId VARCHAR(36) COMMENT 'Links receipts to their source invoice'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS paymentBreakdown TEXT COMMENT 'JSON breakdown of payment methods'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS isPOSSale BOOLEAN DEFAULT FALSE`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS posShiftId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS globalDiscountType VARCHAR(20) DEFAULT 'FIXED'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS globalDiscountValue DECIMAL(15, 2) DEFAULT 0`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS currencyCode VARCHAR(10) DEFAULT 'EGP'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS exchangeRate DECIMAL(15, 6) DEFAULT 1`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS foreignTotal DECIMAL(15, 2) DEFAULT NULL`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bankTransfers TEXT COMMENT 'JSON array of bank transfer details'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS voucherCategory VARCHAR(50) DEFAULT NULL COMMENT 'supplier, expenses, employee_advance, labour, salary'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bankTransferReference VARCHAR(100) DEFAULT NULL COMMENT 'بند رقم عملية التحويل البنكي'`).catch(() => { }),
+                // Core columns that may be missing in older client databases
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes TEXT`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS dueDate DATETIME`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS taxAmount DECIMAL(15, 2) DEFAULT 0`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS whtAmount DECIMAL(15, 2) DEFAULT 0`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS shippingFee DECIMAL(15, 2) DEFAULT 0`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS globalDiscount DECIMAL(15, 2) DEFAULT 0`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS warehouseId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bankAccountId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bankName VARCHAR(100)`).catch(() => { }),
+            ]);
+            // BATCH: Invoice indexes (run in parallel)
+            yield Promise.all([
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_referenceInvoiceId ON invoices(referenceInvoiceId)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_pos_shift ON invoices(posShiftId)`).catch(() => { }),
+                // CONCURRENCY: Prevent duplicate invoice numbers when 10+ users create invoices simultaneously
+                conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_number_unique ON invoices(number)`).catch(() => { }),
+                // PERFORMANCE: Speed up partner statement queries & type-based filters
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_partnerId ON invoices(partnerId)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_type_date ON invoices(type, date)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_status ON invoices(status)`).catch(() => { }),
+                // COVERING INDEX: Speeds up the inv_agg subquery used to calculate partner balances.
+                // Covers: WHERE status, GROUP BY partnerId, and all SUM columns (type, paymentMethod, total, whtAmount)
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_balance_calc ON invoices(status, partnerId, type, paymentMethod, total, whtAmount)`).catch(() => { }),
+                // PERFORMANCE: Covering index for ORDER BY date DESC, number DESC with type filter
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_type_date_desc ON invoices(type, date DESC, number DESC)`).catch(() => { }),
+                // PERFORMANCE: partnerName for search queries
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_partnerName ON invoices(partnerName)`).catch(() => { }),
+                // PERFORMANCE: createdBy filter and unique creators dropdown
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_type_createdBy ON invoices(type, createdBy)`).catch(() => { }),
+                // PERFORMANCE: Payment method filter
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_paymentMethod ON invoices(paymentMethod)`).catch(() => { }),
+                // PERF: Customer last price lookup — joins invoices+invoice_lines by partnerId+type+date
+                // This query fires per line item when editing an invoice, causing N+1 when unindexed
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_partner_type_date ON invoices(partnerId, type, date DESC)`).catch(() => { }),
+                // PERF: sourceInvoiceId used for cascade delete checks and payment linkage
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_sourceInvoiceId ON invoices(sourceInvoiceId)`).catch(() => { }),
+                // PERF: bankTransferReference for bank statement batch lookup
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_bankTransferRef ON invoices(bankTransferReference)`).catch(() => { }),
+            ]);
+            // ═══════════════════════════════════════════════════════════
+            // CRITICAL PERFORMANCE INDEXES FOR 15+ CONCURRENT USERS
+            // These child tables are queried on every view/list/create
+            // Without indexes, every query does a FULL TABLE SCAN
+            // ═══════════════════════════════════════════════════════════
+            // Add notes to journal_entries to support manual notes
+            yield conn.query(`ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS notes TEXT`).catch(() => { });
+            yield Promise.all([
+                // invoice_lines — queried on every invoice list, detail, delete, update
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoice_lines_invoiceId ON invoice_lines(invoiceId)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoice_lines_productId ON invoice_lines(productId)`).catch(() => { }),
+                // PERF: Composite index for customer last price JOIN (invoiceId+productId in one index)
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoice_lines_product_invoice ON invoice_lines(productId, invoiceId)`).catch(() => { }),
+                // stock_permit_items — queried on every permit view/list
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_permit_items_permitId ON stock_permit_items(permitId)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_permit_items_productId ON stock_permit_items(productId)`).catch(() => { }),
+                // product_stocks — queried on every sale, purchase, permit, POS, production
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_product_stocks_productId_warehouseId ON product_stocks(productId, warehouseId)`).catch(() => { }),
+                // cheques — queried with invoice lists and partner statements
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_cheques_transactionId ON cheques(transactionId)`).catch(() => { }),
+                // stock_movements — queried in inventory reports, permit creation
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_movements_product_id ON stock_movements(product_id)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_movements_reference_id ON stock_movements(reference_id)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_movements_warehouse_id ON stock_movements(warehouse_id)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_movements_movement_date ON stock_movements(movement_date)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_movements_variant_id ON stock_movements(variant_id)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_movements_variant_warehouse ON stock_movements(variant_id, warehouse_id)`).catch(() => { }),
+                // stock_reservations — queried during dispatch
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_reservations_invoiceId ON stock_reservations(invoiceId)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_reservations_productId ON stock_reservations(productId)`).catch(() => { }),
+                // journal_lines — queried on every account view, trial balance, financial report
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_journal_lines_journalId ON journal_lines(journalId)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_journal_lines_accountId ON journal_lines(accountId)`).catch(() => { }),
+                // PERF: Covering index for bank statement & general ledger — avoids table lookups entirely
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_journal_lines_ledger_cover ON journal_lines(accountId, journalId, debit, credit, foreignDebit, foreignCredit, currencyCode, exchangeRate)`).catch(() => { }),
+                // PERF: Composite index on journal_entries for date range + id JOIN pattern
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_journal_entries_date_id ON journal_entries(date, id)`).catch(() => { }),
+                // PERF: referenceId used by cascade delete to find journals linked to invoices/vouchers
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_journal_entries_referenceId ON journal_entries(referenceId)`).catch(() => { }),
+                // products — queried during search, barcode scan
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_products_sku ON products(sku)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_products_name ON products(name(100))`).catch(() => { }),
+                // PERF v2: B-tree index on search_vector for Arabic-normalized LIKE queries
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_products_search_vector ON products(search_vector(100))`).catch(() => { }),
+            ]);
+            // ========================================
+            // POS CONFIG TABLES (shift definitions + devices)
+            // ========================================
+            yield Promise.all([
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_shift_definitions (
+          id VARCHAR(36) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          isDefault BOOLEAN DEFAULT FALSE,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_devices (
+          id VARCHAR(36) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          isDefault BOOLEAN DEFAULT FALSE,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `),
+            ]);
+            // ========================================
+            // POS SYSTEM TABLES (run in parallel - no dependencies between them)
+            // ========================================
+            yield Promise.all([
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_shifts (
+          id VARCHAR(36) PRIMARY KEY,
+          userId VARCHAR(36) NOT NULL,
+          warehouseId VARCHAR(36),
+          shiftDefinitionId VARCHAR(36),
+          deviceId VARCHAR(36),
+          terminalName VARCHAR(100),
+          openedAt DATETIME NOT NULL,
+          closedAt DATETIME,
+          openingCash DECIMAL(15,2) DEFAULT 0,
+          closingCash DECIMAL(15,2),
+          expectedCash DECIMAL(15,2),
+          variance DECIMAL(15,2),
+          closingCard DECIMAL(15,2),
+          expectedCard DECIMAL(15,2),
+          varianceCard DECIMAL(15,2),
+          totalSales DECIMAL(15,2) DEFAULT 0,
+          totalRefunds DECIMAL(15,2) DEFAULT 0,
+          salesCount INT DEFAULT 0,
+          refundCount INT DEFAULT 0,
+          closingRecipientType ENUM('EMPLOYEE', 'TREASURY') DEFAULT NULL,
+          closingRecipientId VARCHAR(36) DEFAULT NULL,
+          status ENUM('OPEN', 'CLOSED', 'VALIDATED', 'SUSPENDED') DEFAULT 'OPEN',
+          notes TEXT,
+          validatedBy VARCHAR(36),
+          validatedAt DATETIME,
+          validationNotes TEXT,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_pos_shifts_user (userId),
+          INDEX idx_pos_shifts_status (status),
+          INDEX idx_pos_shifts_opened (openedAt),
+          INDEX idx_pos_shifts_device (deviceId),
+          INDEX idx_pos_shifts_definition (shiftDefinitionId)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_cash_movements (
+          id VARCHAR(36) PRIMARY KEY,
+          shiftId VARCHAR(36) NOT NULL,
+          type ENUM('DEPOSIT', 'WITHDRAWAL', 'OPENING', 'SALE', 'REFUND', 'ADJUSTMENT', 'EXPENSE') NOT NULL,
+          amount DECIMAL(15,2) NOT NULL,
+          paymentMethod ENUM('CASH', 'BANK', 'CHEQUE', 'MIXED') DEFAULT 'CASH',
+          description TEXT,
+          referenceId VARCHAR(36),
+          referenceType VARCHAR(50),
+          approvedBy VARCHAR(36),
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_cash_movements_shift (shiftId),
+          INDEX idx_cash_movements_type (type)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_held_orders (
+          id VARCHAR(36) PRIMARY KEY,
+          shiftId VARCHAR(36) NOT NULL,
+          userId VARCHAR(36) NOT NULL,
+          customerId VARCHAR(36),
+          customerName VARCHAR(255),
+          orderData JSON NOT NULL,
+          holdNote TEXT,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_held_orders_shift (shiftId)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_favorites (
+          id VARCHAR(36) PRIMARY KEY,
+          userId VARCHAR(36),
+          productId VARCHAR(36) NOT NULL,
+          sortOrder INT DEFAULT 0,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY unique_user_product (userId, productId),
+          INDEX idx_favorites_user (userId),
+          INDEX idx_favorites_product (productId)
+        )
+      `),
+            ]);
+            // Ensure pos_shifts has the new fields (migration for existing DBs)
+            // Older MySQL/MariaDB do not support "ADD COLUMN IF NOT EXISTS", so we catch the duplicate column error
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN shiftDefinitionId VARCHAR(36)`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN deviceId VARCHAR(36)`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN closingRecipientType ENUM('EMPLOYEE', 'TREASURY') DEFAULT NULL`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN closingRecipientId VARCHAR(36) DEFAULT NULL`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN validatedBy VARCHAR(36)`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN validatedAt DATETIME`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN validationNotes TEXT`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN closingCard DECIMAL(15,2)`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN expectedCard DECIMAL(15,2)`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN varianceCard DECIMAL(15,2)`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE pos_shifts MODIFY COLUMN status ENUM('OPEN', 'CLOSED', 'PENDING_VALIDATION', 'VALIDATED', 'SUSPENDED') DEFAULT 'OPEN'`).catch(() => { });
+            // Migration: Widen paymentMethod from ENUM to VARCHAR(50) — the ENUM was too narrow
+            // (CASH, BANK, CHEQUE, MIXED, CREDIT) and silently truncated DEFERRED/TREASURY inserts
+            yield conn.query(`ALTER TABLE pos_cash_movements MODIFY COLUMN paymentMethod VARCHAR(50) DEFAULT 'CASH'`).catch(() => { });
+            // ========================================
+            // LOYALTY SYSTEM TABLES (نظام الولاء)
+            // ========================================
+            yield Promise.all([
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS loyalty_settings (
+          id VARCHAR(36) PRIMARY KEY,
+          balanceType ENUM('loyalty_points', 'package_balance') DEFAULT 'loyalty_points',
+          minimumRedemptionPoints INT NOT NULL DEFAULT 100 COMMENT 'Min points to redeem',
+          conversionRate DECIMAL(10,2) NOT NULL DEFAULT 1 COMMENT 'EGP value per redeemed point',
+          allowDecimals BOOLEAN DEFAULT FALSE COMMENT 'Allow decimal conversion rate?',
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS loyalty_rules (
+          id VARCHAR(36) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          status ENUM('active', 'inactive') DEFAULT 'active',
+          priority INT NOT NULL DEFAULT 1 COMMENT 'Higher number = higher priority',
+          customerClassification VARCHAR(50) DEFAULT NULL COMMENT 'Matches partners.classification',
+          accumulationRate DECIMAL(10,2) NOT NULL DEFAULT 10 COMMENT 'EGP per 1 loyalty point',
+          minimumSpend DECIMAL(15,2) DEFAULT NULL COMMENT 'Minimum invoice total to apply',
+          expiryDays INT DEFAULT NULL COMMENT 'Days until points expire',
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_loyalty_rules_status (status),
+          INDEX idx_loyalty_rules_priority (priority)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS loyalty_transactions (
+          id VARCHAR(36) PRIMARY KEY,
+          ruleId VARCHAR(36) DEFAULT NULL COMMENT 'Rule that triggered earning',
+          customerId VARCHAR(36) NOT NULL,
+          orderId VARCHAR(36) DEFAULT NULL COMMENT 'Invoice/order that triggered this',
+          type ENUM('EARN', 'REDEEM', 'ADJUST', 'EXPIRE', 'REFUND_CLAWBACK') NOT NULL,
+          points INT NOT NULL COMMENT 'Positive for earn/adjust-up, negative for redeem/clawback',
+          monetaryValue DECIMAL(15,2) DEFAULT 0 COMMENT 'EGP equivalent',
+          description TEXT,
+          createdBy VARCHAR(100),
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          expiresAt DATETIME DEFAULT NULL COMMENT 'When points expire (for EARN only)',
+          INDEX idx_loyalty_tx_customer (customerId),
+          INDEX idx_loyalty_tx_rule (ruleId),
+          INDEX idx_loyalty_tx_order (orderId),
+          INDEX idx_loyalty_tx_type (type),
+          INDEX idx_loyalty_tx_created (createdAt),
+          INDEX idx_loyalty_tx_expires (expiresAt)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS loyalty_point_consumptions (
+          id VARCHAR(36) PRIMARY KEY,
+          earnTransactionId VARCHAR(36) NOT NULL,
+          consumeTransactionId VARCHAR(36) NOT NULL,
+          pointsConsumed INT NOT NULL,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_loyalty_consumptions_earn (earnTransactionId),
+          INDEX idx_loyalty_consumptions_consume (consumeTransactionId),
+          FOREIGN KEY (earnTransactionId) REFERENCES loyalty_transactions(id) ON DELETE CASCADE,
+          FOREIGN KEY (consumeTransactionId) REFERENCES loyalty_transactions(id) ON DELETE CASCADE
+        )
+      `)
+            ]);
+            // Fallback settings if none exist
             yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS costCenterId VARCHAR(36)
-    `).catch(() => {
-                // Ignore error if column already exists (MySQL/MariaDB might not support IF NOT EXISTS)
-            });
-            // Add priceListId column if it doesn't exist (migration for existing databases)
+      INSERT INTO loyalty_settings (id, balanceType, minimumRedemptionPoints, conversionRate, allowDecimals)
+      SELECT 'default-settings-id', 'loyalty_points', 100, 1.00, FALSE
+      WHERE NOT EXISTS (SELECT id FROM loyalty_settings)
+    `).catch(() => { });
+            // Rename programId to ruleId in loyalty_transactions if it exists
+            yield conn.query(`ALTER TABLE loyalty_transactions CHANGE programId ruleId VARCHAR(36) DEFAULT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE loyalty_transactions ADD COLUMN IF NOT EXISTS expiresAt DATETIME DEFAULT NULL`).catch(() => { });
+            // ========================================
+            // PROMOTION ENGINE TABLES (محرك العروض والخصومات)
+            // ========================================
+            yield Promise.all([
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS promotions (
+          id VARCHAR(36) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          type ENUM('PERCENT_ORDER','FIXED_ORDER','BUY_X_GET_Y','MIN_SPEND','CATEGORY_DISCOUNT','PRODUCT_DISCOUNT') NOT NULL,
+          status ENUM('ACTIVE','PAUSED','ARCHIVED') DEFAULT 'ACTIVE',
+          \`trigger\` ENUM('AUTO','COUPON_CODE') DEFAULT 'AUTO',
+          couponCode VARCHAR(100) DEFAULT NULL,
+          discountValue DECIMAL(10,2) NOT NULL DEFAULT 0,
+          discountType ENUM('PERCENT','FIXED','FREE_PRODUCT') DEFAULT 'PERCENT',
+          maxUsageTotal INT DEFAULT NULL COMMENT 'NULL = unlimited',
+          maxUsagePerCustomer INT DEFAULT NULL COMMENT 'NULL = unlimited',
+          isCombainable BOOLEAN DEFAULT FALSE COMMENT 'Can stack with other promos',
+          priority INT DEFAULT 10 COMMENT 'Lower = evaluated first',
+          startDate DATETIME DEFAULT NULL,
+          endDate DATETIME DEFAULT NULL,
+          usageCount INT DEFAULT 0 COMMENT 'Derived counter, updated on each application',
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          createdBy VARCHAR(100),
+          INDEX idx_promotions_status (status),
+          INDEX idx_promotions_trigger (\`trigger\`),
+          INDEX idx_promotions_coupon (couponCode),
+          INDEX idx_promotions_dates (startDate, endDate)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS promo_rules (
+          id VARCHAR(36) PRIMARY KEY,
+          promotionId VARCHAR(36) NOT NULL,
+          ruleType ENUM('MIN_AMOUNT','MIN_QTY','PRODUCT_IN_CART','CATEGORY_IN_CART','CUSTOMER_GROUP','DAY_OF_WEEK','TIME_RANGE') NOT NULL,
+          targetValue TEXT NOT NULL COMMENT 'Product IDs, category IDs, amounts, day numbers, time ranges, etc.',
+          operator ENUM('GTE','EQ','IN','LTE') DEFAULT 'GTE',
+          INDEX idx_promo_rules_promotion (promotionId)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS promo_applications (
+          id VARCHAR(36) PRIMARY KEY,
+          promotionId VARCHAR(36) NOT NULL,
+          invoiceId VARCHAR(36) NOT NULL,
+          customerId VARCHAR(36) DEFAULT NULL,
+          discountApplied DECIMAL(15,2) NOT NULL DEFAULT 0,
+          appliedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          appliedBy VARCHAR(100),
+          INDEX idx_promo_app_promotion (promotionId),
+          INDEX idx_promo_app_invoice (invoiceId),
+          INDEX idx_promo_app_customer (customerId)
+        )
+      `),
+            ]);
+            // ========================================
+            // MEMBERSHIP SYSTEM TABLES (نظام الاشتراكات)
+            // ========================================
+            yield Promise.all([
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS membership_packages (
+          id VARCHAR(36) PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          price DECIMAL(15,2) NOT NULL DEFAULT 0,
+          duration INT NOT NULL COMMENT 'Duration in days',
+          included_balance INT NOT NULL DEFAULT 0 COMMENT 'Number of allowed sessions/visits',
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS memberships (
+          id VARCHAR(36) PRIMARY KEY,
+          customerId VARCHAR(36) NOT NULL,
+          packageId VARCHAR(36) NOT NULL,
+          description TEXT,
+          joinDate DATE NOT NULL,
+          endDate DATE,
+          status ENUM('pending', 'active', 'expired', 'suspended', 'cancelled') DEFAULT 'pending',
+          invoiceId VARCHAR(36) COMMENT 'The invoice used to pay for this membership/renewal',
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          INDEX idx_memberships_customer (customerId),
+          INDEX idx_memberships_status (status),
+          INDEX idx_memberships_dates (joinDate, endDate)
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS membership_freeze_periods (
+          id VARCHAR(36) PRIMARY KEY,
+          membershipId VARCHAR(36) NOT NULL,
+          freezeStart DATE NOT NULL,
+          freezeEnd DATE NOT NULL,
+          actualUnfreezeDate DATETIME DEFAULT NULL,
+          extendMembership BOOLEAN DEFAULT FALSE,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_membership_freeze (membershipId),
+          FOREIGN KEY (membershipId) REFERENCES memberships(id) ON DELETE CASCADE
+        )
+      `),
+                conn.query(`
+        CREATE TABLE IF NOT EXISTS membership_settings (
+          id INT PRIMARY KEY DEFAULT 1,
+          gracePeriodDays INT NOT NULL DEFAULT 0,
+          attendanceAllowedFor ENUM('active_only', 'active_and_grace') DEFAULT 'active_only',
+          createDraftInvoices BOOLEAN DEFAULT FALSE,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )
+      `)
+            ]);
+            // Seed default membership settings
             yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS priceListId VARCHAR(36)
-    `).catch(() => {
-                // Ignore error if column already exists
-            });
-            // Add paidAmount column if it doesn't exist
-            yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS paidAmount DECIMAL(15, 2) DEFAULT 0
-    `).catch(() => {
-                // Ignore error
-            });
-            // Add salesmanId column if it doesn't exist to track salesman per transaction
-            yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS salesmanId VARCHAR(36)
-    `).catch(() => {
-                // Ignore error
-            });
-            // Add number column for readable invoice numbers (VAN-2025-00001)
-            yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS number VARCHAR(50)
-    `).catch(() => {
-                // Ignore error
-            });
-            // Add createdBy column to track who created the invoice
-            yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS createdBy VARCHAR(255)
-    `).catch(() => {
-                // Ignore error
-            });
-            // Add referenceInvoiceId column to link treasury receipts to their source invoices
-            yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS referenceInvoiceId VARCHAR(36) COMMENT 'Links receipts to their source invoice'
-    `).catch(() => {
-                // Ignore error
-            });
-            // Add index on referenceInvoiceId for faster lookups
-            yield conn.query(`
-      CREATE INDEX IF NOT EXISTS idx_invoices_referenceInvoiceId ON invoices(referenceInvoiceId)
-    `).catch(() => {
-                // Ignore error if index exists
-            });
-            // Add paymentBreakdown column for detailed payment info
-            yield conn.query(`
-      ALTER TABLE invoices 
-      ADD COLUMN IF NOT EXISTS paymentBreakdown TEXT COMMENT 'JSON breakdown of payment methods'
-    `).catch(() => {
-                // Ignore error
-            });
-            // Invoice Lines Table
+      INSERT INTO membership_settings (id, gracePeriodDays, attendanceAllowedFor, createDraftInvoices)
+      SELECT 1, 0, 'active_only', FALSE
+      WHERE NOT EXISTS (SELECT id FROM membership_settings)
+    `).catch(() => { });
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS invoice_lines (
         id INT AUTO_INCREMENT PRIMARY KEY,
@@ -277,10 +1214,19 @@ function initDB() {
         cost DECIMAL(15, 2) DEFAULT 0,
         discount DECIMAL(15, 2) DEFAULT 0,
         total DECIMAL(15, 2) DEFAULT 0,
+        warehouseId VARCHAR(36) DEFAULT NULL COMMENT 'مخزن خاص بالصنف',
+        serials JSON DEFAULT NULL COMMENT 'أرقام تسلسلية للصنف',
         FOREIGN KEY (invoiceId) REFERENCES invoices(id) ON DELETE CASCADE,
         FOREIGN KEY (productId) REFERENCES products(id) ON DELETE SET NULL
       )
     `);
+            // Migration: Ensure invoice_lines.id has AUTO_INCREMENT (fixes "Field 'id' doesn't have a default value" error)
+            // This is needed for databases that were created with an older schema
+            yield conn.query(`
+      ALTER TABLE invoice_lines MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT
+    `).catch(() => {
+                // Ignore error - column is already correct or table structure differs
+            });
             // Deleted Invoices Table (Archive for audit trail and recovery)
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS deleted_invoices (
@@ -345,6 +1291,23 @@ function initDB() {
         referenceId VARCHAR(36)
       )
     `);
+            // DIAGNOSTIC: Verify journal_entries schema has the expected 'id' column
+            // This helps diagnose the 'Unknown column j.id' errors on some client servers
+            try {
+                const [jeColumns] = yield conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+         WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'journal_entries' 
+         ORDER BY ORDINAL_POSITION`);
+                const colNames = jeColumns.map((c) => c.COLUMN_NAME || c.column_name);
+                if (!colNames.includes('id')) {
+                    console.error('⚠️ CRITICAL: journal_entries table is MISSING the "id" column! Columns found:', colNames.join(', '));
+                }
+                else {
+                    console.log(`✅ journal_entries schema verified: ${colNames.length} columns, id present`);
+                }
+            }
+            catch (diagErr) {
+                console.warn('⚠️ Could not verify journal_entries schema:', diagErr);
+            }
             // Journal Lines Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS journal_lines (
@@ -359,6 +1322,25 @@ function initDB() {
         FOREIGN KEY (accountId) REFERENCES accounts(id) ON DELETE CASCADE
       )
     `);
+            // Migration: Ensure journal_lines.id has AUTO_INCREMENT
+            yield conn.query(`
+      ALTER TABLE journal_lines MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT
+    `).catch(() => { });
+            // Migration: Ensure deleted_invoice_lines.id has AUTO_INCREMENT
+            yield conn.query(`
+      ALTER TABLE deleted_invoice_lines MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT
+    `).catch(() => { });
+            // Migration: Ensure stock_permit_items.id has AUTO_INCREMENT
+            yield conn.query(`
+      ALTER TABLE stock_permit_items MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT
+    `).catch(() => { });
+            // Migration: Ensure stock_taking_items.id has AUTO_INCREMENT
+            yield conn.query(`
+      ALTER TABLE stock_taking_items MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT
+    `).catch(() => { });
+            // Migration: Add name and sku columns to stock_taking_items
+            yield conn.query(`ALTER TABLE stock_taking_items ADD COLUMN name VARCHAR(255) DEFAULT '' AFTER productId`).catch(() => { });
+            yield conn.query(`ALTER TABLE stock_taking_items ADD COLUMN sku VARCHAR(100) DEFAULT '' AFTER name`).catch(() => { });
             // Cheques Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS cheques (
@@ -437,6 +1419,16 @@ function initDB() {
         color VARCHAR(100)
       )
     `);
+            // Branch isolation: link each treasury/bank to a branch
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) COMMENT 'الفرع المالك للخزينة'`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_banks_branchId ON banks(branchId)`).catch(() => { });
+            // Payment Fees: per-bank fee configuration (رسوم الدفع)
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeEnabled BOOLEAN DEFAULT FALSE COMMENT 'تفعيل رسوم الدفع'`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeType VARCHAR(20) DEFAULT 'PERCENTAGE' COMMENT 'نوع الرسوم: PERCENTAGE / FIXED / BOTH'`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feePercentage DECIMAL(5,2) DEFAULT 0 COMMENT 'نسبة الرسوم'`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeFixedAmount DECIMAL(15,2) DEFAULT 0 COMMENT 'مبلغ ثابت للرسوم'`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeMinAmount DECIMAL(15,2) DEFAULT 0 COMMENT 'الحد الأدنى للرسوم'`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeTaxRate DECIMAL(5,2) DEFAULT 0 COMMENT 'نسبة الضريبة على الرسوم'`).catch(() => { });
             // Fixed Assets Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS fixed_assets (
@@ -481,6 +1473,12 @@ function initDB() {
         FOREIGN KEY (productId) REFERENCES products(id) ON DELETE SET NULL
       )
     `);
+            // Migrations: Add warehouse transfer columns to stock_permit_items (for existing databases)
+            yield conn.query(`ALTER TABLE stock_permit_items ADD COLUMN IF NOT EXISTS source_warehouse_id VARCHAR(36) DEFAULT NULL COMMENT 'مخزن المصدر للتحويل'`).catch(() => { });
+            yield conn.query(`ALTER TABLE stock_permit_items ADD COLUMN IF NOT EXISTS dest_warehouse_id VARCHAR(36) DEFAULT NULL COMMENT 'مخزن الوجهة للتحويل'`).catch(() => { });
+            // Migration: Add variant columns to stock_permit_items for variant-aware permits
+            yield conn.query(`ALTER TABLE stock_permit_items ADD COLUMN variantId VARCHAR(36) DEFAULT NULL COMMENT 'معرف التشكيلة'`).catch(() => { });
+            yield conn.query(`ALTER TABLE stock_permit_items ADD COLUMN variantLabel VARCHAR(255) DEFAULT NULL COMMENT 'اسم التشكيلة'`).catch(() => { });
             // Migrations for stock permit tables (for existing databases)
             yield conn.query(`
       ALTER TABLE stock_permits 
@@ -500,24 +1498,68 @@ function initDB() {
     `).catch(() => {
                 // Ignore error if column already exists
             });
+            // Stock Reservations Table (حجز المخزون)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS stock_reservations (
+        id VARCHAR(36) PRIMARY KEY,
+        invoiceId VARCHAR(36) NOT NULL,
+        invoiceNumber VARCHAR(50),
+        productId VARCHAR(36) NOT NULL,
+        productName VARCHAR(255),
+        warehouseId VARCHAR(36),
+        quantity DECIMAL(15,5) NOT NULL,
+        status ENUM('RESERVED','DISPATCHED','CANCELLED') DEFAULT 'RESERVED',
+        dispatchPermitId VARCHAR(36),
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_invoice (invoiceId),
+        INDEX idx_product (productId),
+        INDEX idx_status (status),
+        INDEX idx_warehouse (warehouseId)
+      )
+    `);
+            // Add reserved_stock column to product_stocks
+            yield conn.query(`
+      ALTER TABLE product_stocks ADD COLUMN IF NOT EXISTS reserved_stock DECIMAL(15,5) DEFAULT 0
+    `).catch(() => { });
+            // Migration: Add updatedAt and createdAt to core tables for delta sync support
+            const coreTables = ['products', 'partners', 'invoices', 'transactions'];
+            for (const table of coreTables) {
+                yield conn.query(`
+        ALTER TABLE ${table}
+        ADD COLUMN IF NOT EXISTS updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      `).catch(() => { });
+                yield conn.query(`
+        ALTER TABLE ${table}
+        ADD COLUMN IF NOT EXISTS createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+      `).catch(() => { });
+            }
             yield conn.query(`
       ALTER TABLE stock_permits 
-      ADD COLUMN IF NOT EXISTS createdBy VARCHAR(100)
-    `).catch(() => {
-                // Ignore error if column already exists
-            });
+      ADD COLUMN createdBy VARCHAR(100)
+    `).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
             yield conn.query(`
       ALTER TABLE stock_permit_items 
-      ADD COLUMN IF NOT EXISTS productName VARCHAR(255)
-    `).catch(() => {
-                // Ignore error if column already exists
-            });
+      ADD COLUMN productName VARCHAR(255)
+    `).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
             yield conn.query(`
       ALTER TABLE stock_permit_items 
-      ADD COLUMN IF NOT EXISTS driverName VARCHAR(255)
-    `).catch(() => {
-                // Ignore error if column already exists
-            });
+      ADD COLUMN driverName VARCHAR(255)
+    `).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            // Migration: Add returnCondition to invoice_lines for return invoice condition tracking (سليم/هالك)
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN returnCondition VARCHAR(20) DEFAULT NULL
+    `).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`
+      ALTER TABLE deleted_invoice_lines 
+      ADD COLUMN returnCondition VARCHAR(20) DEFAULT NULL
+    `).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
             // Users Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS users (
@@ -537,8 +1579,9 @@ function initDB() {
     `);
             // Add salesmanId column if it doesn't exist (for existing databases)
             yield conn.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS salesmanId VARCHAR(36)
-    `).catch(() => { });
+      ALTER TABLE users ADD COLUMN salesmanId VARCHAR(36)
+    `).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
             // System Config Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS system_config (
@@ -587,6 +1630,16 @@ function initDB() {
     `).catch(() => {
                 // Ignore error if column already exists
             });
+            // ═══════════════════════════════════════════════════════════
+            // BRANCH ISOLATION: Link users to branches for strict data isolation
+            // CASHIER/SALES see only their branch's warehouses + treasury
+            // ADMIN/MANAGER see everything across all branches
+            // ═══════════════════════════════════════════════════════════
+            yield conn.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS branchId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_users_branchId ON users(branchId)`).catch(() => { });
+            // Smart Attendance: Link users to employees for login-based attendance
+            yield conn.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employeeId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`CREATE INDEX IF NOT EXISTS idx_users_employeeId ON users(employeeId)`).catch(() => { });
             // Taxes Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS taxes (
@@ -628,6 +1681,23 @@ function initDB() {
     `).catch(() => {
                 // Ignore error
             });
+            // ========================================
+            // TEAM CHAT (دردشة الفريق - persistent)
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id VARCHAR(100) PRIMARY KEY,
+        userId VARCHAR(100) NOT NULL,
+        userName VARCHAR(255) NOT NULL,
+        message TEXT NOT NULL,
+        type VARCHAR(20) DEFAULT 'message',
+        targetUserId VARCHAR(100) DEFAULT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_chat_timestamp (timestamp),
+        INDEX idx_chat_type (type),
+        INDEX idx_chat_private (userId, targetUserId)
+      )
+    `);
             // Stock Taking Sessions Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS stock_taking_sessions (
@@ -643,6 +1713,8 @@ function initDB() {
         id INT AUTO_INCREMENT PRIMARY KEY,
         sessionId VARCHAR(36) NOT NULL,
         productId VARCHAR(36),
+        name VARCHAR(255) DEFAULT '',
+        sku VARCHAR(100) DEFAULT '',
         systemStock INT DEFAULT 0,
         actualStock INT DEFAULT 0,
         cost DECIMAL(15, 2) DEFAULT 0,
@@ -664,6 +1736,9 @@ function initDB() {
         phone VARCHAR(50)
       )
     `);
+            // Branch isolation: default warehouse and treasury per branch
+            yield conn.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS defaultWarehouseId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS defaultBankId VARCHAR(36) COMMENT 'الخزينة الافتراضية للفرع'`).catch(() => { });
             // Warehouses Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS warehouses (
@@ -722,7 +1797,7 @@ function initDB() {
     `).catch(() => { });
             yield conn.query(`
       ALTER TABLE invoice_lines 
-      ADD COLUMN IF NOT EXISTS unitName VARCHAR(50) COMMENT 'اسم الوحدة'
+      ADD COLUMN IF NOT EXISTS unitName VARCHAR(100) COMMENT 'اسم الوحدة'
     `).catch(() => { });
             yield conn.query(`
       ALTER TABLE invoice_lines 
@@ -730,8 +1805,73 @@ function initDB() {
     `).catch(() => { });
             yield conn.query(`
       ALTER TABLE invoice_lines 
-      ADD COLUMN IF NOT EXISTS baseQuantity DECIMAL(15,3) COMMENT 'الكمية بالوحدة الأساسية'
+      ADD COLUMN IF NOT EXISTS baseQuantity DECIMAL(15,4) COMMENT 'الكمية بالوحدة الأساسية'
     `).catch(() => { });
+            // Migration: Add warehouseId to invoice_lines for per-item warehouse selection
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS warehouseId VARCHAR(36) DEFAULT NULL COMMENT 'مخزن خاص بالصنف'
+    `).catch(() => { });
+            // Migration: Add serials to invoice_lines for serial number tracking
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS serials JSON DEFAULT NULL COMMENT 'أرقام تسلسلية للصنف'
+    `).catch(() => { });
+            // Migration: Add bonusQty to invoice_lines for supplier free goods tracking
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS bonusQty DECIMAL(15, 2) DEFAULT 0
+    `).catch(() => { });
+            // Migration: Add grade to invoice_lines for product grade classification (الفرز)
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS grade VARCHAR(20) DEFAULT NULL COMMENT 'الفرز: أول / ثاني / ثالث'
+    `).catch(() => { });
+            // Migration: Add discountType and discountValue to invoice_lines for percentage discounts
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS discountType VARCHAR(10) DEFAULT 'FIXED'
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS discountValue DECIMAL(15, 2) DEFAULT 0
+    `).catch(() => { });
+            // Migration: Add priceListId to invoice_lines for per-item pricing
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS priceListId VARCHAR(36) NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE deleted_invoice_lines 
+      ADD COLUMN IF NOT EXISTS priceListId VARCHAR(36) NULL
+    `).catch(() => { });
+            // Migration: Add notes to invoice_lines for per-line item notes
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT NULL COMMENT 'ملاحظات السطر'
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE deleted_invoice_lines 
+      ADD COLUMN IF NOT EXISTS notes TEXT DEFAULT NULL COMMENT 'ملاحظات السطر'
+    `).catch(() => { });
+            // Migration: Add variantId to invoice_lines for embedded variant stock tracking (تتبع مخزون التشكيلات)
+            yield conn.query(`
+      ALTER TABLE invoice_lines 
+      ADD COLUMN variantId VARCHAR(36) DEFAULT NULL COMMENT 'معرف التشكيلة'
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE deleted_invoice_lines 
+      ADD COLUMN variantId VARCHAR(36) DEFAULT NULL COMMENT 'معرف التشكيلة'
+    `).catch(() => { });
+            // Migration: Add all missing invoice_lines columns queried by invoiceController
+            for (const tbl of ['invoice_lines', 'deleted_invoice_lines']) {
+                yield conn.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS returnCondition VARCHAR(50) DEFAULT NULL`).catch(() => { });
+                yield conn.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS returnQuantity DECIMAL(15,4) DEFAULT 0`).catch(() => { });
+                yield conn.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS serialNumbers TEXT DEFAULT NULL`).catch(() => { });
+                yield conn.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS warehouseId VARCHAR(36) DEFAULT NULL`).catch(() => { });
+                yield conn.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS unitId VARCHAR(36) DEFAULT NULL`).catch(() => { });
+                yield conn.query(`ALTER TABLE ${tbl} ADD COLUMN IF NOT EXISTS unitName VARCHAR(100) DEFAULT NULL`).catch(() => { });
+            }
             // Migration: Add multi-unit columns to products table
             yield conn.query(`
       ALTER TABLE products
@@ -747,16 +1887,103 @@ function initDB() {
         id VARCHAR(36) PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         type VARCHAR(50),
-        description TEXT
+        description TEXT,
+        color VARCHAR(20)
       )
     `);
+            // Migration: Add color column to partner_groups for existing databases
+            yield conn.query(`
+      ALTER TABLE partner_groups 
+      ADD COLUMN IF NOT EXISTS color VARCHAR(20)
+    `).catch(() => { });
             // (Branches and Warehouses tables already created above)
             // Categories Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS categories (
         id VARCHAR(36) PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
-        description TEXT
+        description TEXT,
+        parentId VARCHAR(36),
+        icon VARCHAR(255),
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Migrations for existing databases
+            yield conn.query(`
+      ALTER TABLE categories 
+      ADD COLUMN IF NOT EXISTS parentId VARCHAR(36)
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE categories 
+      ADD COLUMN IF NOT EXISTS icon VARCHAR(255)
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE categories 
+      ADD COLUMN IF NOT EXISTS createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE categories 
+      ADD COLUMN IF NOT EXISTS updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    `).catch(() => { });
+            // Manufacturers Table (اسم الشركه المنتجه)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS manufacturers (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Sizes Table (المقاسات)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS sizes (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Colors Table (الألوان)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS colors (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Specifications Table (التوصيف)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS specifications (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Item Descriptions Table (الوصف)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS item_descriptions (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Product Groups Table (المجموعات)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS product_groups (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `);
             // Salesmen Table
@@ -932,7 +2159,120 @@ function initDB() {
                     console.log('ℹ️ audit_logs.description column already exists or migration skipped');
                 }
             }
-            // Payment Allocations Table
+            // Migration: Add ip_address column to audit_logs for tracking
+            yield conn.query(`
+      ALTER TABLE audit_logs 
+      ADD COLUMN IF NOT EXISTS ip_address VARCHAR(45) DEFAULT NULL COMMENT 'عنوان IP'
+    `).catch(() => { });
+            // Migration: Add composite index for audit log filtering performance
+            try {
+                yield conn.query('CREATE INDEX idx_audit_logs_date_user ON audit_logs(date, user)');
+            }
+            catch (e) { /* Ignore if exists */ }
+            try {
+                yield conn.query('CREATE INDEX idx_audit_logs_module_action ON audit_logs(module, action)');
+            }
+            catch (e) { /* Ignore if exists */ }
+            // ========================================
+            // AI INTELLIGENCE ENGINE TABLES (Dax)
+            // ========================================
+            // AI Chat Messages Table (المساعد الذكي)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS ai_chat_messages (
+        id VARCHAR(36) PRIMARY KEY,
+        userId VARCHAR(36) NOT NULL,
+        role ENUM('user','assistant') NOT NULL DEFAULT 'user',
+        message TEXT NOT NULL,
+        intent VARCHAR(50) DEFAULT NULL,
+        contextSummary VARCHAR(500) DEFAULT NULL,
+        createdAt DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_ai_chat_user (userId, createdAt)
+      )
+    `);
+            // Migration: Add sessionId for conversation threading
+            yield conn.query(`
+      ALTER TABLE ai_chat_messages
+      ADD COLUMN IF NOT EXISTS sessionId VARCHAR(36) DEFAULT NULL
+    `).catch(() => { });
+            try {
+                yield conn.query('CREATE INDEX idx_ai_chat_session ON ai_chat_messages(sessionId, createdAt)');
+            }
+            catch (e) { /* exists */ }
+            // Migration: Add feedback columns for response quality tracking
+            yield conn.query(`
+      ALTER TABLE ai_chat_messages
+      ADD COLUMN IF NOT EXISTS feedback ENUM('positive','negative','corrected') DEFAULT NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE ai_chat_messages
+      ADD COLUMN IF NOT EXISTS feedbackNote TEXT DEFAULT NULL
+    `).catch(() => { });
+            // Migration: Add provider + model tracking per message
+            yield conn.query(`
+      ALTER TABLE ai_chat_messages
+      ADD COLUMN IF NOT EXISTS provider VARCHAR(20) DEFAULT NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE ai_chat_messages
+      ADD COLUMN IF NOT EXISTS model VARCHAR(100) DEFAULT NULL
+    `).catch(() => { });
+            // AI Chat Sessions — Persistent conversation memory (replaces in-memory Map)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS ai_chat_sessions (
+        id VARCHAR(36) PRIMARY KEY,
+        userId VARCHAR(36) NOT NULL,
+        lastIntent VARCHAR(50) DEFAULT 'general',
+        lastPartnerId VARCHAR(36) DEFAULT NULL,
+        lastPartnerName VARCHAR(255) DEFAULT NULL,
+        lastEntityType VARCHAR(20) DEFAULT NULL,
+        lastTopic VARCHAR(50) DEFAULT NULL,
+        conversationTone VARCHAR(10) DEFAULT 'ar',
+        metadata JSON DEFAULT NULL,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_ai_session_user (userId, updatedAt)
+      )
+    `);
+            // AI Usage Log — Token consumption & latency tracking per request
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS ai_usage_log (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        userId VARCHAR(36) DEFAULT NULL,
+        provider VARCHAR(20) NOT NULL,
+        model VARCHAR(100) NOT NULL,
+        intent VARCHAR(50) DEFAULT NULL,
+        inputTokensEst INT DEFAULT 0,
+        outputTokensEst INT DEFAULT 0,
+        latencyMs INT DEFAULT 0,
+        cached BOOLEAN DEFAULT FALSE,
+        error BOOLEAN DEFAULT FALSE,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_ai_usage_daily (createdAt, provider),
+        INDEX idx_ai_usage_user (userId, createdAt)
+      )
+    `);
+            // AI Knowledge Base — Phase 3: RAG searchable knowledge for Dax
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS ai_knowledge_base (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        title VARCHAR(255) NOT NULL,
+        titleAr VARCHAR(255) DEFAULT NULL,
+        content MEDIUMTEXT NOT NULL,
+        contentType ENUM('policy', 'procedure', 'faq', 'report', 'manual', 'note') NOT NULL DEFAULT 'note',
+        category VARCHAR(100) DEFAULT 'general',
+        tags JSON DEFAULT NULL,
+        priority TINYINT DEFAULT 0,
+        isActive BOOLEAN DEFAULT TRUE,
+        createdBy VARCHAR(36) DEFAULT NULL,
+        updatedBy VARCHAR(36) DEFAULT NULL,
+        metadata JSON DEFAULT NULL,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FULLTEXT INDEX ft_kb_content (title, titleAr, content),
+        INDEX idx_kb_type (contentType, isActive),
+        INDEX idx_kb_category (category, isActive)
+      )
+    `);
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS payment_allocations (
         id VARCHAR(36) PRIMARY KEY,
@@ -990,6 +2330,13 @@ function initDB() {
         UNIQUE KEY unique_bom_product (bom_id, raw_product_id)
       )
     `);
+            // Migration: Add supplier_id to bom_items for BOM supplier assignment
+            yield conn.query(`
+      ALTER TABLE bom_items 
+      ADD COLUMN IF NOT EXISTS supplier_id VARCHAR(36) DEFAULT NULL
+    `).catch(() => {
+                // Ignore error if column already exists
+            });
             // Production Orders Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS production_orders (
@@ -1029,6 +2376,120 @@ function initDB() {
             yield conn.query(`
       ALTER TABLE production_orders 
       ADD COLUMN IF NOT EXISTS dest_warehouse_id VARCHAR(36)
+    `).catch(() => { });
+            // ========================================
+            // PACKAGING ORDERS (التعبئة والتغليف)
+            // ========================================
+            try {
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS packaging_orders (
+          id VARCHAR(36) PRIMARY KEY,
+          order_number VARCHAR(50) UNIQUE NOT NULL,
+          production_order_id VARCHAR(36),
+          product_id VARCHAR(36) NOT NULL,
+          product_name VARCHAR(255),
+          qty_to_package DECIMAL(15,3) NOT NULL,
+          qty_packaged DECIMAL(15,3) DEFAULT 0,
+          status ENUM('DRAFT', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED') DEFAULT 'DRAFT',
+          warehouse_id VARCHAR(36),
+          total_material_cost DECIMAL(15,2) DEFAULT 0,
+          total_packaging_cost DECIMAL(15,2) DEFAULT 0,
+          total_labor_cost DECIMAL(15,2) DEFAULT 0,
+          total_overhead_cost DECIMAL(15,2) DEFAULT 0,
+          grand_total_cost DECIMAL(15,2) DEFAULT 0,
+          cost_per_unit DECIMAL(15,4) DEFAULT 0,
+          notes TEXT,
+          created_by VARCHAR(100),
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+          completed_at TIMESTAMP NULL,
+          FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE RESTRICT,
+          INDEX idx_pkg_status (status),
+          INDEX idx_pkg_order_number (order_number),
+          INDEX idx_pkg_product (product_id),
+          INDEX idx_pkg_production (production_order_id),
+          INDEX idx_pkg_created_at (created_at)
+        )
+      `);
+                // Migration: Add flat packaging columns to packaging_orders
+                yield conn.query(`
+        ALTER TABLE packaging_orders 
+        ADD COLUMN IF NOT EXISTS input_product_id VARCHAR(36) DEFAULT NULL
+      `).catch(() => { });
+                yield conn.query(`
+        ALTER TABLE packaging_orders 
+        ADD COLUMN IF NOT EXISTS input_qty DECIMAL(15,3) DEFAULT 0
+      `).catch(() => { });
+                yield conn.query(`
+        ALTER TABLE packaging_orders 
+        ADD COLUMN IF NOT EXISTS materials_json JSON DEFAULT NULL
+      `).catch(() => { });
+                // Migration: Add production_order_id to packaging_orders for linking to source production orders
+                yield conn.query(`
+        ALTER TABLE packaging_orders 
+        ADD COLUMN IF NOT EXISTS production_order_id VARCHAR(36) DEFAULT NULL
+      `).catch(() => { });
+                try {
+                    yield conn.query('CREATE INDEX idx_pkg_prod_order ON packaging_orders(production_order_id)');
+                }
+                catch (e) { /* Ignore if exists */ }
+                // Packaging Levels (مستويات التعبئة - Hierarchical packaging steps - LEGACY, kept for migration)
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS packaging_levels (
+          id VARCHAR(36) PRIMARY KEY,
+          packaging_order_id VARCHAR(36) NOT NULL,
+          level_order INT NOT NULL DEFAULT 1,
+          level_name VARCHAR(255) NOT NULL,
+          packaging_material_id VARCHAR(36),
+          packaging_material_name VARCHAR(255),
+          qty_per_unit DECIMAL(15,3) DEFAULT 1,
+          units_per_package DECIMAL(15,3) DEFAULT 1,
+          total_packages DECIMAL(15,3) DEFAULT 0,
+          material_cost DECIMAL(15,2) DEFAULT 0,
+          labor_cost DECIMAL(15,2) DEFAULT 0,
+          level_total_cost DECIMAL(15,2) DEFAULT 0,
+          notes TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (packaging_order_id) REFERENCES packaging_orders(id) ON DELETE CASCADE,
+          INDEX idx_pkg_level_order (packaging_order_id, level_order)
+        )
+      `);
+            }
+            catch (pkgErr) {
+                console.warn('⚠️ Packaging tables skipped (FK mismatch - run FIX_HOSTINGER_FK.sql in phpMyAdmin):', pkgErr.message);
+            }
+            // Packaging Order Levels (flat input→output per order)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS packaging_order_levels (
+        id VARCHAR(36) PRIMARY KEY,
+        packaging_order_id VARCHAR(36) NOT NULL,
+        level_index INT NOT NULL DEFAULT 1,
+        input_product_id VARCHAR(36) NOT NULL,
+        output_product_id VARCHAR(36) NOT NULL,
+        input_qty DECIMAL(15,3) NOT NULL DEFAULT 0,
+        output_qty DECIMAL(15,3) NOT NULL DEFAULT 0,
+        material_cost DECIMAL(15,2) DEFAULT 0,
+        packaging_cost DECIMAL(15,2) DEFAULT 0,
+        total_cost DECIMAL(15,2) DEFAULT 0,
+        unit_cost DECIMAL(15,4) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (packaging_order_id) REFERENCES packaging_orders(id) ON DELETE CASCADE,
+        INDEX idx_pkg_level_order_id (packaging_order_id)
+      )
+    `).catch(() => { });
+            // Packaging Order Materials (packaging materials per level)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS packaging_order_materials (
+        id VARCHAR(36) PRIMARY KEY,
+        level_id VARCHAR(36) NOT NULL,
+        product_id VARCHAR(36) NOT NULL,
+        quantity DECIMAL(15,3) NOT NULL DEFAULT 0,
+        unit_cost DECIMAL(15,2) DEFAULT 0,
+        total_cost DECIMAL(15,2) DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (level_id) REFERENCES packaging_order_levels(id) ON DELETE CASCADE,
+        INDEX idx_pkg_mat_level (level_id)
+      )
     `).catch(() => { });
             // Migration: Add indexes to partners table for performance
             try {
@@ -1178,6 +2639,25 @@ function initDB() {
                 yield conn.query('CREATE INDEX idx_journal_entries_salesmanId ON journal_entries(salesmanId)');
             }
             catch (e) { /* Ignore if exists */ }
+            // Migration: Add currencyCode and exchangeRate to journal_entries for multi-currency support
+            yield conn.query(`
+      ALTER TABLE journal_entries 
+      ADD COLUMN IF NOT EXISTS currencyCode VARCHAR(10) DEFAULT 'EGP'
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE journal_entries 
+      ADD COLUMN IF NOT EXISTS exchangeRate DECIMAL(18, 6) DEFAULT 1
+    `).catch(() => { });
+            // Migration: Add denominations column to journal_entries for cash denomination report
+            yield conn.query(`
+      ALTER TABLE journal_entries 
+      ADD COLUMN IF NOT EXISTS denominations JSON
+    `).catch(() => { });
+            // Migration: Add transactionId column to cheques for linking cheques to invoices/receipts
+            yield conn.query(`
+      ALTER TABLE cheques 
+      ADD COLUMN IF NOT EXISTS transactionId VARCHAR(36)
+    `).catch(() => { });
             // Migration: Add createdBy to other tables
             const tablesToAddCreatedBy = ['invoices', 'cheques', 'stock_permits'];
             for (const table of tablesToAddCreatedBy) {
@@ -1225,6 +2705,12 @@ function initDB() {
         INDEX idx_reference (reference_type, reference_id)
       )
     `);
+            // Migration: Ensure stock_movements.id has AUTO_INCREMENT (fixes "Field 'id' doesn't have a default value" error)
+            yield conn.query(`
+      ALTER TABLE stock_movements MODIFY COLUMN id INT NOT NULL AUTO_INCREMENT
+    `).catch(() => {
+                // Ignore error - column is already correct
+            });
             // ========================================
             // MANUFACTURING MODULE MIGRATIONS
             // Added: 2025-12-09 for production batch tracking
@@ -1233,6 +2719,11 @@ function initDB() {
             yield conn.query(`
       ALTER TABLE stock_movements 
       ADD COLUMN IF NOT EXISTS batch_id VARCHAR(50)
+    `).catch(() => { });
+            // Migration: Add variant_id to stock_movements for variant-level audit trail
+            yield conn.query(`
+      ALTER TABLE stock_movements
+      ADD COLUMN variant_id VARCHAR(36) DEFAULT NULL COMMENT 'معرف التشكيلة'
     `).catch(() => { });
             // Migration: Add finished_batch_id to production_orders
             yield conn.query(`
@@ -1532,7 +3023,7 @@ function initDB() {
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_payroll (payrollId),
         INDEX idx_employee (employeeId)
-      )
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
     `);
             // Attendance Records Table
             yield conn.query(`
@@ -1549,12 +3040,66 @@ function initDB() {
         earlyLeaveMinutes INT DEFAULT 0,
         scheduledCheckIn TIME DEFAULT '09:00:00',
         scheduledCheckOut TIME DEFAULT '17:00:00',
+        source ENUM('MANUAL', 'SMART', 'FINGERPRINT') DEFAULT 'MANUAL',
         notes TEXT,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE KEY unique_daily_attendance (employeeId, date),
         INDEX idx_date (date)
       )
     `);
+            // Migration: Add source column to attendance_records
+            yield conn.query(`
+      ALTER TABLE attendance_records 
+      ADD COLUMN IF NOT EXISTS source ENUM('MANUAL', 'SMART', 'FINGERPRINT') DEFAULT 'MANUAL'
+    `).catch(() => { });
+            // ════════════════════════════════════════════════════════════
+            // SMART ATTENDANCE (تسجيل حضور ذكي — بدون بصمة)
+            // GPS geofencing + device fingerprint for clients without
+            // fingerprint machines. Feeds into attendance_records.
+            // ════════════════════════════════════════════════════════════
+            // Office geofences — one per branch/location
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS attendance_locations (
+        id VARCHAR(36) PRIMARY KEY,
+        branchId VARCHAR(36),
+        name VARCHAR(255) NOT NULL,
+        latitude DECIMAL(10, 8) NOT NULL,
+        longitude DECIMAL(11, 8) NOT NULL,
+        radiusMeters INT DEFAULT 200,
+        isActive BOOLEAN DEFAULT TRUE,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_branch (branchId)
+      ) ENGINE=InnoDB;
+    `);
+            // Raw smart check-in punches (immutable audit trail)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS smart_attendance_punches (
+        id VARCHAR(36) PRIMARY KEY,
+        employeeId VARCHAR(36) NOT NULL,
+        userId VARCHAR(36) NOT NULL,
+        punchTime DATETIME NOT NULL,
+        punchType ENUM('CHECK_IN', 'CHECK_OUT') DEFAULT 'CHECK_IN',
+        gpsLatitude DECIMAL(10, 8),
+        gpsLongitude DECIMAL(11, 8),
+        gpsAccuracyMeters INT,
+        matchedLocationId VARCHAR(36),
+        gpsDistanceMeters INT,
+        deviceFingerprint VARCHAR(255),
+        ipAddress VARCHAR(45),
+        userAgent TEXT,
+        confidenceScore INT DEFAULT 0,
+        verificationStatus ENUM('AUTO_APPROVED', 'PENDING_REVIEW', 'REJECTED', 'MANUALLY_APPROVED', 'MANUALLY_REJECTED') DEFAULT 'PENDING_REVIEW',
+        reviewedBy VARCHAR(36),
+        reviewedAt DATETIME,
+        reviewNotes TEXT,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_employee (employeeId),
+        INDEX idx_date (punchTime),
+        INDEX idx_status (verificationStatus)
+      ) ENGINE=InnoDB;
+    `);
+            // Migration: Add source column to attendance_records to track origin
+            yield conn.query(`ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS source ENUM('FINGERPRINT', 'SMART', 'MANUAL') DEFAULT 'MANUAL'`).catch(() => { });
             // Employee Advances / Loans Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS employee_advances (
@@ -1598,6 +3143,130 @@ function initDB() {
         UNIQUE KEY unique_employee_template (employeeId, templateId)
       )
     `);
+            // ========================================
+            // WEEKLY PAYROLL SUPPORT MIGRATIONS
+            // ========================================
+            yield conn.query(`ALTER TABLE payroll_cycles ADD COLUMN payrollType ENUM('MONTHLY', 'WEEKLY') DEFAULT 'MONTHLY'`)
+                .then(() => console.log('✅ Added payrollType column to payroll_cycles'))
+                .catch(() => { });
+            yield conn.query(`ALTER TABLE payroll_cycles ADD COLUMN weekNumber INT NULL`)
+                .then(() => console.log('✅ Added weekNumber column to payroll_cycles'))
+                .catch(() => { });
+            yield conn.query(`ALTER TABLE payroll_cycles ADD COLUMN startDate DATE NULL`)
+                .then(() => console.log('✅ Added startDate column to payroll_cycles'))
+                .catch(() => { });
+            yield conn.query(`ALTER TABLE payroll_cycles ADD COLUMN endDate DATE NULL`)
+                .then(() => console.log('✅ Added endDate column to payroll_cycles'))
+                .catch(() => { });
+            // Migration: Update unique constraint to allow weekly + monthly in same month
+            try {
+                yield conn.query(`ALTER TABLE payroll_cycles DROP INDEX unique_period`);
+                yield conn.query(`ALTER TABLE payroll_cycles ADD UNIQUE KEY unique_period (month, year, payrollType, weekNumber)`);
+                console.log('✅ Updated payroll_cycles unique constraint for weekly support');
+            }
+            catch (e) {
+                // Constraint might already be updated or might not exist
+            }
+            yield conn.query(`ALTER TABLE employees MODIFY COLUMN employmentType ENUM('MONTHLY', 'DAILY', 'WEEKLY') DEFAULT 'MONTHLY'`)
+                .then(() => console.log('✅ Added WEEKLY to employees.employmentType ENUM'))
+                .catch(() => { });
+            console.log('✅ Weekly payroll migrations complete');
+            // ========================================
+            // FINGERPRINT DEVICE INTEGRATION TABLES
+            // ========================================
+            // Employee columns for biometric integration
+            yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS fingerprintId VARCHAR(50) DEFAULT NULL COMMENT 'Device enrollment number'`).catch(() => { });
+            yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS scheduledCheckIn TIME DEFAULT '09:00:00' COMMENT 'Employee scheduled start time'`).catch(() => { });
+            yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS scheduledCheckOut TIME DEFAULT '17:00:00' COMMENT 'Employee scheduled end time'`).catch(() => { });
+            // Fingerprint Devices Registry
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS fingerprint_devices (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        ip VARCHAR(45) NOT NULL,
+        port INT DEFAULT 4370,
+        serialNumber VARCHAR(100),
+        model VARCHAR(100),
+        isActive TINYINT(1) DEFAULT 1,
+        lastSyncAt DATETIME,
+        lastSyncStatus VARCHAR(20),
+        lastSyncMessage TEXT,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_device_ip (ip, port)
+      )
+    `);
+            // Device User ↔ ERP Employee Mapping
+            try {
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS fingerprint_mappings (
+          id VARCHAR(36) PRIMARY KEY,
+          deviceId VARCHAR(36) NOT NULL,
+          deviceUserId VARCHAR(50) NOT NULL,
+          deviceUserName VARCHAR(100),
+          employeeId VARCHAR(36) NOT NULL,
+          createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_device_employee (deviceId, deviceUserId),
+          UNIQUE KEY uq_device_erp_employee (deviceId, employeeId),
+          FOREIGN KEY (deviceId) REFERENCES fingerprint_devices(id) ON DELETE CASCADE,
+          FOREIGN KEY (employeeId) REFERENCES employees(id) ON DELETE CASCADE
+        )
+      `);
+            }
+            catch (_f) {
+                // FK mismatch on Hostinger — create without FK constraints
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS fingerprint_mappings (
+          id VARCHAR(36) PRIMARY KEY,
+          deviceId VARCHAR(36) NOT NULL,
+          deviceUserId VARCHAR(50) NOT NULL,
+          deviceUserName VARCHAR(100),
+          employeeId VARCHAR(36) NOT NULL,
+          createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY uq_device_employee (deviceId, deviceUserId),
+          UNIQUE KEY uq_device_erp_employee (deviceId, employeeId),
+          INDEX idx_device (deviceId),
+          INDEX idx_employee (employeeId)
+        )
+      `).catch(() => { });
+                console.warn('⚠️ fingerprint_mappings created without FK constraints (Hostinger FK mismatch)');
+            }
+            // Sync History / Audit Log
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS fingerprint_sync_log (
+        id VARCHAR(36) PRIMARY KEY,
+        deviceId VARCHAR(36) NOT NULL,
+        syncedAt DATETIME NOT NULL,
+        totalLogs INT DEFAULT 0,
+        newRecords INT DEFAULT 0,
+        updatedRecords INT DEFAULT 0,
+        skippedUnmapped INT DEFAULT 0,
+        skippedLocked INT DEFAULT 0,
+        errors TEXT,
+        status VARCHAR(20) DEFAULT 'SUCCESS',
+        FOREIGN KEY (deviceId) REFERENCES fingerprint_devices(id) ON DELETE CASCADE
+      )
+    `);
+            // Raw Punch Logs — immutable source of truth for audit trail
+            // Attendance records are DERIVED from these, never stored directly from device
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS fingerprint_raw_logs (
+        id VARCHAR(36) PRIMARY KEY,
+        deviceId VARCHAR(36) NOT NULL,
+        syncBatchId VARCHAR(36) NOT NULL COMMENT 'Links to fingerprint_sync_log.id',
+        deviceUserId VARCHAR(50) NOT NULL,
+        punchTime DATETIME NOT NULL,
+        punchState INT DEFAULT 0 COMMENT '0=check-in, 1=check-out (device-dependent)',
+        employeeId VARCHAR(36) DEFAULT NULL COMMENT 'Resolved at sync time, NULL if unmapped',
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uq_raw_punch (deviceId, deviceUserId, punchTime),
+        INDEX idx_raw_employee_date (employeeId, punchTime),
+        INDEX idx_raw_batch (syncBatchId),
+        FOREIGN KEY (deviceId) REFERENCES fingerprint_devices(id) ON DELETE CASCADE
+      )
+    `);
+            // Migration: Add skippedLocked column to existing sync_log tables
+            yield conn.query(`ALTER TABLE fingerprint_sync_log ADD COLUMN IF NOT EXISTS skippedLocked INT DEFAULT 0`).catch(() => { });
+            console.log('✅ Fingerprint device tables initialized');
             // ========================================
             // ALL SYSTEM PERMISSIONS
             // ========================================
@@ -1799,6 +3468,8 @@ function initDB() {
       ('vansales.operations', 'عمليات التحميل والتفريغ', 'المبيعات المتنقلة'),
       ('vansales.visits', 'تتبع زيارات العملاء', 'المبيعات المتنقلة'),
       ('vansales.settlement', 'تسوية نهاية اليوم', 'المبيعات المتنقلة'),
+      ('vansales.settlements', 'التسويات', 'المبيعات المتنقلة'),
+      ('vansales.inventory', 'جرد السيارات', 'المبيعات المتنقلة'),
       ('vansales.returns', 'إدارة المرتجعات', 'المبيعات المتنقلة')
     `);
             // Customer Visits Table (تتبع زيارات العملاء)
@@ -2119,11 +3790,11 @@ function initDB() {
       `);
                 if (missingStocks.length > 0) {
                     console.log(`🔄 Auto-syncing ${missingStocks.length} missing product_stocks entries...`);
-                    const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+                    const { randomUUID: uuidv4 } = require('crypto');
                     for (const row of missingStocks) {
                         // Get the current global stock for this product
                         const [productRow] = yield conn.query('SELECT stock FROM products WHERE id = ?', [row.product_id]);
-                        const globalStock = ((_a = productRow[0]) === null || _a === void 0 ? void 0 : _a.stock) || 0;
+                        const globalStock = ((_c = productRow[0]) === null || _c === void 0 ? void 0 : _c.stock) || 0;
                         // Create product_stocks entry
                         yield conn.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE stock = stock', [uuidv4(), row.product_id, row.warehouse_id, globalStock]);
                     }
@@ -2139,8 +3810,673 @@ function initDB() {
             // Logic removed to prevent auto-creation of OPENING_BALANCE entries
             // ========================================
             // (Logic was here)
+            // Fiscal Years Table
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS fiscal_years (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        start_date DATE NOT NULL,
+        end_date DATE NOT NULL,
+        status ENUM('OPEN','CLOSED') DEFAULT 'OPEN',
+        closing_journal_id VARCHAR(36) DEFAULT NULL,
+        closed_by VARCHAR(100) DEFAULT NULL,
+        closed_at DATETIME DEFAULT NULL,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Fiscal Year Periods Table (الفترات المالية - شهرية/ربع سنوية)
+            try {
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS fiscal_year_periods (
+          id VARCHAR(36) PRIMARY KEY,
+          fiscal_year_id VARCHAR(36) NOT NULL,
+          name VARCHAR(100) NOT NULL,
+          period_number INT NOT NULL,
+          start_date DATE NOT NULL,
+          end_date DATE NOT NULL,
+          status ENUM('OPEN','LOCKED') DEFAULT 'OPEN',
+          locked_by VARCHAR(100) DEFAULT NULL,
+          locked_at DATETIME DEFAULT NULL,
+          FOREIGN KEY (fiscal_year_id) REFERENCES fiscal_years(id) ON DELETE CASCADE,
+          INDEX idx_fyp_year (fiscal_year_id),
+          INDEX idx_fyp_dates (start_date, end_date),
+          INDEX idx_fyp_status (status)
+        )
+      `);
+            }
+            catch (fypErr) {
+                console.warn('⚠️ fiscal_year_periods skipped (FK mismatch):', fypErr.message);
+            }
+            // ========================================
+            // FISCAL YEAR: Lock Date Columns (Odoo-style Continuous Accounting)
+            // Replaces destructive "zeroing entries" with date-based period locking.
+            // ========================================
+            yield conn.query(`ALTER TABLE fiscal_years ADD COLUMN IF NOT EXISTS fiscalyear_lock_date DATE DEFAULT NULL COMMENT 'General accounting lock date'`).catch(() => { });
+            yield conn.query(`ALTER TABLE fiscal_years ADD COLUMN IF NOT EXISTS tax_lock_date DATE DEFAULT NULL COMMENT 'Tax entries lock date'`).catch(() => { });
+            yield conn.query(`ALTER TABLE fiscal_years ADD COLUMN IF NOT EXISTS hard_lock_date DATE DEFAULT NULL COMMENT 'Immutable lock — cannot be overridden'`).catch(() => { });
+            // Expand status enum to include LOCKED (soft close that doesn't destroy data)
+            yield conn.query(`ALTER TABLE fiscal_years MODIFY COLUMN status ENUM('OPEN','CLOSED','LOCKED') DEFAULT 'OPEN'`).catch(() => { });
+            console.log('✅ Fiscal year lock date columns ready');
+            // ========================================
+            // CERAMICS MODULE TABLES (وحدة السيراميك)
+            // ========================================
+            // Migration: Add ceramic columns to products table
+            yield Promise.all([
+                conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ceramic_size VARCHAR(100)`).catch(() => { }),
+                conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ceramic_color VARCHAR(100)`).catch(() => { }),
+                conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ceramic_color_grade VARCHAR(50)`).catch(() => { }),
+                conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ceramic_color_desc VARCHAR(255)`).catch(() => { }),
+                conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ceramic_name VARCHAR(100) COMMENT 'الاسم (was الديكالة)'`).catch(() => { }),
+                conn.query(`ALTER TABLE products ADD COLUMN IF NOT EXISTS ceramic_pattern VARCHAR(100)`).catch(() => { }),
+            ]);
+            // Migration: Add ceramic price/discount list links to partners table
+            yield Promise.all([
+                conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS ceramicPriceListId VARCHAR(36)`).catch(() => { }),
+                conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS ceramicDiscountListId VARCHAR(36)`).catch(() => { }),
+            ]);
+            // Ceramic Price Lists Table (قوائم أسعار السيراميك)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS ceramic_price_lists (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        listNumber INT,
+        date DATE,
+        companyId VARCHAR(36),
+        companyName VARCHAR(255),
+        notes TEXT,
+        status ENUM('ACTIVE','SUSPENDED','PRIVATE') DEFAULT 'ACTIVE',
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_status (status),
+        INDEX idx_date (date)
+      )
+    `);
+            // Migration: Add discountListId to ceramic_price_lists for linking price list to discount list
+            yield conn.query(`
+      ALTER TABLE ceramic_price_lists 
+      ADD COLUMN IF NOT EXISTS discountListId VARCHAR(36) NULL COMMENT 'ربط بقائمة الخصم'
+    `).catch(() => { });
+            // Ceramic Price List Items Table (بنود قوائم الأسعار)
+            try {
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS ceramic_price_list_items (
+          id VARCHAR(36) PRIMARY KEY,
+          priceListId VARCHAR(36) NOT NULL,
+          productId VARCHAR(36),
+          groupName VARCHAR(100),
+          ceramicName VARCHAR(100) COMMENT 'الاسم (was الديكالة)',
+          sizeName VARCHAR(100) COMMENT 'المقاس',
+          itemNumber VARCHAR(50) COMMENT 'الرقم',
+          color VARCHAR(100) COMMENT 'اللون',
+          colorGrade VARCHAR(50) COMMENT 'درجة اللون',
+          colorDescription VARCHAR(255) COMMENT 'توصيف اللون',
+          pattern VARCHAR(100) COMMENT 'الفطعة',
+          price1 DECIMAL(15,2) DEFAULT 0 COMMENT 'أول',
+          price2 DECIMAL(15,2) DEFAULT 0 COMMENT 'ثاني',
+          price3 DECIMAL(15,2) DEFAULT 0 COMMENT 'ثالث',
+          price4 DECIMAL(15,2) DEFAULT 0 COMMENT 'رابع',
+          feature1 DECIMAL(15,2) DEFAULT 0 COMMENT 'ميزة 1',
+          feature2 DECIMAL(15,2) DEFAULT 0 COMMENT 'ميزة 2',
+          feature3 DECIMAL(15,2) DEFAULT 0 COMMENT 'ميزة 3',
+          FOREIGN KEY (priceListId) REFERENCES ceramic_price_lists(id) ON DELETE CASCADE,
+          FOREIGN KEY (productId) REFERENCES products(id) ON DELETE SET NULL,
+          INDEX idx_pricelist (priceListId),
+          INDEX idx_product (productId),
+          INDEX idx_group (groupName)
+        )
+      `);
+            }
+            catch (fkErr) {
+                // FK constraint may fail if charset/collation/engine mismatch — create without FK
+                console.warn('⚠️ ceramic_price_list_items FK error, creating without foreign keys:', fkErr.message);
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS ceramic_price_list_items (
+          id VARCHAR(36) PRIMARY KEY,
+          priceListId VARCHAR(36) NOT NULL,
+          productId VARCHAR(36),
+          groupName VARCHAR(100),
+          ceramicName VARCHAR(100),
+          sizeName VARCHAR(100),
+          itemNumber VARCHAR(50),
+          color VARCHAR(100),
+          colorGrade VARCHAR(50),
+          colorDescription VARCHAR(255),
+          pattern VARCHAR(100),
+          price1 DECIMAL(15,2) DEFAULT 0,
+          price2 DECIMAL(15,2) DEFAULT 0,
+          price3 DECIMAL(15,2) DEFAULT 0,
+          price4 DECIMAL(15,2) DEFAULT 0,
+          feature1 DECIMAL(15,2) DEFAULT 0,
+          feature2 DECIMAL(15,2) DEFAULT 0,
+          feature3 DECIMAL(15,2) DEFAULT 0,
+          INDEX idx_pricelist (priceListId),
+          INDEX idx_product (productId),
+          INDEX idx_group (groupName)
+        )
+      `);
+            }
+            // Ceramic Discount Lists Table (قوائم خصم السيراميك)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS ceramic_discount_lists (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        listNumber INT,
+        date DATE,
+        companyId VARCHAR(36),
+        companyName VARCHAR(255),
+        discountType ENUM('WAREHOUSE','STORE') DEFAULT 'WAREHOUSE',
+        notes TEXT,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_status (discountType),
+        INDEX idx_date (date)
+      )
+    `);
+            // Ceramic Discount List Items Table (بنود قوائم الخصم)
+            try {
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS ceramic_discount_list_items (
+          id VARCHAR(36) PRIMARY KEY,
+          discountListId VARCHAR(36) NOT NULL,
+          groupName VARCHAR(100) NOT NULL COMMENT 'المجموعة',
+          groupDescription VARCHAR(255) COMMENT 'توصيف المجموعة',
+          discount1 DECIMAL(5,2) DEFAULT 0 COMMENT 'خصم أول',
+          discount2 DECIMAL(5,2) DEFAULT 0 COMMENT 'خصم ثاني',
+          discount3 DECIMAL(5,2) DEFAULT 0 COMMENT 'خصم ثالث',
+          featureDiscount DECIMAL(5,2) DEFAULT 0 COMMENT 'خصم الميزة',
+          FOREIGN KEY (discountListId) REFERENCES ceramic_discount_lists(id) ON DELETE CASCADE,
+          INDEX idx_discountlist (discountListId),
+          INDEX idx_group (groupName)
+        )
+      `);
+            }
+            catch (cdliErr) {
+                console.warn('⚠️ ceramic_discount_list_items skipped (FK mismatch):', cdliErr.message);
+            }
+            // ========================================
+            // PACKAGING SYSTEM TABLES (نظام التعبئة والتغليف)
+            // Migration 048: core specs + materials + production_order_packaging
+            // Migration 049: advanced packaging (manual batches, packaging orders)
+            // ========================================
+            // Packaging Specifications (مواصفات التعبئة)
+            // NOTE: FK constraints removed from CREATE TABLE to prevent silent failures
+            // after full database reset. FKs are added separately below.
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS product_packaging_specs (
+        id VARCHAR(36) PRIMARY KEY,
+        product_id VARCHAR(36) NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        capacity INT NOT NULL,
+        level ENUM('PRIMARY', 'SECONDARY', 'TERTIARY') DEFAULT 'PRIMARY',
+        instructions TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_pps_product (product_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ product_packaging_specs creation failed:', e.message));
+            // Packaging Materials (مواد التعبئة لكل مواصفة)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS product_packaging_materials (
+        id VARCHAR(36) PRIMARY KEY,
+        spec_id VARCHAR(36) NOT NULL,
+        material_product_id VARCHAR(36) NOT NULL,
+        quantity DECIMAL(15,3) NOT NULL,
+        INDEX idx_ppm_spec (spec_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ product_packaging_materials creation failed:', e.message));
+            // Production Order Packaging Tasks (مهام التعبئة لأوامر الإنتاج)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS production_order_packaging (
+        id VARCHAR(36) PRIMARY KEY,
+        production_order_id VARCHAR(36) NOT NULL,
+        packaging_spec_id VARCHAR(36) NOT NULL,
+        qty_planned DECIMAL(15,3) NOT NULL,
+        qty_packed DECIMAL(15,3) DEFAULT 0,
+        status ENUM('PENDING', 'IN_PROGRESS', 'COMPLETED') DEFAULT 'PENDING',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_pop_order (production_order_id),
+        INDEX idx_pop_status (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ production_order_packaging creation failed:', e.message));
+            // Manual Batches (تجميع / تعبئة يدوية)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS manual_batches (
+        id VARCHAR(36) PRIMARY KEY,
+        batch_number VARCHAR(50) NOT NULL,
+        date DATETIME NOT NULL,
+        warehouse_id VARCHAR(36) NOT NULL,
+        total_cost DECIMAL(15,3) DEFAULT 0,
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_by VARCHAR(36),
+        INDEX idx_mb_date (date),
+        INDEX idx_mb_warehouse (warehouse_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ manual_batches creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS manual_batch_inputs (
+        id VARCHAR(36) PRIMARY KEY,
+        batch_id VARCHAR(36) NOT NULL,
+        product_id VARCHAR(36) NOT NULL,
+        quantity DECIMAL(15,3) NOT NULL,
+        unit_cost DECIMAL(15,3) NOT NULL,
+        total_cost DECIMAL(15,3) NOT NULL,
+        INDEX idx_mbi_batch (batch_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ manual_batch_inputs creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS manual_batch_outputs (
+        id VARCHAR(36) PRIMARY KEY,
+        batch_id VARCHAR(36) NOT NULL,
+        product_id VARCHAR(36) NOT NULL,
+        quantity DECIMAL(15,3) NOT NULL,
+        unit_cost DECIMAL(15,3) NOT NULL,
+        total_cost DECIMAL(15,3) NOT NULL,
+        INDEX idx_mbo_batch (batch_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ manual_batch_outputs creation failed:', e.message));
+            // Packaging Orders (أوامر التعبئة المتقدمة)
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS packaging_orders (
+        id VARCHAR(36) PRIMARY KEY,
+        order_number VARCHAR(50) NOT NULL,
+        type ENUM('TRADITIONAL', 'HIERARCHICAL') DEFAULT 'TRADITIONAL',
+        production_order_id VARCHAR(36) NULL,
+        product_id VARCHAR(36) NOT NULL,
+        quantity DECIMAL(15,3) NOT NULL,
+        warehouse_id VARCHAR(36) NOT NULL,
+        total_material_cost DECIMAL(15,3) DEFAULT 0,
+        total_packaging_cost DECIMAL(15,3) DEFAULT 0,
+        total_cost DECIMAL(15,3) DEFAULT 0,
+        unit_cost DECIMAL(15,3) DEFAULT 0,
+        status ENUM('DRAFT', 'COMPLETED') DEFAULT 'COMPLETED',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        created_by VARCHAR(36),
+        INDEX idx_po_status (status),
+        INDEX idx_po_product (product_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ packaging_orders creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS packaging_order_levels (
+        id VARCHAR(36) PRIMARY KEY,
+        packaging_order_id VARCHAR(36) NOT NULL,
+        level_index INT NOT NULL,
+        input_product_id VARCHAR(36) NOT NULL,
+        output_product_id VARCHAR(36) NOT NULL,
+        input_qty DECIMAL(15,3) NOT NULL,
+        output_qty DECIMAL(15,3) NOT NULL,
+        material_cost DECIMAL(15,3) DEFAULT 0,
+        packaging_cost DECIMAL(15,3) DEFAULT 0,
+        total_cost DECIMAL(15,3) DEFAULT 0,
+        unit_cost DECIMAL(15,3) DEFAULT 0,
+        INDEX idx_pol_order (packaging_order_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ packaging_order_levels creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS packaging_order_materials (
+        id VARCHAR(36) PRIMARY KEY,
+        level_id VARCHAR(36) NOT NULL,
+        product_id VARCHAR(36) NOT NULL,
+        quantity DECIMAL(15,3) NOT NULL,
+        unit_cost DECIMAL(15,3) NOT NULL,
+        total_cost DECIMAL(15,3) NOT NULL,
+        INDEX idx_pom_level (level_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ packaging_order_materials creation failed:', e.message));
+            console.log('✅ Packaging system tables ready (specs, materials, production_order_packaging, advanced packaging)');
+            // ========================================
+            // CRM MODULE TABLES
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_lead_stages (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        color VARCHAR(20) DEFAULT '#6366f1',
+        sortOrder INT DEFAULT 0,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_lead_stages creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_leads (
+        id VARCHAR(36) PRIMARY KEY,
+        title VARCHAR(200) NOT NULL,
+        name VARCHAR(200),
+        company VARCHAR(200),
+        email VARCHAR(200),
+        phone VARCHAR(50),
+        stageId VARCHAR(36),
+        assignedTo VARCHAR(36),
+        partnerId VARCHAR(36),
+        expectedRevenue DECIMAL(15,2) DEFAULT 0,
+        probability INT DEFAULT 0,
+        source VARCHAR(100),
+        status ENUM('OPEN','WON','LOST') DEFAULT 'OPEN',
+        notes TEXT,
+        tags VARCHAR(500),
+        sortOrder INT DEFAULT 0,
+        createdBy VARCHAR(36),
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_crm_leads_stage (stageId),
+        INDEX idx_crm_leads_assigned (assignedTo),
+        INDEX idx_crm_leads_status (status),
+        INDEX idx_crm_leads_partner (partnerId)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_leads creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_activities (
+        id VARCHAR(36) PRIMARY KEY,
+        leadId VARCHAR(36) NOT NULL,
+        type ENUM('CALL','MEETING','EMAIL','TASK','NOTE') DEFAULT 'TASK',
+        summary VARCHAR(500) NOT NULL,
+        notes TEXT,
+        dueDate DATETIME,
+        isDone TINYINT(1) DEFAULT 0,
+        assignedTo VARCHAR(36),
+        createdBy VARCHAR(36),
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_crm_act_lead (leadId),
+        INDEX idx_crm_act_due (dueDate),
+        INDEX idx_crm_act_done (isDone)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_activities creation failed:', e.message));
+            // Seed default CRM stages if empty
+            const [existingStages] = yield conn.query(`SELECT COUNT(*) as c FROM crm_lead_stages`).catch(() => [[{ c: 1 }]]);
+            if (((_d = existingStages[0]) === null || _d === void 0 ? void 0 : _d.c) === 0) {
+                const { randomUUID: uuidv4 } = require('crypto');
+                const defaultStages = [
+                    { id: uuidv4(), name: 'عميل محتمل', color: '#6366f1', sortOrder: 0 },
+                    { id: uuidv4(), name: 'تواصل أولي', color: '#3b82f6', sortOrder: 1 },
+                    { id: uuidv4(), name: 'عرض سعر', color: '#f59e0b', sortOrder: 2 },
+                    { id: uuidv4(), name: 'تفاوض', color: '#f97316', sortOrder: 3 },
+                    { id: uuidv4(), name: 'إغلاق', color: '#10b981', sortOrder: 4 },
+                ];
+                for (const s of defaultStages) {
+                    yield conn.query(`INSERT INTO crm_lead_stages (id, name, color, sortOrder) VALUES (?, ?, ?, ?)`, [s.id, s.name, s.color, s.sortOrder]).catch(() => { });
+                }
+                console.log('✅ Default CRM stages seeded');
+            }
+            console.log('✅ CRM module tables ready (stages, leads, activities)');
+            // Ticketing System Tables
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_tickets (
+        id VARCHAR(36) PRIMARY KEY,
+        partner_id VARCHAR(36) NOT NULL,
+        lead_id VARCHAR(36),
+        subject VARCHAR(200) NOT NULL,
+        description TEXT,
+        status ENUM('OPEN', 'IN_PROGRESS', 'RESOLVED', 'CLOSED') DEFAULT 'OPEN',
+        priority ENUM('LOW', 'MEDIUM', 'HIGH', 'URGENT') DEFAULT 'MEDIUM',
+        assigned_to VARCHAR(36),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_crm_tickets_partner (partner_id),
+        INDEX idx_crm_tickets_lead (lead_id),
+        INDEX idx_crm_tickets_status (status)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_tickets creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_ticket_comments (
+        id VARCHAR(36) PRIMARY KEY,
+        ticket_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        content TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_crm_ticket_comments_ticket (ticket_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_ticket_comments creation failed:', e.message));
+            // ── Knowledge Base articles table (user-facing FAQ system) ──
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS kb_articles (
+        id VARCHAR(36) PRIMARY KEY,
+        question TEXT NOT NULL,
+        answer MEDIUMTEXT NOT NULL,
+        category VARCHAR(100) NOT NULL,
+        keywords JSON DEFAULT NULL,
+        attachments JSON DEFAULT NULL,
+        viewCount INT DEFAULT 0,
+        isFeatured BOOLEAN DEFAULT FALSE,
+        isActive BOOLEAN DEFAULT TRUE,
+        createdBy VARCHAR(36),
+        updatedBy VARCHAR(36),
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        FULLTEXT INDEX ft_kb_search (question, answer),
+        INDEX idx_kb_category (category, isActive),
+        INDEX idx_kb_featured (isFeatured, isActive)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ kb_articles creation failed:', e.message));
+            console.log('✅ Knowledge Base table ready (kb_articles)');
+            // ========================================
+            // BRANDS TABLE (used by variant groups)
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS brands (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        isActive BOOLEAN DEFAULT TRUE,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_brands_active (isActive)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ brands table creation failed:', e.message));
+            // ========================================
+            // VARIANT GROUPS TABLE
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS variant_groups (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        categoryId VARCHAR(36),
+        brandId VARCHAR(36),
+        description TEXT,
+        attributeKeys JSON NOT NULL COMMENT '["size","color"]',
+        isActive BOOLEAN DEFAULT TRUE,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_vg_active (isActive),
+        INDEX idx_vg_category (categoryId),
+        INDEX idx_vg_brand (brandId)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ variant_groups table creation failed:', e.message));
+            // Migration: Backfill missing columns on variant_groups (table may have been
+            // created from the older posController schema without these fields)
+            yield conn.query(`ALTER TABLE variant_groups ADD COLUMN IF NOT EXISTS isActive TINYINT(1) NOT NULL DEFAULT 1`).catch((e) => { var _a; if (!((_a = e.message) === null || _a === void 0 ? void 0 : _a.includes('Duplicate column')))
+                console.warn('variant_groups.isActive:', e.message); });
+            yield conn.query(`ALTER TABLE variant_groups ADD COLUMN IF NOT EXISTS categoryId VARCHAR(36) DEFAULT NULL`).catch((e) => { var _a; if (!((_a = e.message) === null || _a === void 0 ? void 0 : _a.includes('Duplicate column')))
+                console.warn('variant_groups.categoryId:', e.message); });
+            yield conn.query(`ALTER TABLE variant_groups ADD COLUMN IF NOT EXISTS brandId VARCHAR(36) DEFAULT NULL`).catch((e) => { var _a; if (!((_a = e.message) === null || _a === void 0 ? void 0 : _a.includes('Duplicate column')))
+                console.warn('variant_groups.brandId:', e.message); });
+            yield conn.query(`ALTER TABLE variant_groups ADD COLUMN IF NOT EXISTS description TEXT DEFAULT NULL`).catch((e) => { var _a; if (!((_a = e.message) === null || _a === void 0 ? void 0 : _a.includes('Duplicate column')))
+                console.warn('variant_groups.description:', e.message); });
+            yield conn.query(`ALTER TABLE variant_groups ADD INDEX idx_vg_active (isActive)`).catch(() => { });
+            yield conn.query(`ALTER TABLE variant_groups ADD INDEX idx_vg_category (categoryId)`).catch(() => { });
+            yield conn.query(`ALTER TABLE variant_groups ADD INDEX idx_vg_brand (brandId)`).catch(() => { });
+            // ═══════════════════════════════════════════════════════════
+            // BRANCH ISOLATION v2: Add branchId to all transactional tables
+            // Enables multi-branch data isolation — branch users see only their own data,
+            // admins see everything. Records with NULL branchId remain globally visible.
+            // ═══════════════════════════════════════════════════════════
+            yield Promise.all([
+                // Invoices — the core transactional table (SALE, PURCHASE, RECEIPT, PAYMENT, etc.)
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'الفرع المنشئ للفاتورة'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_branchId ON invoices(branchId)`).catch(() => { }),
+                // Journal Entries — accounting records follow the invoice's branch
+                conn.query(`ALTER TABLE journal_entries ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'الفرع المنشئ للقيد'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_journal_entries_branchId ON journal_entries(branchId)`).catch(() => { }),
+                // POS Shifts — each shift belongs to a branch
+                conn.query(`ALTER TABLE pos_shifts ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'فرع الشيفت'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_pos_shifts_branchId ON pos_shifts(branchId)`).catch(() => { }),
+                // Cheques — follow the parent transaction's branch
+                conn.query(`ALTER TABLE cheques ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'فرع الشيك'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_cheques_branchId ON cheques(branchId)`).catch(() => { }),
+                // Stock Permits — already have warehouseId, but direct branchId enables fast filtering
+                conn.query(`ALTER TABLE stock_permits ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'فرع الأذن'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_permits_branchId ON stock_permits(branchId)`).catch(() => { }),
+                // Stock Taking Sessions — scoped by branch
+                conn.query(`ALTER TABLE stock_taking_sessions ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'فرع الجرد'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_taking_sessions_branchId ON stock_taking_sessions(branchId)`).catch(() => { }),
+            ]);
+            console.log('✅ Branch isolation v2 columns and indexes applied');
+            // SCHEMA VERSION TRACKING
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS schema_meta (
+        \`key\` VARCHAR(100) PRIMARY KEY,
+        value TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `);
+            // Migration: Add source column to products table (QUICK = quick-created, MASTER = default)
+            try {
+                yield conn.query(`ALTER TABLE products ADD COLUMN source VARCHAR(20) DEFAULT 'MASTER'`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                    console.error(e); });
+            }
+            catch (e) { }
+            // Membership & Promotions Migrations
+            yield conn.query(`ALTER TABLE membership_freeze_periods ADD COLUMN actualUnfreezeDate DATETIME DEFAULT NULL`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE promotions ADD COLUMN linkedMembershipId VARCHAR(36) DEFAULT NULL`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            yield conn.query(`ALTER TABLE promotions MODIFY COLUMN type ENUM('PERCENT_ORDER','FIXED_ORDER','BUY_X_GET_Y','MIN_SPEND','CATEGORY_DISCOUNT','PRODUCT_DISCOUNT','CUSTOMER_MEMBERSHIP') NOT NULL`).catch((e) => { console.error(e); });
+            yield conn.query(`CREATE INDEX idx_promotions_linkedMembershipId ON promotions(linkedMembershipId)`).catch(() => { });
+            // ── membership_packages: bridge schema gap (CREATE TABLE uses 'duration'/'included_balance',
+            //    but controller code references 'durationDays'/'includedVisits') ──
+            // Step 1: Rename 'duration' → 'durationDays' if old column exists
+            try {
+                const [cols] = yield conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'membership_packages' AND COLUMN_NAME = 'duration'`);
+                if (cols.length > 0) {
+                    yield conn.query(`ALTER TABLE membership_packages CHANGE COLUMN duration durationDays INT NOT NULL DEFAULT 0 COMMENT 'Duration in days'`);
+                    console.log('✅ Renamed membership_packages.duration → durationDays');
+                }
+            }
+            catch (e) {
+                console.warn('⚠️ membership_packages duration migration:', e.message);
+            }
+            // Step 2: Ensure durationDays exists (fresh installs may already have it)
+            yield conn.query(`ALTER TABLE membership_packages ADD COLUMN durationDays INT NOT NULL DEFAULT 0 COMMENT 'Duration in days'`).catch(() => { });
+            // Step 3: Rename 'included_balance' → 'includedVisits' if old column exists
+            try {
+                const [cols] = yield conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'membership_packages' AND COLUMN_NAME = 'included_balance'`);
+                if (cols.length > 0) {
+                    yield conn.query(`ALTER TABLE membership_packages CHANGE COLUMN included_balance includedVisits INT DEFAULT NULL COMMENT 'Number of allowed sessions/visits'`);
+                    console.log('✅ Renamed membership_packages.included_balance → includedVisits');
+                }
+            }
+            catch (e) {
+                console.warn('⚠️ membership_packages includedVisits migration:', e.message);
+            }
+            yield conn.query(`ALTER TABLE membership_packages ADD COLUMN includedVisits INT DEFAULT NULL`).catch(() => { });
+            // Step 4: Add missing columns (description, isActive, icon)
+            yield conn.query(`ALTER TABLE membership_packages ADD COLUMN description TEXT DEFAULT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE membership_packages ADD COLUMN isActive BOOLEAN DEFAULT TRUE`).catch(() => { });
+            yield conn.query(`ALTER TABLE membership_packages ADD COLUMN icon VARCHAR(50) DEFAULT NULL`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
+            // ── memberships: add columns the controller uses but CREATE TABLE omits ──
+            yield conn.query(`ALTER TABLE memberships ADD COLUMN includedVisits INT DEFAULT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE memberships ADD COLUMN remainingVisits INT DEFAULT NULL`).catch(() => { });
+            // Expand status ENUM to include PENDING_PAYMENT (used by the billing engine)
+            // Note: MariaDB ENUMs are case-insensitive, so 'active'='ACTIVE'. Only add genuinely new values.
+            yield conn.query(`ALTER TABLE memberships MODIFY COLUMN status ENUM('pending','active','expired','suspended','cancelled','PENDING_PAYMENT','FROZEN') DEFAULT 'pending'`).catch(() => { });
+            // ── promotions: add maxDiscountAmount cap and expand ENUMs ──
+            yield conn.query(`ALTER TABLE promotions ADD COLUMN maxDiscountAmount DECIMAL(10,2) DEFAULT NULL COMMENT 'Cap on percent discounts'`).catch(() => { });
+            yield conn.query(`ALTER TABLE promotions MODIFY COLUMN type ENUM('PERCENT_ORDER','FIXED_ORDER','BUY_X_GET_Y','MIN_SPEND','CATEGORY_DISCOUNT','PRODUCT_DISCOUNT','CUSTOMER_MEMBERSHIP','CATEGORY_FIXED','PRODUCT_FIXED') NOT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE promo_rules MODIFY COLUMN ruleType ENUM('MIN_AMOUNT','MIN_QTY','PRODUCT_IN_CART','CATEGORY_IN_CART','CUSTOMER_GROUP','CUSTOMER_MEMBERSHIP','DAY_OF_WEEK','TIME_RANGE') NOT NULL`).catch(() => { });
+            // ── product_variants: ensure table exists so queries don't crash ──
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS product_variants (
+        id VARCHAR(36) PRIMARY KEY,
+        productId VARCHAR(36) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        sku VARCHAR(100) DEFAULT NULL,
+        barcode VARCHAR(100) DEFAULT NULL,
+        purchasePrice DECIMAL(15,2) DEFAULT 0,
+        sellingPrice DECIMAL(15,2) DEFAULT 0,
+        attributes JSON DEFAULT NULL,
+        stock DECIMAL(18, 8) DEFAULT 0,
+        isActive BOOLEAN DEFAULT TRUE,
+        image LONGTEXT DEFAULT NULL,
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_pv_productId (productId),
+        INDEX idx_pv_sku (sku),
+        INDEX idx_pv_barcode (barcode)
+      )
+    `).catch(() => { });
+            // Migration: upgrade stock from INT to DECIMAL for existing databases
+            yield conn.query(`ALTER TABLE product_variants MODIFY COLUMN stock DECIMAL(18, 8) DEFAULT 0`).catch(() => { });
+            // ── product_variant_stocks: warehouse-level stock for individual variants ──
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS product_variant_stocks (
+        id VARCHAR(36) PRIMARY KEY,
+        variantId VARCHAR(36) NOT NULL,
+        productId VARCHAR(36) NOT NULL COMMENT 'denormalized for fast queries',
+        warehouseId VARCHAR(36) NOT NULL,
+        stock DECIMAL(18, 8) DEFAULT 0,
+        UNIQUE KEY unique_variant_warehouse (variantId, warehouseId),
+        INDEX idx_pvs_product (productId),
+        INDEX idx_pvs_warehouse (warehouseId),
+        INDEX idx_pvs_variant (variantId)
+      )
+    `).catch(() => { });
+            // ── WhatsApp Cloud API tables (v71) ──
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_settings (
+        id            VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+        isEnabled     BOOLEAN DEFAULT FALSE,
+        phoneNumberId VARCHAR(100) NOT NULL DEFAULT '',
+        accessToken   TEXT NOT NULL,
+        wabaId        VARCHAR(100) NOT NULL DEFAULT '',
+        webhookToken  VARCHAR(255) NOT NULL DEFAULT '',
+        sendOnInvoiceConfirm BOOLEAN DEFAULT TRUE,
+        sendOnPaymentRecord  BOOLEAN DEFAULT TRUE,
+        sendPOSReceipt       BOOLEAN DEFAULT FALSE,
+        createdAt     DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `).catch(() => { });
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_message_log (
+        id              VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
+        direction       ENUM('outbound','inbound') NOT NULL,
+        toPhone         VARCHAR(30),
+        fromPhone       VARCHAR(30),
+        messageType     ENUM('text','template','document','image') NOT NULL,
+        templateName    VARCHAR(100),
+        status          ENUM('pending','sent','delivered','read','failed') DEFAULT 'pending',
+        wamid           VARCHAR(200),
+        errorMessage    TEXT,
+        referenceType   VARCHAR(50),
+        referenceId     VARCHAR(36),
+        payload         JSON,
+        createdAt       DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt       DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_wa_log_ref (referenceType, referenceId),
+        INDEX idx_wa_log_status (status),
+        INDEX idx_wa_log_wamid (wamid)
+      )
+    `).catch(() => { });
+            yield conn.query(`
+      INSERT INTO schema_meta (\`key\`, value) VALUES ('schema_version', ?)
+      ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = CURRENT_TIMESTAMP
+    `, [String(exports.SCHEMA_VERSION)]);
+            console.log(`✅ Schema version stamped: v${exports.SCHEMA_VERSION}`);
+            // Re-enable foreign key checks after table creation
+            yield conn.query('SET FOREIGN_KEY_CHECKS = 1');
+            console.log("Foreign key checks re-enabled");
             // Seed initial data after tables are created
             yield seedInitialData();
+            // NOTE: cleanupPhantomSafes() REMOVED — see comment above
+            yield fixLongInvoiceNumbers();
+            yield fixDirtyInvoiceNumbers();
+            yield syncBankBalancesToGL();
+            yield syncProductCostsFromPurchases();
         }
         catch (err) {
             console.error("Error initializing database:", err);
@@ -2201,7 +4537,7 @@ function seedInitialData() {
             const priceListCount = priceListRows[0].count;
             if (priceListCount === 0) {
                 console.log('Seeding default price lists...');
-                const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+                const { randomUUID: uuidv4 } = require('crypto');
                 const defaultPriceLists = [
                     { id: uuidv4(), name: 'جملة', description: 'سعر الجملة', isActive: true },
                     { id: uuidv4(), name: 'قطاعي', description: 'سعر القطاعي', isActive: true }
@@ -2219,7 +4555,7 @@ function seedInitialData() {
             const userCount = userRows[0].count;
             if (userCount === 0) {
                 console.log('Seeding default admin user...');
-                const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+                const { randomUUID: uuidv4 } = require('crypto');
                 const bcrypt = yield Promise.resolve().then(() => __importStar(require('bcryptjs')));
                 const hashedPassword = yield bcrypt.hash('admin123', 10);
                 const adminId = uuidv4();
@@ -2237,7 +4573,7 @@ function seedInitialData() {
                 // Ensure master admin exists even if other users exist
                 const [masterRows] = yield conn.query('SELECT id FROM users WHERE role = ? AND isHidden = ?', ['MASTER_ADMIN', true]);
                 if (masterRows.length === 0) {
-                    const { v4: uuidv4 } = yield Promise.resolve().then(() => __importStar(require('uuid')));
+                    const { randomUUID: uuidv4 } = require('crypto');
                     const bcrypt = yield Promise.resolve().then(() => __importStar(require('bcryptjs')));
                     const masterPassword = process.env.MASTER_ADMIN_PASSWORD || 'Daftrix@2025!';
                     const hashedMasterPassword = yield bcrypt.hash(masterPassword, 10);
@@ -2246,10 +4582,472 @@ function seedInitialData() {
                     console.log('Added hidden master admin to existing database');
                 }
             }
+            // ========================================
+            // MIGRATION: Multi-Currency Tables
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS currencies (
+        code VARCHAR(3) PRIMARY KEY,
+        nameAr VARCHAR(100) NOT NULL,
+        nameEn VARCHAR(100) NOT NULL,
+        symbol VARCHAR(10),
+        decimalPlaces INT DEFAULT 2,
+        isActive BOOLEAN DEFAULT TRUE,
+        isBaseCurrency BOOLEAN DEFAULT FALSE,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_currencies_active (isActive)
+      )
+    `).catch(() => { });
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS exchange_rates (
+        id VARCHAR(36) PRIMARY KEY,
+        fromCurrency VARCHAR(3) NOT NULL,
+        toCurrency VARCHAR(3) NOT NULL,
+        rate DECIMAL(18, 8) NOT NULL,
+        effectiveDate DATE NOT NULL,
+        source VARCHAR(50) DEFAULT 'MANUAL',
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        createdBy VARCHAR(100),
+        FOREIGN KEY (fromCurrency) REFERENCES currencies(code) ON DELETE CASCADE,
+        FOREIGN KEY (toCurrency) REFERENCES currencies(code) ON DELETE CASCADE,
+        UNIQUE KEY unique_rate_date (fromCurrency, toCurrency, effectiveDate),
+        INDEX idx_exchange_rates_date (effectiveDate),
+        INDEX idx_exchange_rates_from (fromCurrency),
+        INDEX idx_exchange_rates_to (toCurrency)
+      )
+    `).catch(() => { });
+            // Seed default currencies if table is empty
+            yield conn.query(`
+      INSERT IGNORE INTO currencies (code, nameAr, nameEn, symbol, isBaseCurrency, isActive) VALUES
+        ('EGP', 'جنيه مصري', 'Egyptian Pound', 'ج.م', TRUE, TRUE),
+        ('USD', 'دولار أمريكي', 'US Dollar', '$', FALSE, TRUE),
+        ('EUR', 'يورو', 'Euro', '€', FALSE, TRUE),
+        ('AED', 'درهم إماراتي', 'UAE Dirham', 'د.إ', FALSE, TRUE),
+        ('SAR', 'ريال سعودي', 'Saudi Riyal', 'ر.س', FALSE, TRUE),
+        ('GBP', 'جنيه إسترليني', 'British Pound', '£', FALSE, TRUE)
+    `).catch(() => { });
+            // ========================================
+            // Bank Reconciliation Items (تسوية البنك)
+            // Replaces localStorage-based reconciliation with DB persistence
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS bank_reconciliation_items (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        bankAccountId VARCHAR(36) NOT NULL COMMENT 'The GL account ID for the bank',
+        journalEntryId VARCHAR(36) NOT NULL COMMENT 'The cleared journal entry ID',
+        clearedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        clearedBy VARCHAR(100) COMMENT 'User who marked this as cleared',
+        UNIQUE KEY unique_bank_journal (bankAccountId, journalEntryId),
+        INDEX idx_recon_bank (bankAccountId),
+        INDEX idx_recon_journal (journalEntryId)
+      )
+    `).catch(() => { });
         }
         catch (err) {
             console.error("Error seeding initial data:", err);
             throw err;
+        }
+        finally {
+            if (conn)
+                conn.release();
+        }
+    });
+}
+/**
+ * Cleanup Phantom Safes generated by older versions of the app
+ * Merges 10102, 10202, 10203 into the Main Safe and securely deletes them.
+ */
+function cleanupPhantomSafes() {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        let conn;
+        try {
+            conn = yield exports.pool.getConnection();
+            // Find the REAL ID of the main safe
+            const [mainSafeRows] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%رئيسية%' OR name LIKE '%رئيسي%' LIMIT 1`);
+            if (!mainSafeRows || mainSafeRows.length === 0)
+                return;
+            const MAIN_SAFE_ID = mainSafeRows[0].id;
+            // Find unused phantom accounts
+            const [subSafeRows] = yield conn.query(`SELECT id FROM accounts WHERE id IN ('10102', '10202', '10203')`);
+            if (!subSafeRows || subSafeRows.length === 0)
+                return;
+            console.log(`🧹 [Migration] Found ${subSafeRows.length} phantom safe(s). Auto-merging into 'الخزينة الرئيسية' (ID: ${MAIN_SAFE_ID})...`);
+            // Merge balances and records
+            for (const row of subSafeRows) {
+                const TARGET_ID = row.id;
+                // Update Journal Lines (The Real source of truth)
+                yield conn.query(`UPDATE journal_lines SET accountId = ?, accountName = ? WHERE accountId = ?`, [MAIN_SAFE_ID, mainSafeRows[0].name, TARGET_ID]);
+                // Update Invoices if they reference the sub safe
+                try {
+                    yield conn.query(`UPDATE invoices SET treasuryAccountId = ? WHERE treasuryAccountId = ?`, [MAIN_SAFE_ID, TARGET_ID]);
+                }
+                catch (e) { }
+                // Update user configurations if they have a default safe map
+                try {
+                    yield conn.query(`UPDATE user_configs SET defaultTreasuryId = ? WHERE defaultTreasuryId = ?`, [MAIN_SAFE_ID, TARGET_ID]);
+                }
+                catch (e) { }
+                // Delete the rogue account
+                yield conn.query(`DELETE FROM accounts WHERE id = ?`, [TARGET_ID]);
+            }
+            // Recalculate Main Safe balance from journal lines
+            const [calcResult] = yield conn.query(`SELECT SUM(debit - credit) as newBalance FROM journal_lines WHERE accountId = ?`, [MAIN_SAFE_ID]);
+            const newBalance = ((_a = calcResult[0]) === null || _a === void 0 ? void 0 : _a.newBalance) || 0;
+            yield conn.query(`UPDATE accounts SET balance = ? WHERE id = ?`, [newBalance, MAIN_SAFE_ID]);
+            console.log(`✅ [Migration] Phantom safes securely merged. Main Safe Balance Recalculated: ${newBalance}`);
+        }
+        catch (e) {
+            console.error('⚠️ [Migration] Error during Phantom Safes Cleanup:', e);
+        }
+        finally {
+            if (conn)
+                conn.release();
+        }
+    });
+}
+/**
+ * Automatically repairs long invoice numbers created by sync errors
+ * E.g., translates INVOICE_SALE00005 back to INV-00005
+ */
+function fixLongInvoiceNumbers() {
+    return __awaiter(this, void 0, void 0, function* () {
+        let conn;
+        try {
+            conn = yield exports.pool.getConnection();
+            const updates = [
+                { old: 'INVOICE_SALE', new: 'INV-' },
+                { old: 'SALE_INVOICE', new: 'INV-' },
+                { old: 'INVOICE_PURCHASE', new: 'PUR-' },
+                { old: 'PURCHASE_INVOICE', new: 'PUR-' },
+                { old: 'RETURN_SALE', new: 'RET-S-' },
+                { old: 'SALE_RETURN', new: 'RET-S-' },
+                { old: 'RETURN_PURCHASE', new: 'RET-P-' },
+                { old: 'PURCHASE_RETURN', new: 'RET-P-' },
+            ];
+            let totalFixed = 0;
+            for (const mapping of updates) {
+                // Find invoices starting with the long prefix
+                const [rows] = yield conn.query(`SELECT id, number FROM invoices WHERE number LIKE ?`, [`${mapping.old}%`]);
+                if (rows && rows.length > 0) {
+                    console.log(`🧹 [Migration] Found ${rows.length} invoices with long prefix ${mapping.old}. Repairing to ${mapping.new}...`);
+                    for (const row of rows) {
+                        const newNumber = row.number.replace(mapping.old, mapping.new);
+                        yield conn.query(`UPDATE invoices SET number = ? WHERE id = ?`, [newNumber, row.id]);
+                        totalFixed++;
+                    }
+                }
+            }
+            if (totalFixed > 0) {
+                console.log(`✅ [Migration] Successfully repaired ${totalFixed} long invoice numbers!`);
+            }
+        }
+        catch (e) {
+            console.error('⚠️ [Migration] Error repairing long invoices:', e);
+        }
+        finally {
+            if (conn)
+                conn.release();
+        }
+    });
+}
+/**
+ * Auto-Fix Dirty Invoice Numbers (runs on every server startup)
+ * ══════════════════════════════════════════════════════════════
+ * Detects and fixes invoice numbers that don't match the clean format: PREFIX-NNNNN
+ *
+ * Problems fixed:
+ *   1. Unpadded numbers: INV-1, INV-8, PUR-3 → INV-00038, PUR-00004
+ *   2. Duplicate numbers: Multiple INV-1 entries get unique sequential numbers
+ *   3. Fallback suffixed: INV-00021-mnyhhx66 → INV-00038 (clean sequential)
+ *
+ * Root cause: The old generator used `LIKE 'INV-%'` which matched INV-TRASH-* migration
+ * records (thousands of them). The sort returned TRASH records first, causing parseInt("TRASH")=NaN,
+ * resetting the counter to 1, exhausting retry attempts, and falling back to timestamp suffixes.
+ *
+ * This is IDEMPOTENT — safe to run on every startup. If no dirty numbers exist, it exits instantly.
+ */
+function fixDirtyInvoiceNumbers() {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        let conn;
+        try {
+            conn = yield exports.pool.getConnection();
+            // Define all invoice prefixes to check
+            const prefixes = [
+                { prefix: 'INV-', types: ['INVOICE_SALE', 'SALE_INVOICE'] },
+                { prefix: 'PUR-', types: ['INVOICE_PURCHASE', 'PURCHASE_INVOICE'] },
+                { prefix: 'RET-S-', types: ['RETURN_SALE', 'SALE_RETURN'] },
+                { prefix: 'RET-P-', types: ['RETURN_PURCHASE', 'PURCHASE_RETURN'] },
+                { prefix: 'REC-', types: ['RECEIPT'] },
+                { prefix: 'PAY-', types: ['PAYMENT'] },
+                { prefix: 'QUO-', types: ['QUOTATION'] },
+            ];
+            let totalFixed = 0;
+            for (const { prefix, types } of prefixes) {
+                const prefixLen = prefix.length;
+                // Clean format: PREFIX followed by only digits (5+ padded)
+                // e.g., INV-00037, PUR-00001, RET-S-00005
+                const cleanRegexp = `^${prefix.replace(/[-]/g, '[-')}[0-9]{5,}$`;
+                // Find current MAX clean number for this prefix
+                const [maxRow] = yield conn.query(`SELECT MAX(CAST(SUBSTRING(number, ${prefixLen + 1}) AS UNSIGNED)) AS maxNum
+         FROM invoices
+         WHERE number REGEXP ?`, [cleanRegexp]);
+                let nextNum = (((_a = maxRow[0]) === null || _a === void 0 ? void 0 : _a.maxNum) || 0) + 1;
+                // Find all dirty numbers for this prefix:
+                // - Numbers that START with the prefix
+                // - But do NOT match the clean REGEXP (unpadded, suffixed, etc.)
+                // - Exclude migration prefixes (OLD-*, INV-TRASH-*)
+                const typePlaceholders = types.map(() => '?').join(',');
+                const [dirtyRows] = yield conn.query(`SELECT id, number, date, partnerName
+         FROM invoices
+         WHERE type IN (${typePlaceholders})
+           AND number IS NOT NULL
+           AND number LIKE ?
+           AND number NOT LIKE 'OLD-%'
+           AND number NOT LIKE '%-TRASH-%'
+           AND number NOT REGEXP ?
+         ORDER BY date ASC, id ASC`, [...types, `${prefix}%`, cleanRegexp]);
+                if (!dirtyRows || dirtyRows.length === 0)
+                    continue;
+                console.log(`🔧 [AutoFix] Found ${dirtyRows.length} dirty "${prefix}" numbers to repair...`);
+                yield conn.beginTransaction();
+                try {
+                    for (const inv of dirtyRows) {
+                        const oldNumber = inv.number;
+                        const newNumber = `${prefix}${String(nextNum).padStart(5, '0')}`;
+                        // Update the invoice
+                        yield conn.query('UPDATE invoices SET number = ? WHERE id = ?', [newNumber, inv.id]);
+                        // Update journal entries referencing the old number
+                        yield conn.query(`UPDATE journal_entries SET description = REPLACE(description, ?, ?), 
+                    referenceId = IF(referenceId = ?, ?, referenceId) 
+             WHERE description LIKE ? OR referenceId = ?`, [oldNumber, newNumber, oldNumber, newNumber, `%${oldNumber}%`, oldNumber]);
+                        // Update linked receipt/payment notes
+                        yield conn.query(`UPDATE invoices SET notes = REPLACE(notes, ?, ?) 
+             WHERE notes LIKE ? AND id != ?`, [oldNumber, newNumber, `%${oldNumber}%`, inv.id]);
+                        console.log(`  ✅ ${oldNumber} → ${newNumber}  (${(inv.partnerName || '').substring(0, 25)})`);
+                        nextNum++;
+                        totalFixed++;
+                    }
+                    yield conn.commit();
+                }
+                catch (txErr) {
+                    yield conn.rollback();
+                    throw txErr;
+                }
+            }
+            if (totalFixed > 0) {
+                console.log(`✅ [AutoFix] Repaired ${totalFixed} dirty invoice numbers on startup.`);
+            }
+        }
+        catch (e) {
+            console.error('⚠️ [AutoFix] Error fixing dirty invoice numbers:', e);
+            // Non-fatal: server continues even if this fails
+        }
+        finally {
+            if (conn)
+                conn.release();
+        }
+    });
+}
+/**
+ * One-time migration: Sync banks.balance → GL account openingBalance
+ *
+ * WHY: The getBanks endpoint now returns GL-calculated balance (openingBalance + debits - credits)
+ * instead of the stored banks.balance field. Without this migration, bank balances would show 0
+ * on servers where banks were used before GL journal entries were created for bank transactions.
+ *
+ * HOW: For each bank with a linked GL account where openingBalance is still 0:
+ *   1. Calculate what openingBalance should be: banks.balance - (journal_debits - journal_credits)
+ *   2. This ensures: openingBalance + debits - credits = banks.balance (display doesn't change)
+ *
+ * SAFETY:
+ *   - Runs only ONCE (tracked by schema_meta flag 'bank_gl_synced')
+ *   - Skips banks where GL account already has a non-zero opening balance
+ *   - Non-fatal: server starts even if this fails
+ */
+function syncBankBalancesToGL() {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b, _c;
+        let conn;
+        try {
+            conn = yield exports.pool.getConnection();
+            // Check if already synced (one-time flag)
+            const [flagRows] = yield conn.query(`SELECT value FROM schema_meta WHERE \`key\` = 'bank_gl_synced' LIMIT 1`);
+            if (((_a = flagRows[0]) === null || _a === void 0 ? void 0 : _a.value) === '1')
+                return; // Already done
+            // Get all banks with linked GL accounts
+            const [banks] = yield conn.query(`
+      SELECT b.id, b.name, b.balance, b.accountId,
+             COALESCE(a.openingBalance, 0) as glOpening
+      FROM banks b
+      LEFT JOIN accounts a ON b.accountId = a.id
+      WHERE b.accountId IS NOT NULL
+    `);
+            let synced = 0;
+            for (const bank of banks) {
+                const storedBalance = Number(bank.balance) || 0;
+                const glOpening = Number(bank.glOpening) || 0;
+                // Only sync if GL opening balance is still at default (0)
+                if (glOpening !== 0) {
+                    console.log(`🏦 [BankSync] ${bank.name}: GL already has opening=${glOpening}, skipping`);
+                    continue;
+                }
+                if (storedBalance === 0) {
+                    console.log(`🏦 [BankSync] ${bank.name}: stored balance is 0, nothing to sync`);
+                    continue;
+                }
+                // Calculate journal totals for this bank's GL account
+                const [jl] = yield conn.query(`SELECT COALESCE(SUM(debit),0) as totalDebit, COALESCE(SUM(credit),0) as totalCredit
+         FROM journal_lines WHERE accountId = ?`, [bank.accountId]);
+                const journalDebit = Number((_b = jl[0]) === null || _b === void 0 ? void 0 : _b.totalDebit) || 0;
+                const journalCredit = Number((_c = jl[0]) === null || _c === void 0 ? void 0 : _c.totalCredit) || 0;
+                const journalNet = journalDebit - journalCredit;
+                // Calculate what opening balance should be so that:
+                // openingBalance + journalNet = storedBalance
+                const targetOpening = storedBalance - journalNet;
+                console.log(`🏦 [BankSync] ${bank.name}: stored=${storedBalance}, journalNet=${journalNet}, setting GL opening=${targetOpening}`);
+                yield conn.query(`UPDATE accounts SET openingBalance = ?, balance = COALESCE(balance, 0) + ? WHERE id = ?`, [targetOpening, targetOpening - glOpening, bank.accountId]);
+                synced++;
+            }
+            // Mark as synced so it doesn't run again
+            yield conn.query(`
+      INSERT INTO schema_meta (\`key\`, value) VALUES ('bank_gl_synced', '1')
+      ON DUPLICATE KEY UPDATE value = '1', updated_at = CURRENT_TIMESTAMP
+    `);
+            if (synced > 0) {
+                console.log(`✅ [BankSync] Synced ${synced} bank(s) balance → GL opening balance`);
+            }
+            else {
+                console.log(`✅ [BankSync] All banks already synced or no banks to sync`);
+            }
+        }
+        catch (e) {
+            console.error('⚠️ [BankSync] Error syncing bank balances to GL:', e);
+            // Non-fatal: server continues even if this fails
+        }
+        finally {
+            if (conn)
+                conn.release();
+        }
+    });
+}
+/**
+ * Auto-sync product costs from purchase history on startup.
+ *
+ * WHY: When a user clears the cost field on a product, it becomes 0. The system
+ * doesn't auto-pull from existing purchase invoices, leaving BOM calculations at 0.00.
+ *
+ * HOW:
+ *   1. Find all products where cost = 0 or NULL
+ *   2. For each, find the latest purchase invoice line price (net of line discount)
+ *   3. Update products.cost with that price
+ *   4. Recalculate BOM costs for finished products whose raw materials were updated
+ *
+ * SAFETY: Non-destructive — only fills in missing costs, never overwrites existing ones.
+ */
+function syncProductCostsFromPurchases() {
+    return __awaiter(this, void 0, void 0, function* () {
+        let conn;
+        try {
+            conn = yield exports.pool.getConnection();
+            // Find products with zero/null cost that have purchase history
+            const [zeroProducts] = yield conn.query(`
+      SELECT p.id, p.name, p.cost
+      FROM products p
+      WHERE (p.cost IS NULL OR p.cost = 0 OR p.cost = 0.00)
+        AND p.id IN (
+          SELECT DISTINCT il.productId 
+          FROM invoice_lines il
+          JOIN invoices i ON il.invoiceId = i.id
+          WHERE i.type = 'INVOICE_PURCHASE'
+        )
+    `);
+            if (!zeroProducts || zeroProducts.length === 0) {
+                return;
+            }
+            console.log(`🔄 [CostSync] Found ${zeroProducts.length} product(s) with cost=0 that have purchase history`);
+            let synced = 0;
+            const updatedProductIds = [];
+            for (const product of zeroProducts) {
+                // Get the latest purchase price for this product
+                const [priceRows] = yield conn.query(`
+        SELECT il.price, il.discount, il.quantity, i.date
+        FROM invoice_lines il
+        JOIN invoices i ON il.invoiceId = i.id
+        WHERE i.type = 'INVOICE_PURCHASE'
+          AND il.productId = ?
+        ORDER BY i.date DESC, i.id DESC
+        LIMIT 1
+      `, [product.id]);
+                if (!priceRows || priceRows.length === 0)
+                    continue;
+                const latestPurchase = priceRows[0];
+                const grossPrice = Number(latestPurchase.price) || 0;
+                const lineDiscount = Number(latestPurchase.discount) || 0;
+                const qty = Number(latestPurchase.quantity) || 1;
+                // Net unit cost = (gross - line discount / qty)
+                const netUnitCost = Math.max(0, grossPrice - (lineDiscount / qty));
+                if (netUnitCost <= 0)
+                    continue;
+                yield conn.query('UPDATE products SET cost = ? WHERE id = ?', [
+                    Number(netUnitCost.toFixed(2)),
+                    product.id
+                ]);
+                updatedProductIds.push(product.id);
+                synced++;
+                console.log(`  ✅ ${product.name}: cost 0 → ${netUnitCost.toFixed(2)} (from latest purchase)`);
+            }
+            // Recalculate BOM costs for finished products that use updated raw materials
+            if (updatedProductIds.length > 0) {
+                const placeholders = updatedProductIds.map(() => '?').join(',');
+                const [affectedBOMs] = yield conn.query(`
+        SELECT DISTINCT bi.bom_id
+        FROM bom_items bi
+        WHERE bi.raw_product_id IN (${placeholders})
+      `, updatedProductIds);
+                if (affectedBOMs && affectedBOMs.length > 0) {
+                    console.log(`  🔄 Recalculating ${affectedBOMs.length} BOM(s) with updated material costs...`);
+                    for (const bomRow of affectedBOMs) {
+                        const bomId = bomRow.bom_id;
+                        // Get BOM header
+                        const [bomHeaders] = yield conn.query(`
+            SELECT finished_product_id, labor_cost, overhead_cost, is_active
+            FROM bom WHERE id = ?
+          `, [bomId]);
+                        if (!bomHeaders || bomHeaders.length === 0)
+                            continue;
+                        const bom = bomHeaders[0];
+                        if (!bom.is_active)
+                            continue;
+                        // Get BOM items with updated costs
+                        const [bomItems] = yield conn.query(`
+            SELECT bi.quantity_per_unit, bi.waste_percent, p.cost as unit_cost
+            FROM bom_items bi
+            LEFT JOIN products p ON bi.raw_product_id = p.id
+            WHERE bi.bom_id = ?
+          `, [bomId]);
+                        let materialCost = 0;
+                        for (const item of bomItems) {
+                            const qtyWithWaste = (item.quantity_per_unit || 0) * (1 + (item.waste_percent || 0) / 100);
+                            materialCost += qtyWithWaste * (item.unit_cost || 0);
+                        }
+                        const totalCost = materialCost + (parseFloat(bom.labor_cost) || 0) + (parseFloat(bom.overhead_cost) || 0);
+                        yield conn.query('UPDATE products SET cost = ? WHERE id = ?', [
+                            Number(totalCost.toFixed(2)),
+                            bom.finished_product_id
+                        ]);
+                        console.log(`  ✅ BOM ${bomId}: finished product cost → ${totalCost.toFixed(2)}`);
+                    }
+                }
+            }
+            if (synced > 0) {
+                console.log(`✅ [CostSync] Restored cost for ${synced} product(s) from purchase history`);
+            }
+        }
+        catch (e) {
+            console.error('⚠️ [CostSync] Error syncing product costs:', e);
+            // Non-fatal: server continues even if this fails
         }
         finally {
             if (conn)

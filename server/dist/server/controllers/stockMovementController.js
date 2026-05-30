@@ -19,6 +19,7 @@ const errorHandler_1 = require("../utils/errorHandler");
 // Get stock movements with filters
 const getStockMovements = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
+        const authReq = req;
         const { productId, movementType, startDate, endDate, warehouseId, limit = 99999, offset = 0 } = req.query;
         let query = `
             SELECT sm.*, 
@@ -30,6 +31,13 @@ const getStockMovements = (req, res) => __awaiter(void 0, void 0, void 0, functi
             WHERE 1=1
         `;
         const params = [];
+        // ═══════════════════════════════════════════
+        // MANDATORY: Fiscal Year Hard Boundary
+        // ═══════════════════════════════════════════
+        if (authReq.fiscalYearFilter) {
+            query += ' AND sm.movement_date >= ? AND sm.movement_date <= ?';
+            params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         if (productId) {
             query += ' AND sm.product_id = ?';
             params.push(productId);
@@ -57,6 +65,11 @@ const getStockMovements = (req, res) => __awaiter(void 0, void 0, void 0, functi
         // Get total count for pagination
         let countQuery = 'SELECT COUNT(*) as total FROM stock_movements sm WHERE 1=1';
         const countParams = [];
+        // MANDATORY: Fiscal Year Hard Boundary (count query)
+        if (authReq.fiscalYearFilter) {
+            countQuery += ' AND sm.movement_date >= ? AND sm.movement_date <= ?';
+            countParams.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         if (productId) {
             countQuery += ' AND sm.product_id = ?';
             countParams.push(productId);
@@ -119,7 +132,7 @@ exports.getStockMovements = getStockMovements;
 const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { productId } = req.params;
-        const { warehouseId } = req.query;
+        const { warehouseId, variantId } = req.query;
         // First, get all warehouses for name lookup
         const [warehouseRows] = yield db_1.pool.query('SELECT id, name FROM warehouses');
         const warehouseMap = {};
@@ -128,43 +141,90 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
         });
         // 1. Fetch HISTORICAL Invoices (Sales, Purchases, Returns)
         // EXCLUDE invoices that have stock_movements records (to avoid double-counting new invoices)
-        const [invoiceRows] = yield db_1.pool.query(`
-            SELECT 
-                i.id, 
-                i.date, 
-                i.type, 
-                i.number as docNumber, 
-                CONCAT(i.type, ' - ', COALESCE(i.partnerName, '')) as description,
-                i.notes,
-                il.quantity,
-                COALESCE(il.warehouseId, i.warehouseId) as docWarehouseId
-            FROM invoice_lines il
-            JOIN invoices i ON il.invoiceId = i.id
-            WHERE il.productId = ? 
-              AND i.status = 'POSTED' 
-              AND i.number NOT LIKE 'VAN-%'
-              AND NOT EXISTS (
-                  SELECT 1 FROM stock_movements sm 
-                  WHERE sm.reference_id = i.id 
-                    AND sm.product_id = il.productId
-                    AND sm.reference_type IN ('INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE')
-              )
-        `, [productId]);
-        // 2. Fetch Stock Permits (In, Out, Transfer)
-        const [permitRows] = yield db_1.pool.query(`
-            SELECT 
-                sp.id, 
-                sp.date, 
-                sp.type, 
-                sp.number as docNumber, 
-                sp.description,
-                spi.quantity,
-                sp.sourceWarehouseId,
-                sp.destWarehouseId
-            FROM stock_permit_items spi
-            JOIN stock_permits sp ON spi.permitId = sp.id
-            WHERE spi.productId = ?
-        `, [productId]);
+        let invoiceRows;
+        try {
+            let invoiceQuery = `
+                SELECT 
+                    i.id, 
+                    i.date, 
+                    i.type, 
+                    i.number as docNumber, 
+                    CONCAT(i.type, ' - ', COALESCE(i.partnerName, '')) as description,
+                    i.notes,
+                    il.quantity,
+                    COALESCE(il.bonusQty, 0) as bonusQty,
+                    COALESCE(il.warehouseId, i.warehouseId) as docWarehouseId,
+                    il.returnCondition
+                FROM invoice_lines il
+                JOIN invoices i ON il.invoiceId = i.id
+                WHERE il.productId = ? 
+                  AND i.status IN ('POSTED', 'COMPLETED', 'PARTIAL') 
+                  AND i.number NOT LIKE 'VAN-%'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM stock_movements sm 
+                      WHERE sm.reference_id = i.id 
+                        AND sm.product_id = il.productId
+                        AND sm.reference_type IN ('INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM stock_reservations sr
+                      WHERE sr.invoiceId = i.id
+                        AND sr.productId = il.productId
+                        AND sr.status IN ('RESERVED', 'DISPATCHED')
+                  )
+            `;
+            const invoiceParams = [productId];
+            // Filter by variant if specified
+            if (variantId) {
+                invoiceQuery += ' AND il.variantId = ?';
+                invoiceParams.push(variantId);
+            }
+            const [rows] = yield db_1.pool.query(invoiceQuery, invoiceParams);
+            invoiceRows = rows;
+        }
+        catch (e) {
+            // Fallback: query without returnCondition if column doesn't exist yet
+            console.warn('⚠️ returnCondition column not found, falling back:', e.message);
+            let fallbackQuery = `
+                SELECT 
+                    i.id, 
+                    i.date, 
+                    i.type, 
+                    i.number as docNumber, 
+                    CONCAT(i.type, ' - ', COALESCE(i.partnerName, '')) as description,
+                    i.notes,
+                    il.quantity,
+                    COALESCE(il.bonusQty, 0) as bonusQty,
+                    COALESCE(il.warehouseId, i.warehouseId) as docWarehouseId
+                FROM invoice_lines il
+                JOIN invoices i ON il.invoiceId = i.id
+                WHERE il.productId = ? 
+                  AND i.status IN ('POSTED', 'COMPLETED', 'PARTIAL') 
+                  AND i.number NOT LIKE 'VAN-%'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM stock_movements sm 
+                      WHERE sm.reference_id = i.id 
+                        AND sm.product_id = il.productId
+                        AND sm.reference_type IN ('INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE')
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM stock_reservations sr
+                      WHERE sr.invoiceId = i.id
+                        AND sr.productId = il.productId
+                        AND sr.status IN ('RESERVED', 'DISPATCHED')
+                  )
+            `;
+            const fallbackParams = [productId];
+            if (variantId) {
+                fallbackQuery += ' AND il.variantId = ?';
+                fallbackParams.push(variantId);
+            }
+            const [rows] = yield db_1.pool.query(fallbackQuery, fallbackParams);
+            invoiceRows = rows;
+        }
+        // 2. Stock Permits are now tracked via stock_movements table
+        // (stockPermitController creates stock_movements entries when permits are saved)
+        // The permitRows query was removed to prevent double-counting
         // 2. Fetch Stock Movements (Invoices, Production, Adjustments, Opening Balances, etc.)
         // This includes ALL stock changes - invoices now write here via invoiceController
         let stockMovementQuery = `
@@ -180,8 +240,14 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 sm.warehouse_id
             FROM stock_movements sm
             WHERE sm.product_id = ?
+              AND (sm.reference_type IS NULL OR sm.reference_type NOT IN ('BALANCE_SYNC', 'SYSTEM_ADJUSTMENT'))
         `;
         const smParams = [productId];
+        // Filter by variant_id if specified
+        if (variantId) {
+            stockMovementQuery += ' AND sm.variant_id = ?';
+            smParams.push(variantId);
+        }
         if (warehouseId) {
             // For specific warehouse ID, include:
             // 1. Movements with that specific warehouse ID
@@ -208,18 +274,20 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
             }
             let inQty = 0;
             let outQty = 0;
+            // Include bonusQty in displayed movement quantities
+            const totalQty = parseFloat(row.quantity) + parseFloat(row.bonusQty || 0);
             switch (row.type) {
                 case 'INVOICE_SALE':
-                    outQty = row.quantity;
+                    outQty = totalQty;
                     break;
                 case 'INVOICE_PURCHASE':
-                    inQty = row.quantity;
+                    inQty = totalQty;
                     break;
                 case 'RETURN_SALE':
-                    inQty = row.quantity;
+                    inQty = totalQty;
                     break;
                 case 'RETURN_PURCHASE':
-                    outQty = row.quantity;
+                    outQty = totalQty;
                     break;
             }
             const warehouseName = whId ? warehouseMap[whId] : null;
@@ -252,179 +320,95 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 warehouseName: warehouseName || 'الكل',
                 sourceWarehouse: null,
                 destWarehouse: null,
-                transferQty: 0
+                transferQty: 0,
+                returnCondition: row.returnCondition || null
             });
         });
-        // Process Permits - For transfers, show individual FROM/TO entries
+        // 3. Fetch HISTORICAL Stock Permits (those NOT already in stock_movements)
+        // Only process permits whose id is NOT in stock_movements.reference_id
+        let permitQuery = `
+            SELECT 
+                sp.id,
+                sp.date,
+                sp.type,
+                sp.sourceWarehouseId,
+                sp.destWarehouseId,
+                sp.description as permitDescription,
+                spi.productId,
+                spi.productName,
+                spi.quantity
+            FROM stock_permits sp
+            JOIN stock_permit_items spi ON sp.id = spi.permitId
+            WHERE spi.productId = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM stock_movements sm 
+                  WHERE sm.reference_id = sp.id 
+                    AND sm.product_id = spi.productId
+                    AND sm.reference_type IN ('STOCK_PERMIT_IN', 'STOCK_PERMIT_OUT', 'STOCK_TRANSFER', 'ADJUSTMENT')
+              )
+        `;
+        const permitParams = [productId];
+        if (warehouseId) {
+            permitQuery += ' AND (sp.sourceWarehouseId = ? OR sp.destWarehouseId = ?)';
+            permitParams.push(warehouseId, warehouseId);
+        }
+        const [permitRows] = yield db_1.pool.query(permitQuery, permitParams);
+        // Process historical permits
         permitRows.forEach(row => {
-            const sourceWarehouseName = row.sourceWarehouseId ? warehouseMap[row.sourceWarehouseId] : null;
-            const destWarehouseName = row.destWarehouseId ? warehouseMap[row.destWarehouseId] : null;
-            if (targetWarehouseId) {
-                // Warehouse Specific View
-                if (row.type === 'STOCK_PERMIT_IN') {
-                    if (row.destWarehouseId === targetWarehouseId) {
-                        movements.push({
-                            id: row.id,
-                            date: row.date,
-                            type: row.type,
-                            docNumber: row.docNumber || row.id,
-                            description: row.description || `إذن إضافة إلى ${destWarehouseName}`,
-                            inQty: row.quantity,
-                            outQty: 0,
-                            balance: 0,
-                            warehouseId: row.destWarehouseId,
-                            warehouseName: destWarehouseName,
-                            sourceWarehouse: null,
-                            destWarehouse: destWarehouseName,
-                            transferQty: 0
-                        });
-                    }
-                }
-                else if (row.type === 'STOCK_PERMIT_OUT') {
+            const qty = parseFloat(row.quantity) || 0;
+            let inQty = 0;
+            let outQty = 0;
+            let displayType = row.type;
+            let whId = null;
+            let sourceWarehouse = null;
+            let destWarehouse = null;
+            let transferQty = 0;
+            if (row.type === 'STOCK_PERMIT_IN') {
+                inQty = qty;
+                displayType = 'إذن إضافة';
+                whId = row.destWarehouseId;
+            }
+            else if (row.type === 'STOCK_PERMIT_OUT') {
+                outQty = qty;
+                displayType = 'إذن صرف';
+                whId = row.sourceWarehouseId;
+            }
+            else if (row.type === 'STOCK_TRANSFER') {
+                displayType = 'تحويل مخزني';
+                sourceWarehouse = warehouseMap[row.sourceWarehouseId] || row.sourceWarehouseId;
+                destWarehouse = warehouseMap[row.destWarehouseId] || row.destWarehouseId;
+                if (targetWarehouseId) {
                     if (row.sourceWarehouseId === targetWarehouseId) {
-                        movements.push({
-                            id: row.id,
-                            date: row.date,
-                            type: row.type,
-                            docNumber: row.docNumber || row.id,
-                            description: row.description || `إذن صرف من ${sourceWarehouseName}`,
-                            inQty: 0,
-                            outQty: row.quantity,
-                            balance: 0,
-                            warehouseId: row.sourceWarehouseId,
-                            warehouseName: sourceWarehouseName,
-                            sourceWarehouse: sourceWarehouseName,
-                            destWarehouse: null
-                        });
+                        outQty = qty;
+                        whId = row.sourceWarehouseId;
+                    }
+                    else if (row.destWarehouseId === targetWarehouseId) {
+                        inQty = qty;
+                        whId = row.destWarehouseId;
                     }
                 }
-                else if (row.type === 'STOCK_TRANSFER') {
-                    // For specific warehouse view, show IN or OUT based on perspective
-                    if (row.destWarehouseId === targetWarehouseId) {
-                        movements.push({
-                            id: `${row.id}-IN`,
-                            date: row.date,
-                            type: 'STOCK_TRANSFER',
-                            docNumber: row.docNumber || row.id,
-                            description: `تحويل فروع: من ${sourceWarehouseName} ← إلى ${destWarehouseName}`,
-                            inQty: row.quantity,
-                            outQty: 0,
-                            balance: 0,
-                            warehouseId: row.destWarehouseId,
-                            warehouseName: destWarehouseName,
-                            sourceWarehouse: sourceWarehouseName,
-                            destWarehouse: destWarehouseName
-                        });
-                    }
-                    else if (row.sourceWarehouseId === targetWarehouseId) {
-                        movements.push({
-                            id: `${row.id}-OUT`,
-                            date: row.date,
-                            type: 'STOCK_TRANSFER',
-                            docNumber: row.docNumber || row.id,
-                            description: `تحويل فروع: من ${sourceWarehouseName} ← إلى ${destWarehouseName}`,
-                            inQty: 0,
-                            outQty: row.quantity,
-                            balance: 0,
-                            warehouseId: row.sourceWarehouseId,
-                            warehouseName: sourceWarehouseName,
-                            sourceWarehouse: sourceWarehouseName,
-                            destWarehouse: destWarehouseName
-                        });
-                    }
+                else {
+                    // Global view: transfers are net zero, show as transfer
+                    transferQty = qty;
+                    whId = row.sourceWarehouseId;
                 }
             }
-            else {
-                // Global View - Show both sides of transfer as SEPARATE movements
-                if (row.type === 'STOCK_PERMIT_IN') {
-                    movements.push({
-                        id: row.id,
-                        date: row.date,
-                        type: row.type,
-                        docNumber: row.docNumber || row.id,
-                        description: row.description || `إذن إضافة إلى ${destWarehouseName}`,
-                        inQty: row.quantity,
-                        outQty: 0,
-                        balance: 0,
-                        warehouseId: row.destWarehouseId,
-                        warehouseName: destWarehouseName,
-                        sourceWarehouse: null,
-                        destWarehouse: destWarehouseName,
-                        transferQty: 0
-                    });
-                }
-                else if (row.type === 'STOCK_PERMIT_OUT') {
-                    // Vehicle Loads are now REAL deductions (not floating)
-                    const isCarLoad = row.description && row.description.includes('تحميل سيارة');
-                    if (isCarLoad) {
-                        // Show as real OUT (deduction from warehouse)
-                        movements.push({
-                            id: row.id,
-                            date: row.date,
-                            type: 'STOCK_PERMIT_OUT',
-                            docNumber: row.docNumber || row.id,
-                            description: `تحميل سيارة: نقل من ${sourceWarehouseName} ← إلى مخازن السيارات`,
-                            inQty: 0,
-                            outQty: row.quantity, // Count as real deduction
-                            transferQty: 0,
-                            balance: 0,
-                            warehouseId: row.sourceWarehouseId,
-                            warehouseName: sourceWarehouseName,
-                            sourceWarehouse: sourceWarehouseName,
-                            destWarehouse: 'مخازن السيارات'
-                        });
-                    }
-                    else {
-                        movements.push({
-                            id: row.id,
-                            date: row.date,
-                            type: row.type,
-                            docNumber: row.docNumber || row.id,
-                            description: row.description || `إذن صرف من ${sourceWarehouseName}`,
-                            inQty: 0,
-                            outQty: row.quantity,
-                            balance: 0,
-                            warehouseId: row.sourceWarehouseId,
-                            warehouseName: sourceWarehouseName,
-                            sourceWarehouse: sourceWarehouseName,
-                            destWarehouse: null,
-                            transferQty: 0
-                        });
-                    }
-                }
-                else if (row.type === 'STOCK_TRANSFER') {
-                    // For global view, show transfer as TWO separate entries: OUT from source, IN to dest
-                    // This shows the complete picture of where items moved FROM and TO
-                    movements.push({
-                        id: `${row.id}-OUT`,
-                        date: row.date,
-                        type: 'STOCK_TRANSFER',
-                        docNumber: row.docNumber || row.id,
-                        description: `تحويل فروع: صادر من ${sourceWarehouseName} ← إلى ${destWarehouseName}`,
-                        inQty: 0,
-                        outQty: row.quantity,
-                        balance: 0,
-                        warehouseId: row.sourceWarehouseId,
-                        warehouseName: sourceWarehouseName,
-                        sourceWarehouse: sourceWarehouseName,
-                        destWarehouse: destWarehouseName
-                    });
-                    movements.push({
-                        id: `${row.id}-IN`,
-                        date: row.date,
-                        type: 'STOCK_TRANSFER',
-                        docNumber: row.docNumber || row.id,
-                        description: `تحويل فروع: وارد من ${sourceWarehouseName} ← إلى ${destWarehouseName}`,
-                        inQty: row.quantity,
-                        outQty: 0,
-                        balance: 0,
-                        warehouseId: row.destWarehouseId,
-                        warehouseName: destWarehouseName,
-                        sourceWarehouse: sourceWarehouseName,
-                        destWarehouse: destWarehouseName
-                    });
-                }
-            }
+            const warehouseName = whId ? warehouseMap[whId] : 'الكل';
+            movements.push({
+                id: `PERMIT-${row.id}`,
+                date: row.date,
+                type: displayType,
+                docNumber: `Permit #${row.id.substring(0, 8)}`,
+                description: row.permitDescription || `${displayType} - ${row.productName || ''}`,
+                inQty,
+                outQty,
+                transferQty,
+                balance: 0,
+                warehouseId: whId,
+                warehouseName: warehouseName,
+                sourceWarehouse,
+                destWarehouse
+            });
         });
         // Process Stock Movements (Production, Adjustments, Opening Balances)
         stockMovementRows.forEach(row => {
@@ -475,6 +459,25 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 case 'RETURN_PURCHASE':
                     displayType = 'مرتجع مشتريات';
                     break;
+                case 'RETURN_IN':
+                    displayType = 'مرتجع مبيعات';
+                    break; // Stock IN from customer return
+                case 'RETURN_OUT':
+                    displayType = 'مرتجع مشتريات';
+                    break; // Stock OUT for vendor return
+            }
+            // Improve labels for Stock Permits based on reference_type
+            if (row.reference_type === 'STOCK_PERMIT_IN') {
+                displayType = 'إذن إضافة';
+            }
+            else if (row.reference_type === 'STOCK_PERMIT_OUT') {
+                displayType = 'إذن صرف';
+            }
+            else if (row.reference_type === 'STOCK_TRANSFER') {
+                // For Transfer, keep TRANSFER_IN/OUT distinction if desired, or unify
+                // But keep 'تحويل وارد'/'تحويل صادر' from switch for clarity
+                // Or use 'تحويل مخزني' to match Permit UI?
+                // Let's stick to existing switch for Transfer unless specific override needed
             }
             // Vehicle Loads are now REAL deductions (not floating)
             // They deduct from the source warehouse immediately
@@ -489,17 +492,26 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 // This will properly deduct from the running balance
             }
             let warehouseName = row.warehouse_id ? warehouseMap[row.warehouse_id] : 'الكل';
-            // Van Sales: Show in movement card but DON'T affect warehouse balance
-            // Van sales deduct from VEHICLE inventory, not warehouse
-            // The vehicle load already deducted from warehouse when items were loaded
+            // Van Sales: Show differently depending on view
+            // In SPECIFIC warehouse view: zero out (stock left via vehicle load, not direct sale)
+            // In GLOBAL view: show actual quantities so running balance matches stock balance
             const isVanSale = (row.reference_type === 'VAN_SALE') ||
                 (row.warehouse_id === null && (String(row.type) === 'SALE' || (row.notes && row.notes.includes('بيع متنقل'))));
             if (isVanSale) {
-                warehouseName = 'مخازن السيارات';
-                // Zero out the qty so it doesn't affect running balance in global view
-                // These items were already deducted when loaded onto vehicle
-                outQty = 0;
-                inQty = 0;
+                // Completely exclude Van Sales from the report
+                // User requirement: "only تحميل سيارة can affect it"
+                // This prevents Van Sales from appearing or affecting the running balance
+                return;
+            }
+            // Extract returnCondition from notes for return movements
+            let returnCondition = null;
+            if (row.type === 'RETURN_IN' || row.type === 'RETURN_OUT' || row.reference_type === 'RETURN_SALE' || row.reference_type === 'RETURN_PURCHASE') {
+                if (row.description && row.description.includes('(هالك)')) {
+                    returnCondition = 'DAMAGED';
+                }
+                else if (row.description && row.description.includes('(سليم)')) {
+                    returnCondition = 'GOOD';
+                }
             }
             movements.push({
                 id: `SM-${row.id}`,
@@ -514,7 +526,8 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 warehouseId: row.warehouse_id,
                 warehouseName: warehouseName,
                 sourceWarehouse: null,
-                destWarehouse: null
+                destWarehouse: null,
+                returnCondition
             });
         });
         // Sort: Oldest First to calculate running balance
@@ -546,7 +559,7 @@ exports.getProductMovementHistory = getProductMovementHistory;
 // Create stock movement (manual adjustment)
 const createStockMovement = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
-    const connection = yield db_1.pool.getConnection();
+    const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
         const { productId, warehouseId, qtyChange, movementType, referenceType, referenceId, unitCost, notes, createdBy } = req.body;
@@ -650,6 +663,7 @@ exports.reconcileStock = reconcileStock;
 // Get movement statistics
 const getMovementStats = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
+        const authReq = req;
         const { startDate, endDate } = req.query;
         let query = `
             SELECT 
@@ -661,6 +675,11 @@ const getMovementStats = (req, res) => __awaiter(void 0, void 0, void 0, functio
             WHERE 1=1
         `;
         const params = [];
+        // MANDATORY: Fiscal Year Hard Boundary
+        if (authReq.fiscalYearFilter) {
+            query += ' AND movement_date >= ? AND movement_date <= ?';
+            params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         if (startDate) {
             query += ' AND movement_date >= ?';
             params.push(startDate);

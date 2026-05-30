@@ -38,7 +38,7 @@ function canSeeAllData(userRole, systemConfig) {
         return true;
     }
     // Check if this role is in the whitelist
-    const allowedRoles = (systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.whoCanSeeAllData) || ['MASTER_ADMIN', 'ADMIN'];
+    const allowedRoles = (systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.whoCanSeeAllData) || ['MASTER_ADMIN', 'ADMIN', 'GENERAL_MANAGER'];
     return allowedRoles.includes(userRole);
 }
 /**
@@ -47,17 +47,30 @@ function canSeeAllData(userRole, systemConfig) {
 function canModifyOthersData(userRole, systemConfig) {
     // If modify others is not enabled, only creators can modify
     if (!(systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.enableModifyOthersData)) {
-        // But MASTER_ADMIN and ADMIN always can
-        return userRole === 'MASTER_ADMIN' || userRole === 'ADMIN';
+        // But MASTER_ADMIN, ADMIN, and GENERAL_MANAGER always can
+        return userRole === 'MASTER_ADMIN' || userRole === 'ADMIN' || userRole === 'GENERAL_MANAGER';
     }
     // Check if this role is in the whitelist
-    const allowedRoles = (systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.whoCanModifyOthersData) || ['MASTER_ADMIN', 'ADMIN'];
+    const allowedRoles = (systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.whoCanModifyOthersData) || ['MASTER_ADMIN', 'ADMIN', 'GENERAL_MANAGER'];
     return allowedRoles.includes(userRole);
 }
 /**
- * Builds SQL WHERE clause for filtering data by user
- * Returns empty string if user can see all data
+ * Builds SQL WHERE clause for filtering data by user.
+ * Returns empty string if user can see all data.
+ *
+ * SECURITY: tableName is validated against an allowlist of known table names
+ * to prevent SQL injection. userName uses manual escaping which is fragile —
+ * prefer buildParameterizedFilter() for new code.
+ *
+ * @deprecated Use buildParameterizedFilter() instead — it uses parameterized queries.
  */
+// Allowlist of table names that may use this filter
+const ALLOWED_FILTER_TABLES = new Set([
+    'invoices', 'i', 'journal_entries', 'je', 'cheques', 'c',
+    'stock_permits', 'sp', 'partners', 'p', 'products', 'pr',
+    'account_transactions', 'at', 'treasury_transactions', 'tt',
+    'bank_transactions', 'bt', 'audit_logs', 'al',
+]);
 function buildUserFilterClause(tableName, options, additionalConditions = '') {
     const { userRole, userName, systemConfig } = options;
     if (!userRole || !userName) {
@@ -67,8 +80,15 @@ function buildUserFilterClause(tableName, options, additionalConditions = '') {
     if (canSeeAllData(userRole, systemConfig)) {
         return additionalConditions;
     }
+    // SECURITY: Validate tableName against allowlist to prevent SQL injection
+    if (!ALLOWED_FILTER_TABLES.has(tableName)) {
+        console.error(`🔴 [SECURITY] buildUserFilterClause called with unknown table: "${tableName}"`);
+        // Fail closed — return a condition that filters everything
+        return '1=0';
+    }
     // Build filter for user's own data
-    const userFilter = `${tableName}.createdBy = '${userName.replace(/'/g, "''")}'`;
+    // NOTE: Manual escaping is fragile. Use buildParameterizedFilter() for new code.
+    const userFilter = `${tableName}.createdBy = '${userName.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`;
     // Combine with additional conditions
     if (additionalConditions) {
         return `(${userFilter}) AND (${additionalConditions})`;
@@ -79,8 +99,8 @@ function buildUserFilterClause(tableName, options, additionalConditions = '') {
  * Validates if user can create a transaction based on amount limits
  */
 function validateTransactionAmount(amount, userRole, systemConfig) {
-    // MASTER_ADMIN and ADMIN have no limits
-    if (userRole === 'MASTER_ADMIN' || userRole === 'ADMIN') {
+    // MASTER_ADMIN, ADMIN, and GENERAL_MANAGER have no limits
+    if (userRole === 'MASTER_ADMIN' || userRole === 'ADMIN' || userRole === 'GENERAL_MANAGER') {
         return { allowed: true };
     }
     // Check if limits are enabled
@@ -91,6 +111,7 @@ function validateTransactionAmount(amount, userRole, systemConfig) {
     const limits = systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.transactionLimits;
     let limit = 0;
     switch (userRole) {
+        case 'CASHIER':
         case 'SALES':
             limit = (limits === null || limits === void 0 ? void 0 : limits.SALES) || 0;
             break;
@@ -210,6 +231,7 @@ function hasHigherOrEqualRole(userRole, requiredRole) {
         'ADMIN': 4,
         'ACCOUNTANT': 3,
         'SALES': 2,
+        'CASHIER': 2,
         'INVENTORY': 1,
         'WAREHOUSE_SUPERVISOR': 1,
         'MAINTENANCE': 1,
@@ -235,16 +257,31 @@ function shouldFilterEntity(entityName) {
     return exports.FILTERABLE_ENTITIES.includes(entityName);
 }
 /**
+ * Role-based default permissions (mirrors authMiddleware.ts ROLE_DEFAULT_PERMISSIONS)
+ * Ensures hasPermission() is consistent across all server-side permission checks.
+ */
+// Role defaults intentionally empty — permissions managed entirely via admin UI
+const SERVER_ROLE_DEFAULTS = {};
+/**
  * Checks if a user has a specific permission
  */
 function hasPermission(user, permissionId) {
     if (!user)
         return false;
-    // Admin bypass
+    // Admin bypass — only true system admins get unconditional access.
+    // GENERAL_MANAGER is intentionally excluded: their permissions are
+    // managed via the admin UI (see SERVER_ROLE_DEFAULTS comment above).
     if (user.role === 'ADMIN' || user.role === 'MASTER_ADMIN')
         return true;
     const permissions = user.permissions || [];
-    return permissions.includes(permissionId) || permissions.includes('all');
+    if (permissions.includes(permissionId) || permissions.includes('all'))
+        return true;
+    // Check role-based default permissions
+    const role = (user.role || '').toUpperCase();
+    const roleDefaults = SERVER_ROLE_DEFAULTS[role];
+    if (roleDefaults === null || roleDefaults === void 0 ? void 0 : roleDefaults.includes(permissionId))
+        return true;
+    return false;
 }
 // ============================================
 // SALESMAN DATA ISOLATION (عزل بيانات المندوبين)
@@ -263,7 +300,7 @@ function isExemptFromSalesmanIsolation(userRole, systemConfig) {
         return true;
     }
     // Check if this role is in the exempt list
-    const exemptRoles = ((_b = systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.salesmanIsolation) === null || _b === void 0 ? void 0 : _b.exemptRoles) || ['MASTER_ADMIN', 'ADMIN'];
+    const exemptRoles = ((_b = systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.salesmanIsolation) === null || _b === void 0 ? void 0 : _b.exemptRoles) || ['MASTER_ADMIN', 'ADMIN', 'GENERAL_MANAGER'];
     return exemptRoles.includes(userRole);
 }
 /**

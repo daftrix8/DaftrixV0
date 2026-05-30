@@ -14,7 +14,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getSalesmanCommissionReport = exports.getUnassignedCustomers = exports.unassignCustomer = exports.bulkAssignCustomers = exports.assignCustomer = exports.getSalesmanCustomers = exports.getCommissionSummary = exports.markCommissionPaid = exports.rejectCommission = exports.approveCommission = exports.calculateCommission = exports.getCommissionRecords = exports.deleteCommissionTier = exports.updateCommissionTier = exports.createCommissionTier = exports.getCommissionTiers = void 0;
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
 // =================== COMMISSION TIERS ===================
@@ -45,12 +45,42 @@ const getCommissionTiers = (req, res) => __awaiter(void 0, void 0, void 0, funct
     }
 });
 exports.getCommissionTiers = getCommissionTiers;
+// Helper function to check tier overlap
+const checkTierOverlap = (conn, tierId, isGlobal, salesmanId, minAmount, maxAmount) => __awaiter(void 0, void 0, void 0, function* () {
+    let query = `
+        SELECT id, tierName, minAmount, maxAmount 
+        FROM commission_tiers 
+        WHERE isActive = TRUE 
+          AND (? < COALESCE(maxAmount, 999999999999))
+          AND (COALESCE(?, 999999999999) > minAmount)
+    `;
+    const params = [minAmount, maxAmount];
+    if (tierId) {
+        query += ` AND id != ?`;
+        params.push(tierId);
+    }
+    if (isGlobal) {
+        query += ` AND isGlobal = TRUE`;
+    }
+    else {
+        query += ` AND (salesmanId = ? OR isGlobal = TRUE)`;
+        params.push(salesmanId);
+    }
+    const [overlapping] = yield conn.query(query, params);
+    return overlapping[0];
+});
 // Create commission tier
 const createCommissionTier = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const conn = yield (0, db_1.getConnection)();
         const { salesmanId, tierName, minAmount, maxAmount, commissionRate, isGlobal } = req.body;
-        const id = (0, uuid_1.v4)();
+        const overlapping = yield checkTierOverlap(conn, null, isGlobal || false, salesmanId, minAmount, maxAmount || null);
+        if (overlapping) {
+            conn.release();
+            return res.status(409).json({ error: `تعارض مع النطاق: ${overlapping.tierName} (${overlapping.minAmount} - ${(_a = overlapping.maxAmount) !== null && _a !== void 0 ? _a : '∞'})` });
+        }
+        const id = (0, crypto_1.randomUUID)();
         yield conn.query(`
             INSERT INTO commission_tiers (id, salesmanId, tierName, minAmount, maxAmount, commissionRate, isGlobal)
             VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -66,10 +96,16 @@ const createCommissionTier = (req, res) => __awaiter(void 0, void 0, void 0, fun
 exports.createCommissionTier = createCommissionTier;
 // Update commission tier
 const updateCommissionTier = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const conn = yield (0, db_1.getConnection)();
         const { id } = req.params;
         const { salesmanId, tierName, minAmount, maxAmount, commissionRate, isGlobal, isActive } = req.body;
+        const overlapping = yield checkTierOverlap(conn, id, isGlobal || false, salesmanId, minAmount, maxAmount || null);
+        if (overlapping) {
+            conn.release();
+            return res.status(409).json({ error: `تعارض مع النطاق: ${overlapping.tierName} (${overlapping.minAmount} - ${(_a = overlapping.maxAmount) !== null && _a !== void 0 ? _a : '∞'})` });
+        }
         yield conn.query(`
             UPDATE commission_tiers 
             SET salesmanId = ?, tierName = ?, minAmount = ?, maxAmount = ?, 
@@ -105,6 +141,7 @@ exports.deleteCommissionTier = deleteCommissionTier;
 const getCommissionRecords = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
+        const authReq = req;
         const { salesmanId, status, startDate, endDate } = req.query;
         let query = `
             SELECT cr.*, 
@@ -116,6 +153,13 @@ const getCommissionRecords = (req, res) => __awaiter(void 0, void 0, void 0, fun
             WHERE 1=1
         `;
         const params = [];
+        // ═══════════════════════════════════════════
+        // MANDATORY: Fiscal Year Hard Boundary
+        // ═══════════════════════════════════════════
+        if (authReq.fiscalYearFilter) {
+            query += ' AND cr.periodStart >= ? AND cr.periodEnd <= ?';
+            params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
         if (salesmanId) {
             query += ' AND cr.salesmanId = ?';
             params.push(salesmanId);
@@ -144,6 +188,7 @@ const getCommissionRecords = (req, res) => __awaiter(void 0, void 0, void 0, fun
 });
 exports.getCommissionRecords = getCommissionRecords;
 // Calculate and create commission record for a period
+// Uses salesman_targets for commission rates with Product > Category > Global > Tier > Default hierarchy
 const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
@@ -155,7 +200,7 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
             conn.release();
             return res.status(404).json({ error: 'Salesman not found' });
         }
-        // Calculate sales for the period
+        // Calculate sales for the period (totals for summary)
         const [salesResult] = yield conn.query(`
             SELECT 
                 COALESCE(SUM(CASE WHEN type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN total ELSE 0 END), 0) as totalSales,
@@ -168,33 +213,94 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
         `, [salesmanId, periodStart, periodEnd]);
         const { totalSales, totalReturns } = salesResult[0];
         const netSales = totalSales - totalReturns;
-        // Get commission rate (check tiers first, then fallback to salesman default)
-        let commissionRate = salesman.commissionRate || 0;
-        // Check for tiered commission
-        const [tierResult] = yield conn.query(`
-            SELECT commissionRate FROM commission_tiers
-            WHERE (salesmanId = ? OR isGlobal = TRUE)
-              AND isActive = TRUE
-              AND minAmount <= ?
-              AND (maxAmount IS NULL OR maxAmount >= ?)
-            ORDER BY isGlobal ASC, commissionRate DESC
-            LIMIT 1
-        `, [salesmanId, netSales, netSales]);
-        if (tierResult.length > 0) {
-            commissionRate = tierResult[0].commissionRate;
+        // Get active salesman_targets for this period
+        const [targetsResult] = yield conn.query(`
+            SELECT st.*, p.categoryId as productCategoryId
+            FROM salesman_targets st
+            LEFT JOIN products p ON st.productId = p.id
+            WHERE st.salesmanId = ?
+              AND st.isActive = TRUE
+              AND st.periodStart <= ?
+              AND st.periodEnd >= ?
+        `, [salesmanId, periodEnd, periodStart]);
+        const targets = targetsResult;
+        // Find the Global (SALES_AMOUNT) target
+        const globalTarget = targets.find(t => t.targetType === 'SALES_AMOUNT');
+        const globalCommissionRate = (globalTarget === null || globalTarget === void 0 ? void 0 : globalTarget.commissionPercentage) || 0;
+        // Get product-level sales for detailed calculation
+        const [productSalesResult] = yield conn.query(`
+            SELECT 
+                il.productId,
+                p.categoryId,
+                SUM(CASE WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN il.quantity ELSE -il.quantity END) as netQuantity,
+                SUM(CASE WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN il.total ELSE -il.total END) as netAmount,
+                AVG(p.cost) as avgCost,
+                AVG(il.price) as avgPrice
+            FROM invoice_lines il
+            JOIN invoices i ON il.invoiceId = i.id
+            JOIN products p ON il.productId = p.id
+            WHERE i.salesmanId = ?
+              AND i.date >= ?
+              AND i.date <= ?
+              AND i.status = 'POSTED'
+            GROUP BY il.productId, p.categoryId
+        `, [salesmanId, periodStart, periodEnd]);
+        const productSales = productSalesResult;
+        // Calculate commission based on Product > Category > Global > Tier > Default hierarchy
+        let totalCommission = 0;
+        const defaultRate = salesman.commissionRate || 0;
+        for (const product of productSales) {
+            let rate = defaultRate; // Start with salesman default
+            // 1. Check Product Target
+            const productTarget = targets.find(t => t.targetType === 'PRODUCT' && t.productId === product.productId);
+            if (productTarget === null || productTarget === void 0 ? void 0 : productTarget.commissionPercentage) {
+                rate = productTarget.commissionPercentage;
+            }
+            else {
+                // 2. Check Category Target
+                const categoryTarget = targets.find(t => t.targetType === 'CATEGORY' && t.categoryId === product.categoryId);
+                if (categoryTarget === null || categoryTarget === void 0 ? void 0 : categoryTarget.commissionPercentage) {
+                    rate = categoryTarget.commissionPercentage;
+                }
+                else if (globalCommissionRate > 0) {
+                    // 3. Global Target
+                    rate = globalCommissionRate;
+                }
+                else {
+                    // 4. Fallback to Commission Tiers (Legacy)
+                    const [tierResult] = yield conn.query(`
+                        SELECT commissionRate FROM commission_tiers
+                        WHERE (salesmanId = ? OR isGlobal = TRUE)
+                          AND isActive = TRUE
+                          AND minAmount <= ?
+                          AND (maxAmount IS NULL OR maxAmount >= ?)
+                        ORDER BY isGlobal ASC, commissionRate DESC
+                        LIMIT 1
+                    `, [salesmanId, netSales, netSales]);
+                    if (tierResult.length > 0) {
+                        rate = tierResult[0].commissionRate;
+                    }
+                    // else: Uses default salesman rate
+                }
+            }
+            // Calculate commission for this product based on net sales amount
+            const productCommission = product.netAmount > 0 ? (product.netAmount * rate / 100) : 0;
+            totalCommission += productCommission;
         }
-        // Calculate commission
-        const commissionAmount = (netSales * commissionRate) / 100;
+        // Round the total commission
+        const commissionAmount = Math.round(totalCommission * 100) / 100;
         const finalAmount = commissionAmount + (bonusAmount || 0) - (deductions || 0);
         // Create record
-        const id = (0, uuid_1.v4)();
+        // Note: commissionRate is set to 0 for "mixed rates" cases. The actual calculation is in commissionAmount.
+        const id = (0, crypto_1.randomUUID)();
+        const effectiveRate = globalCommissionRate > 0 ? globalCommissionRate : defaultRate; // For display purposes
         yield conn.query(`
             INSERT INTO commission_records 
             (id, salesmanId, periodStart, periodEnd, totalSales, totalReturns, netSales, 
              commissionRate, commissionAmount, bonusAmount, deductions, finalAmount, notes)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [id, salesmanId, periodStart, periodEnd, totalSales, totalReturns, netSales,
-            commissionRate, commissionAmount, bonusAmount || 0, deductions || 0, finalAmount, notes || null]);
+            effectiveRate, commissionAmount, bonusAmount || 0, deductions || 0, finalAmount, notes || 'Calculated using dynamic targets']);
         conn.release();
         res.status(201).json({
             id,
@@ -202,13 +308,13 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
             totalSales,
             totalReturns,
             netSales,
-            commissionRate,
+            commissionRate: effectiveRate,
             commissionAmount,
             bonusAmount: bonusAmount || 0,
             deductions: deductions || 0,
             finalAmount,
             status: 'PENDING',
-            message: 'Commission calculated successfully'
+            message: 'Commission calculated successfully (using salesman_targets)'
         });
     }
     catch (error) {
@@ -264,7 +370,7 @@ const rejectCommission = (req, res) => __awaiter(void 0, void 0, void 0, functio
 exports.rejectCommission = rejectCommission;
 // Mark commission as paid (with treasury transaction)
 const markCommissionPaid = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c;
+    var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
         // =====================================================
@@ -297,26 +403,37 @@ const markCommissionPaid = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 return res.status(404).json({ error: 'Treasury account not found' });
             }
             // Create journal entry for the payment
-            const journalId = (0, uuid_1.v4)();
+            // 2. Create Journal Entry
+            const journalId = (0, crypto_1.randomUUID)();
             const journalNumber = `COM-${Date.now()}`;
-            const description = `صرف عمولة للمندوب ${record.salesmanName} - فترة ${(_b = record.periodStart) === null || _b === void 0 ? void 0 : _b.split('T')[0]} إلى ${(_c = record.periodEnd) === null || _c === void 0 ? void 0 : _c.split('T')[0]}`;
+            const description = `صرف عمولة للمندوب ${record.salesmanName} - فترة ${new Date(record.periodStart).toISOString().split('T')[0]} إلى ${new Date(record.periodEnd).toISOString().split('T')[0]}`;
+            // Journal Entry - Use referenceId instead of number, remove type
             yield conn.query(`
-                INSERT INTO journal_entries (id, number, date, description, createdBy, type)
-                VALUES (?, ?, NOW(), ?, ?, 'COMMISSION_PAYMENT')
-            `, [journalId, journalNumber, description, userId]);
-            // Create journal lines (debit: commission expense, credit: treasury)
-            const entryId1 = (0, uuid_1.v4)();
-            const entryId2 = (0, uuid_1.v4)();
-            // Debit - Commission Expense (we'll use a generic expense account or create the entry)
+            INSERT INTO journal_entries (id, referenceId, date, description, createdBy)
+            VALUES (?, ?, NOW(), ?, ?)
+        `, [journalId, journalNumber, description, userId]);
+            // 3. Create Journal Entry Line
+            // Table is journal_lines (not journal_entry_lines)
+            // Column is journalId (not journalEntryId)
+            // ID is auto-increment (do not insert)
+            // Commission Payment = صادر (outgoing) from Treasury
+            // Debit: Commission Expense (مصروفات عمولات)
+            // Credit: Treasury Account (reduce cash balance)
+            // Find or use a commission expense account
+            const [expenseAccResult] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%عمولات%' AND type = 'EXPENSE' LIMIT 1`);
+            const expenseAccount = expenseAccResult[0];
+            // Debit line: Commission Expense
+            if (expenseAccount) {
+                yield conn.query(`
+                    INSERT INTO journal_lines (journalId, accountId, debit, credit, accountName)
+                    VALUES (?, ?, ?, 0, ?)
+                `, [journalId, expenseAccount.id, record.finalAmount, `مصروفات عمولات - ${record.salesmanName}`]);
+            }
+            // Credit line: Treasury Account (reduce balance)
             yield conn.query(`
-                INSERT INTO journal_entry_lines (id, journalEntryId, accountId, debit, credit, description)
-                VALUES (?, ?, ?, ?, 0, ?)
-            `, [entryId1, journalId, treasuryAccountId, 0, record.finalAmount, `عمولة ${record.salesmanName}`]);
-            // Credit - Treasury Account (reduce treasury)
-            yield conn.query(`
-                INSERT INTO journal_entry_lines (id, journalEntryId, accountId, debit, credit, description)
-                VALUES (?, ?, ?, 0, ?, ?)
-            `, [entryId2, journalId, treasuryAccountId, record.finalAmount, `صرف عمولة ${record.salesmanName}`]);
+                INSERT INTO journal_lines (journalId, accountId, debit, credit, accountName)
+                VALUES (?, ?, 0, ?, ?)
+            `, [journalId, treasuryAccountId, record.finalAmount, `صرف عمولة ${record.salesmanName}`]);
             // Update treasury account balance
             yield conn.query(`
                 UPDATE accounts SET balance = balance - ? WHERE id = ?
@@ -376,28 +493,47 @@ const getCommissionSummary = (req, res) => __awaiter(void 0, void 0, void 0, fun
 });
 exports.getCommissionSummary = getCommissionSummary;
 // =================== SALESMAN CUSTOMERS ===================
-// Get all customer assignments
+// Get all customer assignments (from both salesman_customers table AND partners.salesmanId)
 const getSalesmanCustomers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
         const salesmanId = req.query.salesmanId;
+        // Combine both sources: explicit salesman_customers assignments AND partners linked via salesmanId
         let query = `
-            SELECT sc.*, 
+            SELECT sc.id, sc.salesmanId, sc.partnerId,
                    s.name as salesmanName,
                    p.name as partnerName,
                    p.phone as partnerPhone,
-                   p.address as partnerAddress
+                   p.address as partnerAddress,
+                   'commission' as source
             FROM salesman_customers sc
             JOIN salesmen s ON sc.salesmanId = s.id
             JOIN partners p ON sc.partnerId = p.id
             WHERE 1=1
+            ${salesmanId ? ' AND sc.salesmanId = ?' : ''}
+
+            UNION
+
+            SELECT CONCAT('partner-', p.id) as id, p.salesmanId, p.id as partnerId,
+                   s.name as salesmanName,
+                   p.name as partnerName,
+                   p.phone as partnerPhone,
+                   p.address as partnerAddress,
+                   'partner' as source
+            FROM partners p
+            JOIN salesmen s ON p.salesmanId = s.id
+            WHERE p.salesmanId IS NOT NULL
+              AND p.type = 'CUSTOMER'
+              AND p.id NOT IN (SELECT partnerId FROM salesman_customers)
+            ${salesmanId ? ' AND p.salesmanId = ?' : ''}
+
+            ORDER BY salesmanName, partnerName
         `;
         const params = [];
         if (salesmanId) {
-            query += ' AND sc.salesmanId = ?';
+            params.push(salesmanId);
             params.push(salesmanId);
         }
-        query += ' ORDER BY s.name, p.name';
         const [assignments] = yield conn.query(query, params);
         conn.release();
         res.json(assignments);
@@ -413,7 +549,7 @@ const assignCustomer = (req, res) => __awaiter(void 0, void 0, void 0, function*
     try {
         const conn = yield (0, db_1.getConnection)();
         const { salesmanId, partnerId, notes } = req.body;
-        const id = (0, uuid_1.v4)();
+        const id = (0, crypto_1.randomUUID)();
         // Check if already assigned
         const [existing] = yield conn.query('SELECT id FROM salesman_customers WHERE salesmanId = ? AND partnerId = ?', [salesmanId, partnerId]);
         if (existing.length > 0) {
@@ -424,6 +560,8 @@ const assignCustomer = (req, res) => __awaiter(void 0, void 0, void 0, function*
             INSERT INTO salesman_customers (id, salesmanId, partnerId, notes)
             VALUES (?, ?, ?, ?)
         `, [id, salesmanId, partnerId, notes || null]);
+        // Also update partners.salesmanId for master data sync
+        yield conn.query('UPDATE partners SET salesmanId = ? WHERE id = ?', [salesmanId, partnerId]);
         conn.release();
         res.status(201).json({ id, message: 'Customer assigned successfully' });
     }
@@ -440,12 +578,14 @@ const bulkAssignCustomers = (req, res) => __awaiter(void 0, void 0, void 0, func
         const { salesmanId, partnerIds, notes } = req.body;
         let assignedCount = 0;
         for (const partnerId of partnerIds) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             try {
                 yield conn.query(`
                     INSERT IGNORE INTO salesman_customers (id, salesmanId, partnerId, notes)
                     VALUES (?, ?, ?, ?)
                 `, [id, salesmanId, partnerId, notes || null]);
+                // Also update partners.salesmanId for master data sync
+                yield conn.query('UPDATE partners SET salesmanId = ? WHERE id = ?', [salesmanId, partnerId]);
                 assignedCount++;
             }
             catch (e) {
@@ -469,7 +609,14 @@ const unassignCustomer = (req, res) => __awaiter(void 0, void 0, void 0, functio
     try {
         const conn = yield (0, db_1.getConnection)();
         const { id } = req.params;
+        // Get the partnerId before deleting to clear salesmanId
+        const [assignment] = yield conn.query('SELECT partnerId FROM salesman_customers WHERE id = ?', [id]);
         yield conn.query('DELETE FROM salesman_customers WHERE id = ?', [id]);
+        // Clear salesmanId on the partner in master data
+        if (assignment.length > 0) {
+            const partnerId = assignment[0].partnerId;
+            yield conn.query('UPDATE partners SET salesmanId = NULL WHERE id = ?', [partnerId]);
+        }
         conn.release();
         res.json({ message: 'Customer unassigned successfully' });
     }
@@ -479,7 +626,7 @@ const unassignCustomer = (req, res) => __awaiter(void 0, void 0, void 0, functio
     }
 });
 exports.unassignCustomer = unassignCustomer;
-// Get unassigned customers
+// Get unassigned customers (not in salesman_customers AND no salesmanId in partners)
 const getUnassignedCustomers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
@@ -488,6 +635,7 @@ const getUnassignedCustomers = (req, res) => __awaiter(void 0, void 0, void 0, f
             FROM partners p
             WHERE p.type = 'CUSTOMER'
               AND p.id NOT IN (SELECT partnerId FROM salesman_customers)
+              AND (p.salesmanId IS NULL OR p.salesmanId = '')
             ORDER BY p.name
         `);
         conn.release();

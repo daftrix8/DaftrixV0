@@ -15,7 +15,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const promise_1 = __importDefault(require("mysql2/promise"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const path_1 = __importDefault(require("path"));
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 dotenv_1.default.config({ path: path_1.default.join(__dirname, '.env') });
 const dbConfig = {
     host: process.env.DB_HOST || 'localhost',
@@ -42,7 +42,7 @@ function runTest() {
             yield conn.query(`
             INSERT INTO invoices (id, type, date, total, discount, status, partnerName, salesmanId, paymentMethod, createdAt)
             VALUES (?, 'INVOICE_SALE', ?, 100, 50, 'POSTED', 'TEST_PERISTENCE', ?, 'CASH', ?)
-        `, [(0, uuid_1.v4)(), tStart, salesmanId, tStart]);
+        `, [(0, crypto_1.randomUUID)(), tStart, salesmanId, tStart]);
             // 2. Create APPROVED Settlement (Simulating the App Logic via DB Insert for simplicity, aiming to test the READ logic)
             // Actually, we want to test if 'getSettlements' reads from the COLUMN or RECALCULATES.
             // So we Insert a settlement with a stored totalDiscounts = 50.
@@ -50,7 +50,7 @@ function runTest() {
             // But since we fixed it, it should ignore the late invoice partially because of createdAt logic AND because it reads from column.
             // Let's test the "reads from column" part explicitly.
             // We insert a settlement with stored discount = 50.
-            const settId = (0, uuid_1.v4)();
+            const settId = (0, crypto_1.randomUUID)();
             yield conn.query(`
             INSERT INTO vehicle_settlements (id, vehicleId, settlementDate, status, createdAt, totalSales, totalDiscounts, totalBankTransfers)
             VALUES (?, ?, ?, 'APPROVED', ?, 0, 50, 0)

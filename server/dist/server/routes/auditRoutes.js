@@ -2,6 +2,9 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const auditController_1 = require("../controllers/auditController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
 const router = (0, express_1.Router)();
-router.get('/', auditController_1.getAuditLogs);
+router.get('/', (0, authMiddleware_1.requirePermission)('audit.view'), auditController_1.getAuditLogs);
+router.get('/stats', (0, authMiddleware_1.requirePermission)('audit.view'), auditController_1.getAuditStats);
+router.get('/export', (0, authMiddleware_1.requirePermission)('audit.view'), auditController_1.exportAuditLogs);
 exports.default = router;

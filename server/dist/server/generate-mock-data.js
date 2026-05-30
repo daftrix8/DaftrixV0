@@ -10,7 +10,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 // ============================================
 // CONFIGURATION
 // ============================================
@@ -122,7 +122,7 @@ function generateBranches() {
         console.log('Generating branches...');
         const branches = [];
         for (let i = 0; i < CONFIG.branches; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const city = randomElement(ARABIC_NAMES.cities);
             const branch = {
                 id,
@@ -143,7 +143,7 @@ function generateWarehouses(branches) {
         console.log('Generating warehouses...');
         const warehouses = [];
         for (let i = 0; i < CONFIG.warehouses; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const branch = randomElement(branches);
             const warehouse = {
                 id,
@@ -164,7 +164,7 @@ function generateCategories() {
         console.log('Generating categories...');
         const categories = [];
         for (let i = 0; i < CONFIG.categories; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const category = {
                 id,
                 name: ARABIC_NAMES.productCategories[i % ARABIC_NAMES.productCategories.length],
@@ -183,7 +183,7 @@ function generateProducts(warehouses, categories) {
         const products = [];
         // Raw materials
         for (let i = 0; i < CONFIG.products.rawMaterials; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const name = randomElement(ARABIC_NAMES.rawMaterials);
             const product = {
                 id,
@@ -208,7 +208,7 @@ function generateProducts(warehouses, categories) {
         }
         // Finished goods
         for (let i = 0; i < CONFIG.products.finishedGoods; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const name = randomElement(ARABIC_NAMES.finishedGoods);
             const product = {
                 id,
@@ -241,7 +241,7 @@ function generatePartners() {
         const partners = [];
         // Customers
         for (let i = 0; i < CONFIG.partners.customers; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const isCompany = Math.random() > 0.3;
             let name;
             if (isCompany) {
@@ -273,7 +273,7 @@ function generatePartners() {
         }
         // Suppliers
         for (let i = 0; i < CONFIG.partners.suppliers; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const name = `${randomElement(ARABIC_NAMES.companyTypes)} ${randomElement(ARABIC_NAMES.companyNames)} للتجارة`;
             const partner = {
                 id,
@@ -305,7 +305,7 @@ function generateSalesmen() {
         console.log('Generating salesmen...');
         const salesmen = [];
         for (let i = 0; i < CONFIG.salesmen; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const salesman = {
                 id,
                 name: `${randomElement(ARABIC_NAMES.firstNames)} ${randomElement(ARABIC_NAMES.lastNames)}`,
@@ -328,7 +328,7 @@ function generateCostCenters() {
         const costCenters = [];
         const names = ['المبيعات', 'الإنتاج', 'التسويق', 'الإدارة', 'الصيانة'];
         for (let i = 0; i < CONFIG.costCenters; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const costCenter = {
                 id,
                 code: `CC-${String(i + 1).padStart(3, '0')}`,
@@ -348,7 +348,7 @@ function generatePriceLists() {
         const priceLists = [];
         const names = ['قطاعي', 'جملة', 'VIP'];
         for (let i = 0; i < CONFIG.priceLists; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const priceList = {
                 id,
                 name: `${names[i % names.length]} ${Math.floor(i / names.length) + 1}`,
@@ -368,7 +368,7 @@ function generateBanks() {
         const banks = [];
         const bankNames = ['البنك الأهلي', 'بنك الرياض', 'البنك السعودي الفرنسي', 'بنك الراجحي'];
         for (let i = 0; i < CONFIG.banks; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const bank = {
                 id,
                 name: `${bankNames[i % bankNames.length]} ${Math.floor(i / bankNames.length) + 1}`,
@@ -393,7 +393,7 @@ function generateBOMs(products) {
         const finishedGoods = products.filter(p => p.type === 'FINISHED');
         // Create BOMs for first 15 finished products
         for (const finished of finishedGoods.slice(0, 15)) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const bom = {
                 id,
                 finished_product_id: finished.id,
@@ -436,7 +436,7 @@ function generateSalesInvoices(partners, products, warehouses, costCenters) {
         const finishedGoods = products.filter(p => p.type === 'FINISHED');
         let count = 0;
         for (let i = 0; i < CONFIG.transactions.salesInvoices; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const customer = randomElement(customers);
             const date = randomDate(CONFIG.year);
             const numLines = randomInt(1, 5);
@@ -497,7 +497,7 @@ function generatePurchaseInvoices(partners, products, warehouses, costCenters) {
         const rawMaterials = products.filter(p => p.type === 'RAW');
         let count = 0;
         for (let i = 0; i < CONFIG.transactions.purchaseInvoices; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const supplier = randomElement(suppliers);
             const date = randomDate(CONFIG.year);
             const numLines = randomInt(1, 8);
@@ -556,7 +556,7 @@ function generateProductionOrders(boms, warehouses) {
         let count = 0;
         for (let i = 0; i < CONFIG.transactions.productionOrders; i++) {
             const bom = randomElement(boms);
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const date = randomDate(CONFIG.year);
             const qtyPlanned = randomInt(10, 100);
             const status = randomElement(['PLANNED', 'IN_PROGRESS', 'COMPLETED']);
@@ -587,7 +587,7 @@ function generateJournalEntries(costCenters) {
         let count = 0;
         const accountIds = ['101', '103', '104', '201', '301', '401', '501', '503', '504', '505'];
         for (let i = 0; i < CONFIG.transactions.journalEntries; i++) {
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const date = randomDate(CONFIG.year);
             const numLines = randomInt(2, 4);
             const amount = randomFloat(1000, 50000);
@@ -631,7 +631,7 @@ function generatePaymentReceipts(partners, banks) {
             const pendingInvoices = customerInvoices[customer.id] || [];
             if (pendingInvoices.length === 0)
                 continue;
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const date = randomDate(CONFIG.year);
             const bank = randomElement(banks);
             // Pay 1-3 invoices
@@ -671,7 +671,7 @@ function generatePaymentReceipts(partners, banks) {
                 payment.status, payment.paymentMethod, payment.posted, payment.bankAccountId, payment.bankName]);
             // Create Allocations and Update Invoices
             for (const item of invoicesToPay) {
-                const allocationId = (0, uuid_1.v4)();
+                const allocationId = (0, crypto_1.randomUUID)();
                 yield db_1.pool.query(`INSERT INTO payment_allocations (id, paymentId, invoiceId, amount) VALUES (?, ?, ?, ?)`, [allocationId, payment.id, item.id, item.amount]);
                 yield db_1.pool.query(`UPDATE invoices SET paidAmount = paidAmount + ?, status = CASE WHEN total <= paidAmount + ? THEN 'PAID' ELSE 'PARTIAL' END WHERE id = ?`, [item.amount, item.amount, item.id]);
             }
@@ -709,7 +709,7 @@ function generatePaymentVouchers(partners, banks) {
             const pendingInvoices = supplierInvoices[supplier.id] || [];
             if (pendingInvoices.length === 0)
                 continue;
-            const id = (0, uuid_1.v4)();
+            const id = (0, crypto_1.randomUUID)();
             const date = randomDate(CONFIG.year);
             const bank = randomElement(banks);
             // Pay 1-3 invoices
@@ -749,7 +749,7 @@ function generatePaymentVouchers(partners, banks) {
                 payment.status, payment.paymentMethod, payment.posted, payment.bankAccountId, payment.bankName]);
             // Create Allocations and Update Invoices
             for (const item of invoicesToPay) {
-                const allocationId = (0, uuid_1.v4)();
+                const allocationId = (0, crypto_1.randomUUID)();
                 yield db_1.pool.query(`INSERT INTO payment_allocations (id, paymentId, invoiceId, amount) VALUES (?, ?, ?, ?)`, [allocationId, payment.id, item.id, item.amount]);
                 yield db_1.pool.query(`UPDATE invoices SET paidAmount = paidAmount + ?, status = CASE WHEN total <= paidAmount + ? THEN 'PAID' ELSE 'PARTIAL' END WHERE id = ?`, [item.amount, item.amount, item.id]);
             }

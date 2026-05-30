@@ -9,9 +9,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.markInstallmentsAsDeducted = exports.getPendingInstallments = exports.settleLoanEarly = exports.skipInstallment = exports.generateInstallments = exports.checkLoanEligibility = exports.getLoanConstraints = void 0;
+exports.markInstallmentsAsDeducted = exports.getPendingInstallments = exports.repayLoan = exports.settleLoanEarly = exports.skipInstallment = exports.generateInstallments = exports.checkLoanEligibility = exports.getLoanConstraints = void 0;
 const db_1 = require("../db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 // ============================================
 // CONSTRAINT & ELIGIBILITY LOGIC
 // ============================================
@@ -19,11 +19,26 @@ const uuid_1 = require("uuid");
  * Get active loan constraints configuration
  */
 const getLoanConstraints = () => __awaiter(void 0, void 0, void 0, function* () {
-    const [rows] = yield db_1.pool.query(`
-    SELECT * FROM loan_constraints WHERE isActive = TRUE LIMIT 1
-  `);
-    if (rows.length === 0) {
-        // Return defaults if no config exists
+    try {
+        const [rows] = yield db_1.pool.query(`
+        SELECT * FROM loan_constraints WHERE isActive = TRUE LIMIT 1
+      `);
+        if (rows.length === 0) {
+            // Return defaults if no config exists
+            return {
+                maxDeductionPercentage: 50,
+                minEmploymentMonths: 6,
+                allowDuringProbation: false,
+                maxActiveLoanCount: 2,
+                minSalaryMultiplier: 3,
+                requireApproval: true
+            };
+        }
+        return rows[0];
+    }
+    catch (error) {
+        // Table doesn't exist yet — return safe defaults
+        console.warn('⚠️ loan_constraints table not found, using defaults:', error.message);
         return {
             maxDeductionPercentage: 50,
             minEmploymentMonths: 6,
@@ -33,7 +48,6 @@ const getLoanConstraints = () => __awaiter(void 0, void 0, void 0, function* () 
             requireApproval: true
         };
     }
-    return rows[0];
 });
 exports.getLoanConstraints = getLoanConstraints;
 /**
@@ -96,8 +110,23 @@ const checkLoanEligibility = (employeeId, requestedAmount, numberOfMonths) => __
   `, [employeeId]);
     const existingMonthlyDeduction = parseFloat((_a = existingDeductions[0]) === null || _a === void 0 ? void 0 : _a.total) || 0;
     const totalMonthlyDeduction = existingMonthlyDeduction + monthlyDeduction;
-    // Estimate net salary (simplified - in real calc, subtract insurance/tax)
-    const estimatedNetSalary = baseSalary * 0.85; // Rough estimate after deductions
+    // Estimate net salary — try using the real salary engine
+    let estimatedNetSalary = baseSalary * 0.85; // Fallback rough estimate
+    try {
+        const salaryService = require('./salaryService');
+        const payrollResult = yield salaryService.calculateEmployeePayroll(employeeId, {
+            baseSalary,
+            variableSalary: parseFloat(employee.variableSalary) || 0,
+            basicSalaryInsurable: parseFloat(employee.basicSalaryInsurable) || baseSalary,
+            personalExemption: parseFloat(employee.personalExemption) || 15000
+        }, { workingDays: 30, absentDays: 0, lateMinutes: 0, overtimeHours: 0 }, 0, { includeTax: true, includeInsurance: true });
+        if (payrollResult.netSalary > 0) {
+            estimatedNetSalary = payrollResult.netSalary;
+        }
+    }
+    catch (_b) {
+        // Fall through to 85% estimate
+    }
     const deductionPercentage = (totalMonthlyDeduction / estimatedNetSalary) * 100;
     if (deductionPercentage > constraints.maxDeductionPercentage) {
         reasons.push(`إجمالي الخصومات الشهرية (${deductionPercentage.toFixed(1)}%) يتجاوز الحد المسموح (${constraints.maxDeductionPercentage}%)`);
@@ -121,7 +150,7 @@ exports.checkLoanEligibility = checkLoanEligibility;
 const generateInstallments = (loanId_1, employeeId_1, totalAmount_1, numberOfMonths_1, ...args_1) => __awaiter(void 0, [loanId_1, employeeId_1, totalAmount_1, numberOfMonths_1, ...args_1], void 0, function* (loanId, employeeId, totalAmount, numberOfMonths, startDate = new Date()) {
     const installmentAmount = totalAmount / numberOfMonths;
     const installments = [];
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Delete existing installments if any (for regeneration scenarios)
@@ -136,7 +165,7 @@ const generateInstallments = (loanId_1, employeeId_1, totalAmount_1, numberOfMon
             const amount = isLast
                 ? totalAmount - (installmentAmount * (numberOfMonths - 1))
                 : installmentAmount;
-            const installmentId = (0, uuid_1.v4)();
+            const installmentId = (0, crypto_1.randomUUID)();
             yield conn.query(`
         INSERT INTO loan_installments (
           id, loanId, employeeId, installmentNumber,
@@ -170,7 +199,7 @@ exports.generateInstallments = generateInstallments;
  * Skip an installment (push it forward)
  */
 const skipInstallment = (installmentId, reason, userId) => __awaiter(void 0, void 0, void 0, function* () {
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get installment and loan info
@@ -222,7 +251,7 @@ const skipInstallment = (installmentId, reason, userId) => __awaiter(void 0, voi
         dueDate, amount, status, notes
       ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
     `, [
-            (0, uuid_1.v4)(),
+            (0, crypto_1.randomUUID)(),
             installment.loanId,
             installment.employeeId,
             lastInstallment[0].maxNum + 1,
@@ -234,7 +263,7 @@ const skipInstallment = (installmentId, reason, userId) => __awaiter(void 0, voi
         yield conn.query(`
       INSERT INTO loan_history (id, loanId, action, performedBy, amount, notes)
       VALUES (?, ?, 'INSTALLMENT_SKIPPED', ?, ?, ?)
-    `, [(0, uuid_1.v4)(), installment.loanId, userId, installment.amount, reason]);
+    `, [(0, crypto_1.randomUUID)(), installment.loanId, userId, installment.amount, reason]);
         yield conn.commit();
     }
     catch (error) {
@@ -250,7 +279,7 @@ exports.skipInstallment = skipInstallment;
  * Settle a loan early (pay remaining balance)
  */
 const settleLoanEarly = (loanId_1, settlementAmount_1, userId_1, ...args_1) => __awaiter(void 0, [loanId_1, settlementAmount_1, userId_1, ...args_1], void 0, function* (loanId, settlementAmount, userId, notes = '') {
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get loan info
@@ -289,7 +318,7 @@ const settleLoanEarly = (loanId_1, settlementAmount_1, userId_1, ...args_1) => _
         yield conn.query(`
       INSERT INTO loan_history (id, loanId, action, performedBy, amount, notes)
       VALUES (?, ?, 'SETTLED', ?, ?, ?)
-    `, [(0, uuid_1.v4)(), loanId, userId, settlementAmount, notes]);
+    `, [(0, crypto_1.randomUUID)(), loanId, userId, settlementAmount, notes]);
         yield conn.commit();
     }
     catch (error) {
@@ -301,6 +330,101 @@ const settleLoanEarly = (loanId_1, settlementAmount_1, userId_1, ...args_1) => _
     }
 });
 exports.settleLoanEarly = settleLoanEarly;
+/**
+ * Partial loan repayment (مردودات سلف)
+ * Employee pays back part (or all) of their outstanding loan in cash
+ */
+const repayLoan = (loanId_1, repaymentAmount_1, userId_1, ...args_1) => __awaiter(void 0, [loanId_1, repaymentAmount_1, userId_1, ...args_1], void 0, function* (loanId, repaymentAmount, userId, notes = '') {
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        yield conn.beginTransaction();
+        // Get loan info
+        const [loans] = yield conn.query('SELECT * FROM employee_advances WHERE id = ?', [loanId]);
+        if (loans.length === 0) {
+            throw new Error('السلفة/القرض غير موجود');
+        }
+        const loan = loans[0];
+        if (loan.status !== 'ACTIVE') {
+            throw new Error('السلفة/القرض غير نشط');
+        }
+        const remaining = parseFloat(loan.remainingAmount) || 0;
+        if (repaymentAmount <= 0) {
+            throw new Error('مبلغ السداد يجب أن يكون أكبر من صفر');
+        }
+        if (repaymentAmount > remaining) {
+            throw new Error(`مبلغ السداد (${repaymentAmount.toLocaleString()}) أكبر من المتبقي (${remaining.toLocaleString()})`);
+        }
+        const newRemaining = remaining - repaymentAmount;
+        const newTotalPaid = (parseFloat(loan.totalPaid) || 0) + repaymentAmount;
+        const isCompleted = newRemaining <= 0;
+        // Mark equivalent pending installments as PAID_CASH (oldest first)
+        let amountToAllocate = repaymentAmount;
+        try {
+            const [pendingInstallments] = yield conn.query(`
+                SELECT id, amount FROM loan_installments
+                WHERE loanId = ? AND status = 'PENDING'
+                ORDER BY dueDate ASC
+            `, [loanId]);
+            for (const inst of pendingInstallments) {
+                if (amountToAllocate <= 0)
+                    break;
+                const instAmount = parseFloat(inst.amount) || 0;
+                if (amountToAllocate >= instAmount) {
+                    // Fully cover this installment
+                    yield conn.query(`
+                        UPDATE loan_installments
+                        SET status = 'PAID_CASH', paidCashAt = NOW(), paidCashBy = ?,
+                            notes = CONCAT(COALESCE(notes, ''), ' - سداد نقدي')
+                        WHERE id = ?
+                    `, [userId, inst.id]);
+                    amountToAllocate -= instAmount;
+                }
+                else {
+                    // Partial — reduce the installment amount
+                    yield conn.query(`
+                        UPDATE loan_installments
+                        SET amount = amount - ?,
+                            notes = CONCAT(COALESCE(notes, ''), ' - سداد جزئي ${amountToAllocate.toLocaleString()} ج.م')
+                        WHERE id = ?
+                    `, [amountToAllocate, inst.id]);
+                    amountToAllocate = 0;
+                }
+            }
+        }
+        catch (instErr) {
+            // loan_installments table might not exist for simple advances — continue gracefully
+            console.warn('⚠️ Could not update installments (may not exist for ADVANCE type):', instErr.message);
+        }
+        // Update loan balance
+        yield conn.query(`
+            UPDATE employee_advances
+            SET totalPaid = ?,
+                remainingAmount = ?,
+                status = ?
+            WHERE id = ?
+        `, [newTotalPaid, newRemaining, isCompleted ? 'COMPLETED' : 'ACTIVE', loanId]);
+        // Log history
+        try {
+            yield conn.query(`
+                INSERT INTO loan_history (id, loanId, action, performedBy, amount, notes)
+                VALUES (?, ?, 'REPAYMENT', ?, ?, ?)
+            `, [(0, crypto_1.randomUUID)(), loanId, userId, repaymentAmount, notes || 'سداد جزئي']);
+        }
+        catch (histErr) {
+            console.warn('⚠️ Could not log to loan_history:', histErr.message);
+        }
+        yield conn.commit();
+        return { newRemaining, newTotalPaid, isCompleted };
+    }
+    catch (error) {
+        yield conn.rollback();
+        throw error;
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.repayLoan = repayLoan;
 // ============================================
 // PAYROLL INTEGRATION
 // ============================================
@@ -330,7 +454,7 @@ exports.getPendingInstallments = getPendingInstallments;
  */
 const markInstallmentsAsDeducted = (employeeId, payrollCycleId, startDate, endDate) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
-    const conn = yield db_1.pool.getConnection();
+    const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         // Get the installments
@@ -373,7 +497,7 @@ const markInstallmentsAsDeducted = (employeeId, payrollCycleId, startDate, endDa
         INSERT INTO loan_history (id, loanId, action, performedBy, amount, notes, metadata)
         VALUES (?, ?, 'INSTALLMENT_DEDUCTED', NULL, ?, ?, ?)
       `, [
-                (0, uuid_1.v4)(),
+                (0, crypto_1.randomUUID)(),
                 inst.loanId,
                 inst.amount,
                 `خصم تلقائي من مسير ${payrollCycleId}`,

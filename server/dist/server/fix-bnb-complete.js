@@ -10,7 +10,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 const fixBNBComplete = () => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield db_1.pool.getConnection();
     try {
@@ -51,7 +51,7 @@ const fixBNBComplete = () => __awaiter(void 0, void 0, void 0, function* () {
                 return Math.max(max, code);
             }, 10200);
             const newCode = (maxCode + 1).toString();
-            const newAccountId = (0, uuid_1.v4)();
+            const newAccountId = (0, crypto_1.randomUUID)();
             const bankBalance = Number(bnbBank.balance) || 0;
             // Insert new account
             yield conn.query('INSERT INTO accounts (id, name, code, type, balance, openingBalance) VALUES (?, ?, ?, ?, ?, ?)', [newAccountId, `Bank: ${bnbBank.name}`, newCode, 'ASSET', bankBalance, bankBalance]);

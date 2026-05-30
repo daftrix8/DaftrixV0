@@ -10,7 +10,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 const db_1 = require("./db");
-const uuid_1 = require("uuid");
+const crypto_1 = require("crypto");
 /**
  * Comprehensive ERP Stress Test - 2 Year Historical Data
  * Generates realistic business data from Jan 1, 2024 to Dec 1, 2025
@@ -131,7 +131,7 @@ function runStressTest() {
             const branchNames = ['الفرع الرئيسي - القاهرة', 'فرع الإسكندرية', 'فرع المنصورة'];
             for (let i = 0; i < TEST_CONFIG.branches; i++) {
                 const branch = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: branchNames[i],
                     location: arabicNames.regions[i],
                     manager: `مدير فرع ${i + 1}`,
@@ -147,7 +147,7 @@ function runStressTest() {
             for (const branch of branches) {
                 for (let i = 0; i < TEST_CONFIG.warehousesPerBranch; i++) {
                     const warehouse = {
-                        id: (0, uuid_1.v4)(),
+                        id: (0, crypto_1.randomUUID)(),
                         name: `مخزن ${i === 0 ? 'رئيسي' : 'فرعي'} - ${branch.name}`,
                         branchId: branch.id,
                         keeper: `أمين مخزن ${warehouses.length + 1}`,
@@ -163,7 +163,7 @@ function runStressTest() {
             const categories = [];
             for (let i = 0; i < TEST_CONFIG.categories; i++) {
                 const category = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: arabicNames.categories[i],
                     description: `فئة ${arabicNames.categories[i]} - تشمل جميع المنتجات ذات الصلة`
                 };
@@ -176,7 +176,7 @@ function runStressTest() {
             const salesmen = [];
             for (let i = 0; i < TEST_CONFIG.salesmen; i++) {
                 const salesman = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: arabicNames.salesmen[i],
                     phone: `0120000000${i}`,
                     target: getRandomNumber(80000, 200000),
@@ -195,7 +195,7 @@ function runStressTest() {
             for (let i = 0; i < TEST_CONFIG.products; i++) {
                 const cost = getRandomDecimal(50, 500);
                 const product = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: arabicNames.products[i % arabicNames.products.length],
                     sku: `SKU-${String(i + 1).padStart(5, '0')}`,
                     barcode: `7891234567${String(i).padStart(3, '0')}`,
@@ -217,7 +217,7 @@ function runStressTest() {
             const suppliers = [];
             for (let i = 0; i < TEST_CONFIG.suppliers; i++) {
                 const supplier = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: arabicNames.suppliers[i],
                     type: 'SUPPLIER',
                     isSupplier: true,
@@ -237,7 +237,7 @@ function runStressTest() {
             const customers = [];
             for (let i = 0; i < TEST_CONFIG.customers; i++) {
                 const customer = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: arabicNames.customers[i],
                     type: 'CUSTOMER',
                     isSupplier: false,
@@ -263,7 +263,7 @@ function runStressTest() {
             const vehiclePlates = ['أ ب ت 1234', 'س ص ع 5678', 'م ن و 9012', 'ك ل ز 3456'];
             for (let i = 0; i < TEST_CONFIG.vehicles; i++) {
                 const vehicle = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     plateNumber: vehiclePlates[i],
                     name: `سيارة توصيل ${i + 1}`,
                     type: 'VAN',
@@ -284,7 +284,7 @@ function runStressTest() {
             for (let i = 0; i < 10; i++) {
                 const product = products[i];
                 const item = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     vehicleId: loadedVehicle.id,
                     productId: product.id,
                     quantity: getRandomNumber(20, 80),
@@ -326,7 +326,7 @@ function runStressTest() {
                         });
                     }
                     const invoice = {
-                        id: (0, uuid_1.v4)(),
+                        id: (0, crypto_1.randomUUID)(),
                         number: `PUR-${String(purchaseInvoiceNum++).padStart(6, '0')}`,
                         date: formatDate(invoiceDate),
                         type: 'INVOICE_PURCHASE',
@@ -351,7 +351,7 @@ function runStressTest() {
                         }
                         else {
                             yield conn.query('INSERT INTO product_stocks SET ?', {
-                                id: (0, uuid_1.v4)(),
+                                id: (0, crypto_1.randomUUID)(),
                                 productId: line.productId,
                                 warehouseId: warehouse.id,
                                 stock: line.quantity
@@ -407,7 +407,7 @@ function runStressTest() {
                     }
                     const globalDiscount = i % 6 === 0 ? getRandomDecimal(50, 300) : 0;
                     const invoice = {
-                        id: (0, uuid_1.v4)(),
+                        id: (0, crypto_1.randomUUID)(),
                         number: `INV-${String(salesInvoiceNum++).padStart(6, '0')}`,
                         date: formatDate(invoiceDate),
                         type: 'INVOICE_SALE',
@@ -473,7 +473,7 @@ function runStressTest() {
                 for (const salesman of salesmen) {
                     // Category target for each salesman per quarter
                     const target = {
-                        id: (0, uuid_1.v4)(),
+                        id: (0, crypto_1.randomUUID)(),
                         salesmanId: salesman.id,
                         targetType: 'CATEGORY',
                         categoryId: getRandomElement(categories).id,
@@ -500,7 +500,7 @@ function runStressTest() {
             let priceListCount = 0;
             for (let i = 0; i < 3; i++) {
                 const priceList = {
-                    id: (0, uuid_1.v4)(),
+                    id: (0, crypto_1.randomUUID)(),
                     name: priceListNames[i],
                     description: `${priceListNames[i]} - خصم ${discounts[i]}%`,
                     isActive: true
