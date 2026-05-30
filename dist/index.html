@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, maximum-scale=1" />
+  <meta name="description" content="DaftriX ERP - نظام إدارة الموارد المؤسسية المتكامل" />
+  <meta name="theme-color" content="#0f766e" />
+  <!-- Preconnect to Google Fonts for faster loading -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
+  <link rel="dns-prefetch" href="https://fonts.gstatic.com" />
+  <title>DaftriX ERP</title>
+  <link rel="icon" type="image/webp" href="/logo.webp" id="app-favicon">
+  <link rel="apple-touch-icon" href="/logo.webp">
+  <link rel="stylesheet" href="/fonts/cairo.css">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" media="print" id="deferred-fonts" crossorigin="anonymous"/>
+  <noscript><link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" crossorigin="anonymous"/></noscript>
+  <!-- Material Symbols REMOVED — all icons replaced with lucide-react (saves ~1 MB) -->
+  <script>
+    // ⚡ Apply cached branding instantly (before React loads) to prevent flash
+    (function() {
+      // Title
+      var bn = localStorage.getItem('appBrandName');
+      if (bn) document.title = bn;
+      // Font size
+      var fs = localStorage.getItem('appFontSize');
+      if (fs && fs !== '16') document.documentElement.style.fontSize = fs + 'px';
+      // Favicon — use cached app/company logo if available
+      var logo = localStorage.getItem('appBrandLogo') || localStorage.getItem('appCompanyLogo');
+      if (logo) {
+        var fav = document.getElementById('app-favicon');
+        if (fav) fav.href = logo;
+      }
+      // Deferred font loading (CSP-safe — no inline onload handler)
+      var df = document.getElementById('deferred-fonts');
+      if (df) df.media = 'all';
+    })();
+  </script>
+  <script type="module" crossorigin src="/assets/index-IBFziwL2.js"></script>
+<link rel="modulepreload" crossorigin href="/assets/react-vendor-BIDOXFPG.js">
+  <link rel="modulepreload" crossorigin href="/assets/socket-vendor-TjCxX7sJ.js">
+  <link rel="modulepreload" crossorigin href="/assets/icons-vendor-DaeaA4tz.js">
+<link rel="modulepreload" crossorigin href="/assets/query-vendor-CgIICZoo.js">
+  <link rel="stylesheet" crossorigin href="/assets/index-BDJm8eBC.css">
+</head>
+
+<body>
+  <div id="root"></div>
+  <script>
+    // Unregister any service workers to prevent CORS issues
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.getRegistrations().then(function (registrations) {
+        for (let registration of registrations) {
+          registration.unregister();
+          console.log('Unregistered service worker:', registration);
+        }
+      });
+    }
+
+    // Global Input Behavior: Auto-select text on focus
+    // This fixes the "delete written first" annoyance
+    document.addEventListener('focus', function (e) {
+      if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) {
+        // Only for text-like inputs
+        const type = e.target.type;
+        if (['text', 'number', 'email', 'password', 'search', 'tel', 'url'].includes(type) || e.target.tagName === 'TEXTAREA') {
+          // Small delay to ensure focus is complete
+          setTimeout(() => {
+            try {
+              e.target.select();
+            } catch (err) {
+              // Ignore errors (e.g. for hidden inputs)
+            }
+          }, 10);
+        }
+      }
+    }, true);
+  </script>
+</body>
+
+</html>

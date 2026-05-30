@@ -1,0 +1,38 @@
+/* Cairo Font - Arabic (self-hosted, WOFF2 optimized) */
+/* Only loads 4 essential weights — Light/ExtraBold removed to save bandwidth */
+
+@font-face {
+    font-family: 'Cairo';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('./Cairo-Regular.woff2') format('woff2'),
+         url('./Cairo-Regular.ttf') format('truetype');
+}
+
+@font-face {
+    font-family: 'Cairo';
+    font-style: normal;
+    font-weight: 500;
+    font-display: swap;
+    src: url('./Cairo-Medium.woff2') format('woff2'),
+         url('./Cairo-Medium.ttf') format('truetype');
+}
+
+@font-face {
+    font-family: 'Cairo';
+    font-style: normal;
+    font-weight: 600;
+    font-display: swap;
+    src: url('./Cairo-SemiBold.woff2') format('woff2'),
+         url('./Cairo-SemiBold.ttf') format('truetype');
+}
+
+@font-face {
+    font-family: 'Cairo';
+    font-style: normal;
+    font-weight: 700;
+    font-display: swap;
+    src: url('./Cairo-Bold.woff2') format('woff2'),
+         url('./Cairo-Bold.ttf') format('truetype');
+}
