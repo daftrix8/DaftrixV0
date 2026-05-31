@@ -2047,6 +2047,14 @@ function initDB() {
     `).catch(() => { });
             yield conn.query(`
       ALTER TABLE categories 
+      ADD COLUMN IF NOT EXISTS image MEDIUMTEXT
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE categories 
+      ADD COLUMN IF NOT EXISTS color VARCHAR(20)
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE categories 
       ADD COLUMN IF NOT EXISTS createdAt DATETIME DEFAULT CURRENT_TIMESTAMP
     `).catch(() => { });
             yield conn.query(`

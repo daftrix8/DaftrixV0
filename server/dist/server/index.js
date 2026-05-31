@@ -473,6 +473,10 @@ app.use((0, cors_1.default)({
             if (/^(192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.)/.test(url.hostname)) {
                 return callback(null, true);
             }
+            // Allow the public VPS IP
+            if (url.hostname === '188.245.195.126') {
+                return callback(null, true);
+            }
         }
         catch (_a) { }
         // Allow ngrok/tailscale subdomains dynamically, and production domain.

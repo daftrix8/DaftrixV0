@@ -261,6 +261,23 @@ const createBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         const authReq = req;
         const bankBranchId = bank.branchId || ((_a = authReq.branchContext) === null || _a === void 0 ? void 0 : _a.branchId) || null;
         const openingBalance = Number((_b = bank.openingBalance) !== null && _b !== void 0 ? _b : bank.balance) || 0;
+        // Strict Uniqueness Checks
+        if (bank.name) {
+            const [dupName] = yield connection.query('SELECT id FROM banks WHERE name = ? AND id != ? LIMIT 1', [bank.name, id]);
+            if (dupName.length > 0) {
+                yield connection.rollback();
+                connection.release();
+                return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+            }
+        }
+        if (bank.accountNumber && String(bank.accountNumber).trim() !== '') {
+            const [dupAccount] = yield connection.query('SELECT id, name FROM banks WHERE accountNumber = ? AND id != ? LIMIT 1', [bank.accountNumber, id]);
+            if (dupAccount.length > 0) {
+                yield connection.rollback();
+                connection.release();
+                return res.status(400).json({ code: 'DUPLICATE_ACCOUNT', message: `رقم الحساب هذا مسجل مسبقاً للبنك: ${dupAccount[0].name}. يرجى تغييره.` });
+            }
+        }
         // 1. Auto-create GL Account if no accountId provided (or if the provided one doesn't exist)
         if (!accountId) {
             const bankType = bank.bankType || 'BANK';
@@ -340,6 +357,23 @@ const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         const oldBank = oldBanks[0];
         if (!oldBank)
             throw new Error('Bank not found');
+        // Strict Uniqueness Checks
+        if (bank.name) {
+            const [dupName] = yield connection.query('SELECT id FROM banks WHERE name = ? AND id != ? LIMIT 1', [bank.name, id]);
+            if (dupName.length > 0) {
+                yield connection.rollback();
+                connection.release();
+                return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+            }
+        }
+        if (bank.accountNumber && String(bank.accountNumber).trim() !== '') {
+            const [dupAccount] = yield connection.query('SELECT id, name FROM banks WHERE accountNumber = ? AND id != ? LIMIT 1', [bank.accountNumber, id]);
+            if (dupAccount.length > 0) {
+                yield connection.rollback();
+                connection.release();
+                return res.status(400).json({ code: 'DUPLICATE_ACCOUNT', message: `رقم الحساب هذا مسجل مسبقاً للبنك: ${dupAccount[0].name}. يرجى تغييره.` });
+            }
+        }
         // 1.5 Handle isPrimary
         const isPrimary = bank.isPrimary !== undefined ? (bank.isPrimary ? 1 : 0) : (oldBank.isPrimary ? 1 : 0);
         if (isPrimary && !oldBank.isPrimary) {

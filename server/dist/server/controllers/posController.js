@@ -2339,7 +2339,7 @@ const getShifts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
         const authReq = req;
-        const { page = 1, limit = 20, userId, status, dateFrom, dateTo } = req.query;
+        const { page = 1, limit = 20, userId, status, dateFrom, dateTo, search } = req.query;
         const offset = (Number(page) - 1) * Number(limit);
         let whereClause = '1=1';
         const params = [];
@@ -2369,12 +2369,17 @@ const getShifts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             params.push(status);
         }
         if (dateFrom) {
-            whereClause += ' AND DATE(s.openedAt) >= ?';
-            params.push(dateFrom);
+            whereClause += ' AND s.openedAt >= ?';
+            params.push(String(dateFrom).length === 10 ? `${dateFrom} 00:00:00` : dateFrom);
         }
         if (dateTo) {
-            whereClause += ' AND DATE(s.openedAt) <= ?';
-            params.push(dateTo);
+            whereClause += ' AND s.openedAt <= ?';
+            params.push(String(dateTo).length === 10 ? `${dateTo} 23:59:59` : dateTo);
+        }
+        if (search) {
+            whereClause += ' AND (u.name LIKE ? OR w.name LIKE ?)';
+            const like = `%${search}%`;
+            params.push(like, like);
         }
         let shifts;
         try {

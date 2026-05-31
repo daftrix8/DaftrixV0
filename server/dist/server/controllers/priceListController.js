@@ -71,6 +71,14 @@ const createPriceList = (req, res) => __awaiter(void 0, void 0, void 0, function
         const conn = yield (0, db_1.getConnection)();
         // Ensure tables exist
         yield ensurePriceListTables(conn);
+        // Strict Uniqueness Checks
+        if (name) {
+            const [dupName] = yield conn.query('SELECT id FROM price_lists WHERE name = ? AND id != ? LIMIT 1', [name, id]);
+            if (dupName.length > 0) {
+                conn.release();
+                return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+            }
+        }
         yield conn.query('INSERT INTO price_lists (id, name, description, isActive) VALUES (?, ?, ?, ?)', [id, name, description || null, isActive !== undefined ? isActive : true]);
         // When creating a new price list, automatically add it to all existing products
         yield conn.query(`
@@ -92,6 +100,14 @@ const updatePriceList = (req, res) => __awaiter(void 0, void 0, void 0, function
         const { id } = req.params;
         const { name, description, isActive } = req.body;
         const conn = yield (0, db_1.getConnection)();
+        // Strict Uniqueness Checks
+        if (name) {
+            const [dupName] = yield conn.query('SELECT id FROM price_lists WHERE name = ? AND id != ? LIMIT 1', [name, id]);
+            if (dupName.length > 0) {
+                conn.release();
+                return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+            }
+        }
         yield conn.query('UPDATE price_lists SET name = ?, description = ?, isActive = ? WHERE id = ?', [name, description || null, isActive, id]);
         conn.release();
         // Broadcast real-time update

@@ -396,12 +396,12 @@ const createProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const id = reqId || (0, crypto_1.randomUUID)();
         // Auto-populate barcode with SKU if not provided
         const barcode = req.body.barcode || sku || null;
-        // Check for duplicate Name in the same Category
-        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND categoryId <=> ? LIMIT 1', [name, categoryId || null]);
+        // Check for duplicate Name globally
+        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) LIMIT 1', [name]);
         if (existingName.length > 0) {
             yield conn.rollback();
             conn.release();
-            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً في نفس المجموعة` });
+            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً` });
         }
         // Check for duplicate SKU or Barcode
         const barcodeToCheck = barcode || null;
@@ -489,12 +489,12 @@ const updateProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const { name, sku, price, cost, stock, warehouseId, categoryId, bomId, type, unit, isManufactured, leadTimeDays, trackSerials, trackInventory } = req.body;
         // Sync barcode with SKU if barcode is not explicitly provided or is empty
         const barcode = req.body.barcode || sku || null;
-        // Check for duplicate Name in the same Category (excluding this product)
-        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND categoryId <=> ? AND id != ? LIMIT 1', [name, categoryId || null, id]);
+        // Check for duplicate Name globally (excluding this product)
+        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND id != ? LIMIT 1', [name, id]);
         if (existingName.length > 0) {
             yield conn.rollback();
             conn.release();
-            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً في نفس المجموعة` });
+            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً` });
         }
         // Check for duplicate SKU or Barcode (excluding this product)
         const barcodeToCheck = barcode || null;

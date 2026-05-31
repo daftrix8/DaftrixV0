@@ -96,6 +96,13 @@ const createCrudHandlers = (tableName) => ({
             delete data.syncedAt;
             const id = data.id || (0, crypto_1.randomUUID)();
             const keys = Object.keys(data).filter(k => k !== 'id');
+            // Duplicate Name Check
+            if (data.name) {
+                const [existing] = yield db_1.pool.query(`SELECT id FROM ${tableName} WHERE name = ? AND id != ? LIMIT 1`, [data.name, id]);
+                if (existing.length > 0) {
+                    return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+                }
+            }
             // Validate column names against SQL injection (H1)
             if (!validateColumnNames(keys)) {
                 return res.status(400).json({ code: 'INVALID_FIELD', message: 'Invalid field name detected' });
@@ -128,6 +135,13 @@ const createCrudHandlers = (tableName) => ({
             // from SELECT subqueries (e.g. productCount, achieved) and must not appear in SET.
             const COMPUTED_FIELDS = new Set(['productCount', 'achieved']);
             const keys = Object.keys(data).filter(k => k !== 'id' && !COMPUTED_FIELDS.has(k));
+            // Duplicate Name Check
+            if (data.name) {
+                const [existing] = yield db_1.pool.query(`SELECT id FROM ${tableName} WHERE name = ? AND id != ? LIMIT 1`, [data.name, id]);
+                if (existing.length > 0) {
+                    return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+                }
+            }
             // Validate column names against SQL injection (H1)
             if (!validateColumnNames(keys)) {
                 return res.status(400).json({ code: 'INVALID_FIELD', message: 'Invalid field name detected' });
@@ -370,6 +384,13 @@ exports.salesmen = Object.assign(Object.assign({}, createCrudHandlers('salesmen'
             delete data.syncedAt;
             const id = data.id || (0, crypto_1.randomUUID)();
             const keys = Object.keys(data).filter(k => k !== 'id');
+            // Duplicate Name Check
+            if (data.name) {
+                const [existing] = yield db_1.pool.query(`SELECT id FROM salesmen WHERE name = ? AND id != ? LIMIT 1`, [data.name, id]);
+                if (existing.length > 0) {
+                    return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+                }
+            }
             if (!validateColumnNames(keys)) {
                 return res.status(400).json({ code: 'INVALID_FIELD', message: 'Invalid field name detected' });
             }
@@ -409,6 +430,13 @@ exports.salesmen = Object.assign(Object.assign({}, createCrudHandlers('salesmen'
             delete data.syncedAt;
             const COMPUTED_FIELDS = new Set(['productCount', 'achieved']);
             const keys = Object.keys(data).filter(k => k !== 'id' && !COMPUTED_FIELDS.has(k));
+            // Duplicate Name Check
+            if (data.name) {
+                const [existing] = yield db_1.pool.query(`SELECT id FROM salesmen WHERE name = ? AND id != ? LIMIT 1`, [data.name, id]);
+                if (existing.length > 0) {
+                    return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
+                }
+            }
             if (!validateColumnNames(keys)) {
                 return res.status(400).json({ code: 'INVALID_FIELD', message: 'Invalid field name detected' });
             }

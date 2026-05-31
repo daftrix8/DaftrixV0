@@ -484,6 +484,28 @@ const createPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         const salesmanValue = salesmanId === '' ? null : (salesmanId || null);
         const priceListValue = priceListId === '' ? null : (priceListId || null);
+        // Strict Uniqueness Checks
+        if (name) {
+            const [dupName] = yield conn.query('SELECT id FROM partners WHERE name = ? AND id != ? LIMIT 1', [name, id]);
+            if (dupName.length > 0) {
+                yield conn.rollback();
+                return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً لشريك آخر، يرجى اختيار اسم آخر.' });
+            }
+        }
+        if (phone && String(phone).trim() !== '') {
+            const [dupPhone] = yield conn.query('SELECT id, name FROM partners WHERE phone = ? AND id != ? LIMIT 1', [phone, id]);
+            if (dupPhone.length > 0) {
+                yield conn.rollback();
+                return res.status(400).json({ code: 'DUPLICATE_PHONE', message: `رقم الهاتف هذا مسجل مسبقاً للشريك: ${dupPhone[0].name}. يرجى استخدام رقم آخر.` });
+            }
+        }
+        if (taxId && String(taxId).trim() !== '') {
+            const [dupTaxId] = yield conn.query('SELECT id, name FROM partners WHERE taxId = ? AND id != ? LIMIT 1', [taxId, id]);
+            if (dupTaxId.length > 0) {
+                yield conn.rollback();
+                return res.status(400).json({ code: 'DUPLICATE_TAXID', message: `الرقم الضريبي مسجل مسبقاً للشريك: ${dupTaxId[0].name}. يرجى تغييره.` });
+            }
+        }
         const ceramicPriceListValue = ceramicPriceListId === '' ? null : (ceramicPriceListId || null);
         const ceramicDiscountListValue = ceramicDiscountListId === '' ? null : (ceramicDiscountListId || null);
         // Handle Foreign Currency Logic
@@ -541,6 +563,28 @@ const updatePartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             if (!isCustomer && !isSupplier) {
                 yield conn.rollback();
                 return res.status(400).json({ message: 'Partner must be either a customer, supplier, or both' });
+            }
+        }
+        // Strict Uniqueness Checks
+        if (name) {
+            const [dupName] = yield conn.query('SELECT id FROM partners WHERE name = ? AND id != ? LIMIT 1', [name, id]);
+            if (dupName.length > 0) {
+                yield conn.rollback();
+                return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً لشريك آخر، يرجى اختيار اسم آخر.' });
+            }
+        }
+        if (phone && String(phone).trim() !== '') {
+            const [dupPhone] = yield conn.query('SELECT id, name FROM partners WHERE phone = ? AND id != ? LIMIT 1', [phone, id]);
+            if (dupPhone.length > 0) {
+                yield conn.rollback();
+                return res.status(400).json({ code: 'DUPLICATE_PHONE', message: `رقم الهاتف هذا مسجل مسبقاً للشريك: ${dupPhone[0].name}. يرجى استخدام رقم آخر.` });
+            }
+        }
+        if (taxId && String(taxId).trim() !== '') {
+            const [dupTaxId] = yield conn.query('SELECT id, name FROM partners WHERE taxId = ? AND id != ? LIMIT 1', [taxId, id]);
+            if (dupTaxId.length > 0) {
+                yield conn.rollback();
+                return res.status(400).json({ code: 'DUPLICATE_TAXID', message: `الرقم الضريبي مسجل مسبقاً للشريك: ${dupTaxId[0].name}. يرجى تغييره.` });
             }
         }
         // ============================================================

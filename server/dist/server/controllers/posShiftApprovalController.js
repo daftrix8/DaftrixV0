@@ -82,11 +82,11 @@ const getShiftsForReview = (req, res) => __awaiter(void 0, void 0, void 0, funct
         }
         if (from) {
             filters.push(`s.closedAt >= ?`);
-            params.push(from);
+            params.push(String(from).length === 10 ? `${from} 00:00:00` : from);
         }
         if (to) {
             filters.push(`s.closedAt <= ?`);
-            params.push(to);
+            params.push(String(to).length === 10 ? `${to} 23:59:59` : to);
         }
         const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
         let shifts;
