@@ -304,7 +304,7 @@ const getShiftSummary = (req, res) => __awaiter(void 0, void 0, void 0, function
         const expectedCash = parseFloat(shift.expectedCash || 0);
         const cashierOpening = parseFloat(shift.openingCash || 0);
         const adminOpening = parseFloat(shift.adminOpeningAmount || 0);
-        const totalOpening = cashierOpening + adminOpening;
+        const totalOpening = adminOpening; // The system opening amount is the true starting balance
         // Use true sales from movements if available, otherwise fallback to invoice-based
         const hasMovementData = trueCashSales !== 0 || trueCardSales !== 0 || trueOtherSales !== 0;
         const cashSalesAmt = hasMovementData ? trueCashSales : parseFloat((sales === null || sales === void 0 ? void 0 : sales.cashSales) || 0);

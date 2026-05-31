@@ -30,13 +30,13 @@ const calculateMRP = (req, res) => __awaiter(void 0, void 0, void 0, function* (
                 p.name as product_name,
                 p.sku as product_sku,
                 p.stock as current_stock,
-                p.min_stock,
-                p.lead_time_days,
+                p.minStock as min_stock,
+                p.leadTimeDays as lead_time_days,
                 b.id as bom_id,
                 b.name as bom_name
             FROM products p
             LEFT JOIN bom b ON b.finished_product_id = p.id AND b.is_active = 1
-            WHERE (p.type = 'FINISHED' OR p.type = 'PRODUCT' OR p.type IS NULL OR p.is_manufactured = 1)
+            WHERE (p.type = 'FINISHED' OR p.type = 'PRODUCT' OR p.type IS NULL OR p.isManufactured = 1)
               AND b.id IS NOT NULL
             ORDER BY p.name
         `);

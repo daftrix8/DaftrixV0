@@ -804,8 +804,11 @@ const calculatePayroll = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 templateDeductions +
                 socialInsurance +
                 incomeTax) * 100) / 100;
-            // --- NET SALARY ---
-            const netSalary = Math.round((grossSalary - totalDeductions) * 100) / 100;
+            // --- NET SALARY — floored at 0: deductions cannot exceed gross ---
+            const netSalary = Math.max(0, Math.round((grossSalary - totalDeductions) * 100) / 100);
+            if (grossSalary - totalDeductions < 0) {
+                console.warn(`⚠️ [calculatePayroll] ${emp.fullName}: deductions (${totalDeductions}) exceed gross (${grossSalary}). Net capped at 0.`);
+            }
             // 4e. Save Entry with ALL fields stored explicitly
             const entryId = (0, crypto_1.randomUUID)();
             totalAmount += netSalary;
@@ -2151,7 +2154,11 @@ const getLeaveRequests = (req, res) => __awaiter(void 0, void 0, void 0, functio
 });
 exports.getLeaveRequests = getLeaveRequests;
 const createLeaveRequest = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { employeeId, leaveTypeId, startDate, endDate, days, reason, notes } = req.body;
+    const { employeeId, leaveTypeId, startDate, endDate, reason, notes } = req.body;
+    // Accept client-provided days or auto-calculate from date range (inclusive)
+    const days = req.body.days != null
+        ? Number(req.body.days)
+        : Math.ceil((new Date(endDate).getTime() - new Date(startDate).getTime()) / 86400000) + 1;
     try {
         const id = (0, crypto_1.randomUUID)();
         yield db_1.pool.query(`
@@ -2383,8 +2390,21 @@ exports.getInsuranceConfig = getInsuranceConfig;
 // Calculate full payroll preview for an employee
 const calculatePayrollPreview = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { employeeId } = req.params;
-    const { employee, attendance, loanDeductions } = req.body;
+    let { employee, attendance, loanDeductions } = req.body;
     try {
+        // If employee data wasn't passed in the body, load it from the DB
+        if (!employee || !employee.baseSalary) {
+            const [rows] = yield db_1.pool.query('SELECT baseSalary, variableSalary, basicSalaryInsurable, personalExemption FROM employees WHERE id = ?', [employeeId]);
+            if (rows.length === 0) {
+                return res.status(404).json({ error: 'Employee not found' });
+            }
+            employee = {
+                baseSalary: Number(rows[0].baseSalary) || 0,
+                variableSalary: Number(rows[0].variableSalary) || 0,
+                basicSalaryInsurable: Number(rows[0].basicSalaryInsurable) || undefined,
+                personalExemption: Number(rows[0].personalExemption) || 15000,
+            };
+        }
         const result = yield salaryService.calculateEmployeePayroll(employeeId, employee, attendance || {}, loanDeductions || 0);
         res.json(result);
     }

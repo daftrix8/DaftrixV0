@@ -396,11 +396,13 @@ const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             const destWarehouse = order.dest_warehouse_id || order.warehouse_id;
             // 1. Reverse Finished Products (remove from inventory)
             const qtyFinished = order.qty_finished || order.qty_planned;
+            const qtyScrapped = order.qty_scrapped || 0;
+            const goodQty = Math.max(0, qtyFinished - qtyScrapped);
             // Remove from global product stock
-            yield connection.query('UPDATE products SET stock = stock - ? WHERE id = ?', [qtyFinished, order.finished_product_id]);
+            yield connection.query('UPDATE products SET stock = stock - ? WHERE id = ?', [goodQty, order.finished_product_id]);
             // Remove from destination warehouse
             if (destWarehouse) {
-                yield connection.query(`UPDATE product_stocks SET stock = stock - ? WHERE productId = ? AND warehouseId = ?`, [qtyFinished, order.finished_product_id, destWarehouse]);
+                yield connection.query(`UPDATE product_stocks SET stock = stock - ? WHERE productId = ? AND warehouseId = ?`, [goodQty, order.finished_product_id, destWarehouse]);
             }
             // Create reverse stock movement for finished product
             yield connection.query(`
@@ -411,7 +413,7 @@ const deleteProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             `, [
                 order.finished_product_id,
                 destWarehouse,
-                -qtyFinished,
+                -goodQty,
                 id,
                 `إلغاء المنتج التام - حذف أمر التصنيع ${order.order_number}`
             ]);

@@ -188,7 +188,7 @@ function getBranchBanks(conn, branchId) {
                b.id AS bankId, b.name AS bankName,
                b.feeEnabled, b.feeType, b.feePercentage, b.feeFixedAmount, b.feeMinAmount, b.feeTaxRate
         FROM banks b
-        JOIN accounts a ON b.accountId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
+        JOIN accounts a ON b.accountId = a.id
         WHERE b.accountId IS NOT NULL`;
         // Branch-scoped: return banks belonging to this branch + shared banks (branchId IS NULL)
         if (branchId) {
@@ -236,7 +236,8 @@ const getPOSTreasuries = (req, res) => __awaiter(void 0, void 0, void 0, functio
         let branchFilter = '';
         const params = [];
         if (!isPrivileged && userBranchId) {
-            branchFilter = `AND (b.branchId = ? OR b.branchId IS NULL)`;
+            // Only return treasuries EXACTLY matching the user's branch
+            branchFilter = `AND b.branchId = ?`;
             params.push(userBranchId);
         }
         const [rows] = yield conn.query(`
@@ -274,18 +275,23 @@ exports.getPOSTreasuries = getPOSTreasuries;
  * If no previous shift exists, returns 0.
  */
 const getTreasuryPreviousBalance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { id } = req.params;
-        const [rows] = yield conn.query(`SELECT closingCash, closedAt, id AS shiftId
+        // 1. Get the actual current balance from the GL accounts table
+        const [accountRows] = yield conn.query(`SELECT balance FROM accounts WHERE id = ?`, [id]);
+        const actualBalance = ((_a = accountRows[0]) === null || _a === void 0 ? void 0 : _a.balance) || 0;
+        // 2. Get last shift info for the UI display (closedAt date)
+        const [rows] = yield conn.query(`SELECT closedAt, id AS shiftId
              FROM pos_shifts
-             WHERE treasuryId = ? COLLATE utf8mb4_unicode_ci
+             WHERE treasuryId = ?
                AND status IN ('CLOSED', 'VALIDATED', 'APPROVED')
              ORDER BY closedAt DESC
              LIMIT 1`, [id]);
         const lastShift = rows[0] || null;
         res.json({
-            balance: lastShift ? parseFloat(lastShift.closingCash || 0) : 0,
+            balance: parseFloat(actualBalance),
             fromShiftId: (lastShift === null || lastShift === void 0 ? void 0 : lastShift.shiftId) || null,
             closedAt: (lastShift === null || lastShift === void 0 ? void 0 : lastShift.closedAt) || null,
         });
@@ -477,7 +483,7 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b, _c;
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { openingCash = 0, terminalName, shiftDefinitionId: reqShiftDefId, deviceId: reqDeviceId, treasuryId, adminOpeningAmount = 0, adminOpeningAmountPassword, } = req.body;
+        const { openingCash = 0, terminalName, shiftDefinitionId: reqShiftDefId, deviceId: reqDeviceId, treasuryId, } = req.body;
         const userCtx = req.user;
         const userId = userCtx === null || userCtx === void 0 ? void 0 : userCtx.id;
         const userName = (userCtx === null || userCtx === void 0 ? void 0 : userCtx.name) || 'Unknown';
@@ -495,29 +501,16 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             ? req.body.warehouseId
             : ((userCtx === null || userCtx === void 0 ? void 0 : userCtx.defaultWarehouseId) || req.body.warehouseId || null);
         const now = (0, dateUtils_1.getEgyptianISOString)();
-        // ── Admin opening amount: verify password if amount > 0 ──
-        let adminOpeningAmountSetBy = null;
-        let adminOpeningAmountSetAt = null;
-        const parsedAdminAmount = parseFloat(adminOpeningAmount) || 0;
-        if (parsedAdminAmount > 0) {
-            if (!adminOpeningAmountPassword) {
-                return res.status(400).json({ error: 'كلمة مرور المشرف مطلوبة لتحديد المبلغ الافتتاحي للمشرف' });
-            }
-            const [settingsRows] = yield conn.query(`SELECT adminPassword FROM pos_settings LIMIT 1`);
-            const storedHash = ((_a = settingsRows[0]) === null || _a === void 0 ? void 0 : _a.adminPassword) || null;
-            if (!storedHash) {
-                return res.status(400).json({ error: 'لم يتم تعيين كلمة مرور المشرف في إعدادات نقطة البيع' });
-            }
-            const bcrypt = yield Promise.resolve().then(() => __importStar(require('bcryptjs')));
-            const isValid = yield bcrypt.compare(adminOpeningAmountPassword, storedHash);
-            if (!isValid) {
-                return res.status(400).json({ error: 'كلمة مرور المشرف غير صحيحة' });
-            }
-            adminOpeningAmountSetBy = userId;
-            adminOpeningAmountSetAt = now;
-        }
+        // ── Admin opening amount: automatically fetch treasury balance ──
+        // No password required for the cashier to open the shift. The system
+        // simply records what the treasury balance was at the moment of opening.
+        const [accountRows] = yield conn.query(`SELECT balance FROM accounts WHERE id = ?`, [treasuryId]);
+        const actualBalance = ((_a = accountRows[0]) === null || _a === void 0 ? void 0 : _a.balance) || 0;
+        const parsedAdminAmount = parseFloat(actualBalance) || 0;
+        const adminOpeningAmountSetBy = userId;
+        const adminOpeningAmountSetAt = now;
         // Check if user already has an open shift
-        const [existingShifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE userId = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [userId]);
+        const [existingShifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE userId = ? AND status = 'OPEN'`, [userId]);
         if (existingShifts.length > 0) {
             return res.status(400).json({
                 error: 'لديك وردية مفتوحة بالفعل. يرجى إغلاقها أولاً.',
@@ -558,12 +551,12 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         // Fetch warehouse + treasury names
         let warehouseName = null;
         if (resolvedWarehouseId) {
-            const [warehouses] = yield conn.query(`SELECT name FROM warehouses WHERE id = ? COLLATE utf8mb4_unicode_ci`, [resolvedWarehouseId]);
+            const [warehouses] = yield conn.query(`SELECT name FROM warehouses WHERE id = ?`, [resolvedWarehouseId]);
             warehouseName = (_b = warehouses[0]) === null || _b === void 0 ? void 0 : _b.name;
         }
         let treasuryName = null;
         if (treasuryId) {
-            const [treasuryRows] = yield conn.query(`SELECT name FROM accounts WHERE id = ? COLLATE utf8mb4_unicode_ci`, [treasuryId]);
+            const [treasuryRows] = yield conn.query(`SELECT name FROM accounts WHERE id = ?`, [treasuryId]);
             treasuryName = (_c = treasuryRows[0]) === null || _c === void 0 ? void 0 : _c.name;
         }
         const shift = {
@@ -625,10 +618,10 @@ const getCurrentShift = (req, res) => __awaiter(void 0, void 0, void 0, function
             [shifts] = (yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName,
                         a.name as treasuryName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN accounts a ON s.treasuryId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
-                 WHERE s.userId = ? COLLATE utf8mb4_unicode_ci AND s.status = 'OPEN' COLLATE utf8mb4_unicode_ci
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 LEFT JOIN accounts a ON s.treasuryId = a.id
+                 WHERE s.userId = ? AND s.status = 'OPEN'
                  ORDER BY s.openedAt DESC
                  LIMIT 1`, [userId]));
         }
@@ -636,9 +629,9 @@ const getCurrentShift = (req, res) => __awaiter(void 0, void 0, void 0, function
             // treasuryId column not yet migrated — fall back to basic query
             [shifts] = (yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 WHERE s.userId = ? COLLATE utf8mb4_unicode_ci AND s.status = 'OPEN' COLLATE utf8mb4_unicode_ci
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 WHERE s.userId = ? AND s.status = 'OPEN'
                  ORDER BY s.openedAt DESC
                  LIMIT 1`, [userId]));
         }
@@ -648,16 +641,16 @@ const getCurrentShift = (req, res) => __awaiter(void 0, void 0, void 0, function
             // expectedCash must match closeShift formula: OPENING + DEPOSIT + CASH sales − WITHDRAWAL − CASH refunds
             // Bank/card sales do NOT go into the cash drawer, so they must be excluded
             const [movements] = yield conn.query(`SELECT 
-                    SUM(CASE WHEN type IN ('OPENING', 'DEPOSIT') THEN amount ELSE 0 END) as deposits,
+                    SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
                     SUM(CASE WHEN type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals,
                     SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
                     SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
                     SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
                     SUM(CASE WHEN type = 'SALE' THEN amount ELSE 0 END) as totalSales
                  FROM pos_cash_movements
-                 WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shift.id]);
+                 WHERE shiftId = ?`, [shift.id]);
             const movementData = movements[0];
-            const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shift.id]);
+            const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shift.id]);
             const shiftExpenses = parseFloat(((_b = expenseRows[0]) === null || _b === void 0 ? void 0 : _b.totalExpenses) || 0);
             // Cash drawer = opening + adminOpening + deposits + cash sales − withdrawals − cash refunds - expenses
             shift.expectedCash = parseFloat(shift.adminOpeningAmount || 0) +
@@ -703,23 +696,23 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             return res.status(400).json({ error: 'يجب اختيار وجهة تسليم العهدة (خزينة أو موظف)' });
         }
         // Verify shift belongs to user and is open
-        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci AND userId = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [shiftId, userId]);
+        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? AND userId = ? AND status = 'OPEN'`, [shiftId, userId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة أو مغلقة بالفعل' });
         }
         const shift = shifts[0];
         // Calculate expected cash and card
         const [movements] = yield conn.query(`SELECT 
-                SUM(CASE WHEN type IN ('OPENING', 'DEPOSIT') THEN amount ELSE 0 END) as deposits,
+                SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
                 SUM(CASE WHEN type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals,
                 SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
                 SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
                 SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
                 SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankRefunds
              FROM pos_cash_movements
-             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+             WHERE shiftId = ?`, [shiftId]);
         const movementData = movements[0];
-        const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shiftId]);
         const shiftExpenses = parseFloat(((_c = expenseRows[0]) === null || _c === void 0 ? void 0 : _c.totalExpenses) || 0);
         const expectedCash = parseFloat(shift.adminOpeningAmount || 0) +
             parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.deposits) || 0) +
@@ -774,7 +767,7 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                      status = ?, notes = ?,
                      closingRecipientType = ?, closingRecipientId = ?, shortageEmployeeId = ?,
                      updatedAt = ?
-                 WHERE id = ? COLLATE utf8mb4_unicode_ci`, [now, closingCash, expectedCash, variance,
+                 WHERE id = ?`, [now, closingCash, expectedCash, variance,
                 parsedClosingCard, expectedCard, varianceCard,
                 newStatus, notes || null,
                 closingRecipientType || null, closingRecipientId || null, shortageEmployeeId || null,
@@ -831,7 +824,7 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                     // Debit POS Expenses (from pos_expenses table)
                     let expensesList = [];
                     try {
-                        const [expRows] = yield conn.query(`SELECT id, amount, entityType, description FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shift.id]);
+                        const [expRows] = yield conn.query(`SELECT id, amount, entityType, description FROM pos_expenses WHERE shiftId = ?`, [shift.id]);
                         expensesList = expRows;
                     }
                     catch (_e) {
@@ -889,9 +882,9 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             // Get updated shift data (read-only, outside transaction)
             const [closedShifts] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 WHERE s.id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 WHERE s.id = ?`, [shiftId]);
             const closedShift = closedShifts[0];
             // emitEntityChanged('pos-shift', closedShift, userName);
             res.json({
@@ -941,7 +934,7 @@ const validateShift = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             return res.status(400).json({ error: 'معرف الوردية مطلوب' });
         }
         // Verify shift exists and is PENDING_VALIDATION (only pending shifts can be validated)
-        const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ?`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة' });
         }
@@ -951,9 +944,9 @@ const validateShift = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         const [shiftsDetails] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName
              FROM pos_shifts s
-             LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-             WHERE s.id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+             LEFT JOIN users u ON s.userId = u.id
+             LEFT JOIN warehouses w ON s.warehouseId = w.id
+             WHERE s.id = ?`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة' });
         }
@@ -974,7 +967,7 @@ const validateShift = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // Transition to VALIDATED
         yield conn.query(`UPDATE pos_shifts 
              SET status = 'VALIDATED', validatedBy = ?, validatedAt = ?, validationNotes = ?, updatedAt = ?
-             WHERE id = ? COLLATE utf8mb4_unicode_ci`, [userId, now, notes || null, now, shiftId]);
+             WHERE id = ?`, [userId, now, notes || null, now, shiftId]);
         // Return the updated shift with validator info
         let validated;
         try {
@@ -982,18 +975,18 @@ const validateShift = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         u.name as userName, w.name as warehouseName,
                         v.name as validatedByName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN users v ON s.validatedBy COLLATE utf8mb4_unicode_ci = v.id COLLATE utf8mb4_unicode_ci
-                 WHERE s.id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 LEFT JOIN users v ON s.validatedBy = v.id
+                 WHERE s.id = ?`, [shiftId]);
         }
         catch (_c) {
             // validatedBy column may not exist — fall back without validator join
             [validated] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 WHERE s.id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 WHERE s.id = ?`, [shiftId]);
         }
         res.json({
             success: true,
@@ -1024,7 +1017,7 @@ const unvalidateShift = (req, res) => __awaiter(void 0, void 0, void 0, function
         if (!shiftId) {
             return res.status(400).json({ error: 'معرف الوردية مطلوب' });
         }
-        const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ?`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة' });
         }
@@ -1043,7 +1036,7 @@ const unvalidateShift = (req, res) => __awaiter(void 0, void 0, void 0, function
                  approvalStatus = 'pending',
                  validationNotes = CONCAT(COALESCE(validationNotes, ''), '\\n[', ?, '] ', ?), 
                  updatedAt = ?
-             WHERE id = ? COLLATE utf8mb4_unicode_ci`, [now, notes ? `إلغاء اعتماد: ${notes}` : 'تم إلغاء الاعتماد', now, shiftId]);
+             WHERE id = ?`, [now, notes ? `إلغاء اعتماد: ${notes}` : 'تم إلغاء الاعتماد', now, shiftId]);
         // Delete any closing/approval journals
         const [oldJournals] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ? AND description LIKE ?`, [shiftId, '%إغلاق وردية%']);
         if (oldJournals.length > 0) {
@@ -1087,7 +1080,7 @@ const reopenShift = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         if (!shiftId) {
             return res.status(400).json({ error: 'معرف الوردية مطلوب' });
         }
-        const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT status FROM pos_shifts WHERE id = ?`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة' });
         }
@@ -1118,7 +1111,7 @@ const reopenShift = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                  approvalStatus = 'pending',
                  notes = CONCAT(COALESCE(notes, ''), '\\n[', ?, '] ', ?), 
                  updatedAt = ?
-             WHERE id = ? COLLATE utf8mb4_unicode_ci`, [now, notes ? `إعادة فتح الوردية: ${notes}` : 'تم إعادة فتح الوردية', now, shiftId]);
+             WHERE id = ?`, [now, notes ? `إعادة فتح الوردية: ${notes}` : 'تم إعادة فتح الوردية', now, shiftId]);
         // Delete any closing/approval journals
         const [oldJournals] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ? AND description LIKE ?`, [shiftId, '%إغلاق وردية%']);
         if (oldJournals.length > 0) {
@@ -1202,7 +1195,7 @@ const addCashMovement = (req, res) => __awaiter(void 0, void 0, void 0, function
             return res.status(400).json({ error: 'نوع الحركة غير صالح' });
         }
         // Verify shift is open
-        const [shifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE id = ? AND status = 'OPEN'`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(400).json({ error: 'الوردية غير مفتوحة' });
         }
@@ -1248,24 +1241,9 @@ const getShiftMovements = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const { shiftId } = req.params;
         const [movements] = yield conn.query(`SELECT m.*, u.name as approvedByName
              FROM pos_cash_movements m
-             LEFT JOIN users u ON m.approvedBy COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             WHERE m.shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
-        const [expensesList] = yield conn.query(`SELECT e.id, e.shiftId, e.amount, e.description, e.createdAt, u.name as approvedByName
-             FROM pos_expenses e
-             LEFT JOIN users u ON e.createdBy COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             WHERE e.shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
-        const expenseMovements = expensesList.map(e => ({
-            id: e.id,
-            shiftId: e.shiftId,
-            type: 'CASH_OUT',
-            amount: e.amount,
-            paymentMethod: 'CASH',
-            description: e.description,
-            notes: 'مصروف: ' + (e.description || ''),
-            createdAt: e.createdAt,
-            approvedByName: e.approvedByName
-        }));
-        const combinedMovements = [...movements, ...expenseMovements].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+             LEFT JOIN users u ON m.approvedBy = u.id
+             WHERE m.shiftId = ?`, [shiftId]);
+        const combinedMovements = [...movements].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
         res.json({ movements: combinedMovements });
     }
     catch (error) {
@@ -1286,7 +1264,7 @@ exports.getShiftMovements = getShiftMovements;
  * POST /api/pos/sale
  */
 const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { shiftId, customerId, customerName, items, subtotal, discount, discountType, taxAmount, total, paymentMethod, payments, // Split payment: Array<{ method, amount }>
@@ -1310,16 +1288,18 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 return res.status(401).json({ error: 'مطلوب إذن مدير للقيام بهذه العملية (مرتجع/مبادلة)' });
             }
             try {
-                const jwt = yield Promise.resolve().then(() => __importStar(require('jsonwebtoken')));
+                const jwtMod = yield Promise.resolve().then(() => __importStar(require('jsonwebtoken')));
+                const jwt = jwtMod.default || jwtMod;
                 const secret = process.env.JWT_SECRET || 'pos_admin_secret';
                 jwt.verify(adminToken, secret);
             }
             catch (err) {
+                console.error("Admin token verification failed:", err);
                 return res.status(401).json({ error: 'إذن المدير غير صالح أو منتهي الصلاحية' });
             }
         }
         // Verify shift is open
-        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? AND status = 'OPEN'`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(400).json({ error: 'الوردية غير مفتوحة' });
         }
@@ -1379,14 +1359,14 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             const invoiceLines = items.map((item) => {
                 const qty = Number(item.quantity) || 0;
                 const price = Number(item.price) || 0;
-                const discountAmount = Number(item.discount) || 0;
-                const discountValue = Number(item.discountValue) || 0;
+                // The frontend sends the discount value (either fixed amount or percentage) in `item.discount`
+                const discountVal = Number(item.discount) || 0;
                 const discountType = item.discountType || 'FIXED';
                 // Recompute line total in piasters
                 const grossP = Math.round(toPiasters(price) * qty);
                 const discountP = discountType === 'PERCENT'
-                    ? Math.round((grossP * discountValue) / 100)
-                    : toPiasters(discountAmount);
+                    ? Math.round((grossP * discountVal) / 100)
+                    : toPiasters(discountVal);
                 const recomputedTotalP = Math.max(0, grossP - discountP);
                 const recomputedTotal = fromPiasters(recomputedTotalP);
                 return {
@@ -1396,8 +1376,8 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     quantity: qty,
                     price,
                     cost: Number(item.cost) || 0,
-                    discount: discountAmount,
-                    discountValue: discountValue,
+                    discount: discountType === 'PERCENT' ? fromPiasters(discountP) : discountVal,
+                    discountValue: discountType === 'PERCENT' ? discountVal : 0,
                     discountType,
                     total: recomputedTotal,
                     unitId: item.unitId,
@@ -1624,7 +1604,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             // Update shift totals
             yield conn.query(`UPDATE pos_shifts 
                  SET totalSales = totalSales + ?, salesCount = salesCount + 1, updatedAt = ?
-                 WHERE id = ? COLLATE utf8mb4_unicode_ci`, [serverTotal, now, shiftId]);
+                 WHERE id = ?`, [serverTotal, now, shiftId]);
             // ═══════════════════════════════════════════════════════════════════
             // AUTO-POST REVENUE/COGS JOURNAL ENTRY (ATOMIC — failure rolls back sale)
             // POS sales bypass createInvoice, so we must call this directly.
@@ -1887,8 +1867,8 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 for (const item of sortedWriteOffItems) {
                     const scrapQty = Math.abs(Number(item.quantity)); // Positive value for the deduction amount
                     // Average Cost logic
-                    let [costRows] = yield conn.query(`SELECT averageCost FROM products WHERE id = ?`, [item.productId]);
-                    let itemCost = Number((_g = costRows[0]) === null || _g === void 0 ? void 0 : _g.averageCost) || 0;
+                    let [costRows] = yield conn.query(`SELECT avgCost, cost FROM products WHERE id = ?`, [item.productId]);
+                    let itemCost = Number((_g = costRows[0]) === null || _g === void 0 ? void 0 : _g.avgCost) || Number((_h = costRows[0]) === null || _h === void 0 ? void 0 : _h.cost) || 0;
                     // Fall back to item.price if average cost is 0
                     if (itemCost <= 0)
                         itemCost = Number(item.price);
@@ -1906,11 +1886,11 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     // Deduct global product stock
                     yield conn.query(`UPDATE products SET stock = stock - ? WHERE id = ?`, [baseScrapQty, item.productId]);
                     // Log stock movement
-                    yield conn.query(`INSERT INTO stock_movements (id, productId, variantId, warehouseId, type, quantity, referenceId, notes, createdBy)
-                         VALUES (?, ?, ?, ?, 'ADJUSTMENT', ?, ?, ?, ?)`, [
-                        (0, crypto_1.randomUUID)(), item.productId, item.variantId || null, effectiveWarehouseId,
+                    yield conn.query(`INSERT INTO stock_movements (product_id, variant_id, warehouse_id, movement_type, qty_change, reference_type, reference_id, unit_cost, notes, created_by)
+                         VALUES (?, ?, ?, 'ADJUSTMENT', ?, 'INVOICE', ?, ?, ?, ?)`, [
+                        item.productId, item.variantId || null, effectiveWarehouseId,
                         -baseScrapQty, // negative because we're removing it
-                        invoiceId, `إهلاك بضاعة مرتجعة تالفة (POS #${invoiceNumber})`, userName
+                        invoiceId, itemCost, `إهلاك بضاعة مرتجعة تالفة (POS #${invoiceNumber})`, userName
                     ]);
                 }
                 if (totalScrapCost > 0) {
@@ -2023,9 +2003,9 @@ const getShiftReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
         // Get shift details
         const [shifts] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName
              FROM pos_shifts s
-             LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-             WHERE s.id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+             LEFT JOIN users u ON s.userId = u.id
+             LEFT JOIN warehouses w ON s.warehouseId = w.id
+             WHERE s.id = ?`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة' });
         }
@@ -2033,31 +2013,16 @@ const getShiftReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
         // Get cash movements
         const [movements] = yield conn.query(`SELECT m.*, u.name as approvedByName
              FROM pos_cash_movements m
-             LEFT JOIN users u ON m.approvedBy COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             WHERE m.shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
-        const [expensesList] = yield conn.query(`SELECT e.id, e.shiftId, e.amount, e.description, e.createdAt, u.name as approvedByName
-             FROM pos_expenses e
-             LEFT JOIN users u ON e.createdBy COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             WHERE e.shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
-        const expenseMovements = expensesList.map(e => ({
-            id: e.id,
-            shiftId: e.shiftId,
-            type: 'CASH_OUT',
-            amount: e.amount,
-            paymentMethod: 'CASH',
-            description: e.description,
-            notes: 'مصروف: ' + (e.description || ''),
-            createdAt: e.createdAt,
-            approvedByName: e.approvedByName
-        }));
-        const combinedMovements = [...movements, ...expenseMovements].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+             LEFT JOIN users u ON m.approvedBy = u.id
+             WHERE m.shiftId = ?`, [shiftId]);
+        const combinedMovements = [...movements].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
         // Get sales by payment method
         const [salesByMethod] = yield conn.query(`SELECT 
                 paymentMethod,
                 SUM(amount) as total,
                 COUNT(*) as count
              FROM pos_cash_movements
-             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci AND type = 'SALE'
+             WHERE shiftId = ? AND type = 'SALE'
              GROUP BY paymentMethod`, [shiftId]);
         // Get top selling products
         const [topProducts] = yield conn.query(`SELECT 
@@ -2071,18 +2036,18 @@ const getShiftReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
              GROUP BY il.productId, il.productName
              ORDER BY revenue DESC
              LIMIT 10`, [shiftId]);
-        const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shiftId]);
         const shiftExpenses = parseFloat(((_a = expenseRows[0]) === null || _a === void 0 ? void 0 : _a.totalExpenses) || 0);
         // Recalculate expected cash on the fly for the report
         const [expectedCashMovements] = yield conn.query(`SELECT 
-                SUM(CASE WHEN type IN ('OPENING', 'DEPOSIT') THEN amount ELSE 0 END) as deposits,
+                SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
                 SUM(CASE WHEN type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals,
                 SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
                 SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
                 SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
                 SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankRefunds
              FROM pos_cash_movements
-             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+             WHERE shiftId = ?`, [shiftId]);
         const movData = expectedCashMovements[0];
         const computedExpectedCash = parseFloat(shift.adminOpeningAmount || 0) +
             parseFloat((movData === null || movData === void 0 ? void 0 : movData.deposits) || 0) +
@@ -2147,7 +2112,7 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 pcm.paymentMethod,
                 COALESCE(SUM(pcm.amount), 0) AS total
              FROM pos_cash_movements pcm
-             JOIN invoices i ON pcm.referenceId = i.id COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON pcm.referenceId = i.id
              WHERE pcm.type = 'SALE'
                AND ${baseWhere}
              GROUP BY pcm.paymentMethod`, dateParams);
@@ -2199,7 +2164,7 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 pcm.paymentMethod,
                 COALESCE(SUM(pcm.amount), 0) AS total
              FROM pos_cash_movements pcm
-             JOIN invoices i ON pcm.referenceId = i.id COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON pcm.referenceId = i.id
              WHERE pcm.type = 'SALE' AND ${baseWhere}
              GROUP BY DATE(i.date), pcm.paymentMethod`, dateParams);
         const dailyMap = new Map();
@@ -2242,7 +2207,7 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 SUM(il.quantity) AS totalQuantity,
                 SUM(il.total) AS totalRevenue
              FROM invoice_lines il
-             JOIN invoices i ON i.id = il.invoiceId COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON i.id = il.invoiceId
              WHERE ${baseWhere}
              GROUP BY il.productId
              ORDER BY totalQuantity DESC
@@ -2255,8 +2220,8 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 COUNT(*) AS transactionCount,
                 COALESCE(SUM(i.total), 0) AS totalSales
              FROM invoices i
-             LEFT JOIN users u ON i.createdBy COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-             LEFT JOIN users u2 ON i.createdBy COLLATE utf8mb4_unicode_ci = u2.username COLLATE utf8mb4_unicode_ci
+             LEFT JOIN users u ON i.createdBy = u.id
+             LEFT JOIN users u2 ON i.createdBy = u2.username
              WHERE ${baseWhere}
              GROUP BY i.createdBy, COALESCE(u.name, u2.name, i.createdBy)
              ORDER BY totalSales DESC`, dateParams);
@@ -2396,7 +2361,7 @@ const getShifts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             }
         }
         if (userId) {
-            whereClause += ' AND s.userId = ? COLLATE utf8mb4_unicode_ci';
+            whereClause += ' AND s.userId = ?';
             params.push(userId);
         }
         if (status) {
@@ -2417,11 +2382,11 @@ const getShifts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
                         v.name as validatedByName,
                         def.name as shiftDefinitionName, dev.name as deviceName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN users v ON s.validatedBy COLLATE utf8mb4_unicode_ci = v.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN pos_shift_definitions def ON s.shiftDefinitionId COLLATE utf8mb4_unicode_ci = def.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN pos_devices dev ON s.deviceId COLLATE utf8mb4_unicode_ci = dev.id COLLATE utf8mb4_unicode_ci
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 LEFT JOIN users v ON s.validatedBy = v.id
+                 LEFT JOIN pos_shift_definitions def ON s.shiftDefinitionId = def.id
+                 LEFT JOIN pos_devices dev ON s.deviceId = dev.id
                  WHERE ${whereClause}
                  ORDER BY s.openedAt DESC
                  LIMIT ? OFFSET ?`, [...params, Number(limit), offset]);
@@ -2431,10 +2396,10 @@ const getShifts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             [shifts] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName,
                         def.name as shiftDefinitionName, dev.name as deviceName
                  FROM pos_shifts s
-                 LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN pos_shift_definitions def ON s.shiftDefinitionId COLLATE utf8mb4_unicode_ci = def.id COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN pos_devices dev ON s.deviceId COLLATE utf8mb4_unicode_ci = dev.id COLLATE utf8mb4_unicode_ci
+                 LEFT JOIN users u ON s.userId = u.id
+                 LEFT JOIN warehouses w ON s.warehouseId = w.id
+                 LEFT JOIN pos_shift_definitions def ON s.shiftDefinitionId = def.id
+                 LEFT JOIN pos_devices dev ON s.deviceId = dev.id
                  WHERE ${whereClause}
                  ORDER BY s.openedAt DESC
                  LIMIT ? OFFSET ?`, [...params, Number(limit), offset]);
@@ -2942,7 +2907,7 @@ const getHeldOrders = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const { shiftId } = req.params;
         const [orders] = yield conn.query(`SELECT *, JSON_UNQUOTE(orderData) as orderData
              FROM pos_held_orders
-             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci
+             WHERE shiftId = ?
              ORDER BY createdAt DESC`, [shiftId]);
         // Parse orderData JSON
         const parsedOrders = orders.map(order => (Object.assign(Object.assign({}, order), { items: JSON.parse(order.orderData) })));
@@ -2968,13 +2933,13 @@ const recallHeldOrder = (req, res) => __awaiter(void 0, void 0, void 0, function
         const { holdId } = req.params;
         const [orders] = yield conn.query(`SELECT *, JSON_UNQUOTE(orderData) as orderData
              FROM pos_held_orders
-             WHERE id = ? COLLATE utf8mb4_unicode_ci`, [holdId]);
+             WHERE id = ?`, [holdId]);
         if (orders.length === 0) {
             return res.status(404).json({ error: 'الطلب غير موجود' });
         }
         const order = orders[0];
         // Delete the held order
-        yield conn.query(`DELETE FROM pos_held_orders WHERE id = ? COLLATE utf8mb4_unicode_ci`, [holdId]);
+        yield conn.query(`DELETE FROM pos_held_orders WHERE id = ?`, [holdId]);
         res.json({
             success: true,
             order: Object.assign(Object.assign({}, order), { items: JSON.parse(order.orderData) }),
@@ -3011,26 +2976,29 @@ const getRecentPOSSales = (req, res) => __awaiter(void 0, void 0, void 0, functi
             .join(', ');
         const totalCol = invCols.has('total') ? ', total' : ', 0 AS total';
         const isPOSFilter = invCols.has('isPOSSale') ? 'isPOSSale = 1 AND' : '';
-        let shiftFilter = '';
+        let userFilter = '';
         const params = [];
         if (shiftId) {
-            shiftFilter = 'posShiftId = ? AND';
+            userFilter = 'posShiftId = ? AND';
             params.push(shiftId);
         }
-        else if (userId && invCols.has('posShiftId')) {
-            const [shifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE userId = ? AND status = 'OPEN'`, [userId]);
-            if (shifts.length > 0) {
-                shiftFilter = 'posShiftId = ? AND';
-                params.push(shifts[0].id);
+        else if (userId) {
+            userFilter = 'createdBy = ? AND';
+            // We need the username or email of the user to match createdBy, but we only have userId.
+            // Wait, createdBy is a string (username) or ID?
+            // Usually createdBy is the user's name or ID. Let's fetch the username.
+            const [users] = yield conn.query(`SELECT name FROM users WHERE id = ?`, [userId]);
+            if (users.length > 0) {
+                params.push(users[0].name);
             }
             else {
-                return res.json({ invoices: [] });
+                params.push(userId); // Fallback
             }
         }
         params.push(limit);
         const [invoices] = yield conn.query(`SELECT ${safeCols}${totalCol}
              FROM invoices
-             WHERE ${shiftFilter} ${isPOSFilter} type = 'INVOICE_SALE'
+             WHERE ${userFilter} ${isPOSFilter} type = 'INVOICE_SALE'
              ORDER BY date DESC
              LIMIT ?`, params);
         res.json({ invoices });
@@ -3262,13 +3230,13 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
         }
         refundTotal = Number(refundTotal);
         // Verify shift is open
-        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? AND status = 'OPEN'`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(400).json({ error: 'الوردية غير مفتوحة' });
         }
         const shift = shifts[0];
         // Verify original invoice exists
-        const [origInvoices] = yield conn.query(`SELECT * FROM invoices WHERE id = ? COLLATE utf8mb4_unicode_ci AND isPOSSale = 1`, [originalInvoiceId]);
+        const [origInvoices] = yield conn.query(`SELECT * FROM invoices WHERE id = ? AND isPOSSale = 1`, [originalInvoiceId]);
         if (origInvoices.length === 0) {
             return res.status(404).json({ error: 'الفاتورة الأصلية غير موجودة' });
         }
@@ -3317,6 +3285,11 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 for (const item of sortedItems) {
                     const baseQty = item.baseQuantity || item.quantity;
                     yield conn.query(`UPDATE product_stocks SET stock = stock + ? WHERE productId = ? AND warehouseId = ?`, [baseQty, item.productId, effectiveWarehouseId]);
+                    // Restore variant-specific stock (mirrors sale deduction logic)
+                    if (item.variantId) {
+                        yield conn.query(`UPDATE product_variant_stocks SET stock = stock + ? WHERE variantId = ? AND warehouseId = ?`, [baseQty, item.variantId, effectiveWarehouseId]);
+                        yield conn.query(`UPDATE product_variants SET stock = stock + ? WHERE id = ?`, [baseQty, item.variantId]);
+                    }
                 }
                 // 2. BATCH global product stock update (CASE WHEN — 1 query)
                 const productStockMap = new Map();
@@ -3358,7 +3331,7 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
             yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
                  VALUES (?, ?, 'REFUND', ?, ?, ?, 'INVOICE', ?, ?)`, [movementId, shiftId, refundTotal, effectiveRefundMethod, refundId, reason || 'مرتجع', now]);
             // Update shift totals
-            yield conn.query(`UPDATE pos_shifts SET totalRefunds = COALESCE(totalRefunds, 0) + ?, refundsCount = COALESCE(refundsCount, 0) + 1, updatedAt = ? WHERE id = ? COLLATE utf8mb4_unicode_ci`, [refundTotal, now, shiftId]);
+            yield conn.query(`UPDATE pos_shifts SET totalRefunds = COALESCE(totalRefunds, 0) + ?, refundsCount = COALESCE(refundsCount, 0) + 1, updatedAt = ? WHERE id = ?`, [refundTotal, now, shiftId]);
             // ═══════════════════════════════════════════════════════════════════
             // REVERSE REVENUE/COGS JOURNAL ENTRY (ATOMIC — failure rolls back refund)
             // Mirrors the sale journal but with RETURN_SALE type — reverses Dr/Cr
@@ -3539,7 +3512,7 @@ const getEmbeddedVariants = (req, res) => __awaiter(void 0, void 0, void 0, func
                         pv.purchasePrice, pv.sellingPrice, pv.attributes, pv.isActive, pv.image,
                         ${stockExpr}
                  FROM product_variants pv
-                 WHERE pv.productId COLLATE utf8mb4_unicode_ci = ? ${activeFilter}
+                 WHERE pv.productId = ? ${activeFilter}
                  ORDER BY pv.name`, params);
             variantRows = rows;
         }
@@ -3655,15 +3628,15 @@ function buildReportFilters(query) {
         rawShiftIds.push(...String(sessionNumbers).split(',').map((s) => s.trim()).filter(Boolean));
     const uniqueShiftIds = [...new Set(rawShiftIds)];
     if (uniqueShiftIds.length === 1) {
-        conditions.push('i.posShiftId = ? COLLATE utf8mb4_unicode_ci');
+        conditions.push('i.posShiftId = ?');
         params.push(uniqueShiftIds[0]);
     }
     else if (uniqueShiftIds.length > 1) {
-        conditions.push(`i.posShiftId IN (${uniqueShiftIds.map(() => '?').join(',')}) COLLATE utf8mb4_unicode_ci`);
+        conditions.push(`i.posShiftId IN (${uniqueShiftIds.map(() => '?').join(',')})`);
         params.push(...uniqueShiftIds);
     }
     if (warehouseId) {
-        conditions.push('i.warehouseId = ? COLLATE utf8mb4_unicode_ci');
+        conditions.push('i.warehouseId = ?');
         params.push(warehouseId);
     }
     const rawBranchIds = [];
@@ -3673,11 +3646,11 @@ function buildReportFilters(query) {
         rawBranchIds.push(...String(branchIds).split(',').map((s) => s.trim()).filter(Boolean));
     const uniqueBranchIds = [...new Set(rawBranchIds)];
     if (uniqueBranchIds.length === 1) {
-        conditions.push('i.branchId = ? COLLATE utf8mb4_unicode_ci');
+        conditions.push('i.branchId = ?');
         params.push(uniqueBranchIds[0]);
     }
     else if (uniqueBranchIds.length > 1) {
-        conditions.push(`i.branchId IN (${uniqueBranchIds.map(() => '?').join(',')}) COLLATE utf8mb4_unicode_ci`);
+        conditions.push(`i.branchId IN (${uniqueBranchIds.map(() => '?').join(',')})`);
         params.push(...uniqueBranchIds);
     }
     if (currency) {
@@ -3698,8 +3671,8 @@ function buildDeviceJoin(posDeviceId) {
     if (!posDeviceId)
         return { join: '', condition: '', param: [] };
     return {
-        join: 'JOIN pos_shifts ps ON ps.id = i.posShiftId COLLATE utf8mb4_unicode_ci',
-        condition: ' AND ps.deviceId = ? COLLATE utf8mb4_unicode_ci',
+        join: 'JOIN pos_shifts ps ON ps.id = i.posShiftId',
+        condition: ' AND ps.deviceId = ?',
         param: [posDeviceId],
     };
 }
@@ -3719,9 +3692,9 @@ const getCategorySalesSummary = (req, res) => __awaiter(void 0, void 0, void 0, 
                 COALESCE(SUM(il.discount), 0) AS totalDiscount,
                 SUM(il.total) AS totalNetSales
              FROM invoice_lines il
-             JOIN invoices i ON i.id = il.invoiceId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN products p ON p.id = il.productId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN categories c ON c.id = p.categoryId COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON i.id = il.invoiceId
+             LEFT JOIN products p ON p.id = il.productId
+             LEFT JOIN categories c ON c.id = p.categoryId
              ${dj}
              WHERE ${where}${dc}
              GROUP BY COALESCE(c.name, 'غير مصنف')
@@ -3755,9 +3728,9 @@ const getProductSalesSummary = (req, res) => __awaiter(void 0, void 0, void 0, f
                 SUM(il.price * il.quantity) AS totalRevenue,
                 SUM(il.total) AS totalNetSales
              FROM invoice_lines il
-             JOIN invoices i ON i.id = il.invoiceId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN products p ON p.id = il.productId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN categories c ON c.id = p.categoryId COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON i.id = il.invoiceId
+             LEFT JOIN products p ON p.id = il.productId
+             LEFT JOIN categories c ON c.id = p.categoryId
              ${dj}
              WHERE ${where}${dc}
              GROUP BY il.productId
@@ -3784,11 +3757,11 @@ const getShiftSalesReport = (req, res) => __awaiter(void 0, void 0, void 0, func
             params.push(dateFrom, dateTo);
         }
         if (warehouseId) {
-            conditions.push('ps.warehouseId = ? COLLATE utf8mb4_unicode_ci');
+            conditions.push('ps.warehouseId = ?');
             params.push(warehouseId);
         }
         if (posDeviceId) {
-            conditions.push('ps.deviceId = ? COLLATE utf8mb4_unicode_ci');
+            conditions.push('ps.deviceId = ?');
             params.push(posDeviceId);
         }
         const rawBranchIds = [];
@@ -3797,11 +3770,11 @@ const getShiftSalesReport = (req, res) => __awaiter(void 0, void 0, void 0, func
         if (branchIds)
             rawBranchIds.push(...String(branchIds).split(',').map((s) => s.trim()).filter(Boolean));
         if (rawBranchIds.length === 1) {
-            conditions.push('ps.branchId = ? COLLATE utf8mb4_unicode_ci');
+            conditions.push('ps.branchId = ?');
             params.push(rawBranchIds[0]);
         }
         else if (rawBranchIds.length > 1) {
-            conditions.push(`ps.branchId IN (${rawBranchIds.map(() => '?').join(',')}) COLLATE utf8mb4_unicode_ci`);
+            conditions.push(`ps.branchId IN (${rawBranchIds.map(() => '?').join(',')})`);
             params.push(...rawBranchIds);
         }
         const parsedPageSize = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
@@ -3827,8 +3800,8 @@ const getShiftSalesReport = (req, res) => __awaiter(void 0, void 0, void 0, func
                 COALESCE(ps.refundCount, 0) AS refundCount,
                 TIMESTAMPDIFF(MINUTE, ps.openedAt, COALESCE(ps.closedAt, NOW())) AS durationMinutes
              FROM pos_shifts ps
-             LEFT JOIN users u ON u.id = ps.userId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN warehouses w ON w.id = ps.warehouseId COLLATE utf8mb4_unicode_ci
+             LEFT JOIN users u ON u.id = ps.userId
+             LEFT JOIN warehouses w ON w.id = ps.warehouseId
              WHERE ${conditions.join(' AND ')}
              ORDER BY ps.openedAt DESC
              LIMIT ? OFFSET ?`, [...params, parsedPageSize, offset]);
@@ -3861,7 +3834,7 @@ const getShiftMovementDetail = (req, res) => __awaiter(void 0, void 0, void 0, f
                 pcm.approvedBy,
                 pcm.createdAt
              FROM pos_cash_movements pcm
-             WHERE pcm.shiftId = ? COLLATE utf8mb4_unicode_ci
+             WHERE pcm.shiftId = ?
              ORDER BY pcm.createdAt ASC`, [shiftId]);
         const [invoices] = yield conn.query(`SELECT
                 i.id,
@@ -3872,7 +3845,7 @@ const getShiftMovementDetail = (req, res) => __awaiter(void 0, void 0, void 0, f
                 i.paymentMethod,
                 i.status
              FROM invoices i
-             WHERE i.posShiftId = ? COLLATE utf8mb4_unicode_ci
+             WHERE i.posShiftId = ?
                AND i.type IN ('INVOICE_SALE', 'CREDIT_NOTE')
                AND i.isPOSSale = 1
              ORDER BY i.date ASC`, [shiftId]);
@@ -3897,11 +3870,11 @@ const getShiftProfitabilityReport = (req, res) => __awaiter(void 0, void 0, void
             shiftParams.push(dateFrom, dateTo);
         }
         if (warehouseId) {
-            shiftConditions.push('ps.warehouseId = ? COLLATE utf8mb4_unicode_ci');
+            shiftConditions.push('ps.warehouseId = ?');
             shiftParams.push(warehouseId);
         }
         if (posDeviceId) {
-            shiftConditions.push('ps.deviceId = ? COLLATE utf8mb4_unicode_ci');
+            shiftConditions.push('ps.deviceId = ?');
             shiftParams.push(posDeviceId);
         }
         const parsedPageSize = Math.min(Math.max(parseInt(pageSize) || 50, 1), 500);
@@ -3919,23 +3892,23 @@ const getShiftProfitabilityReport = (req, res) => __awaiter(void 0, void 0, void
                 COALESCE((
                     SELECT SUM(CASE WHEN inv.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END)
                     FROM invoices inv
-                    JOIN invoice_lines il ON il.invoiceId = inv.id COLLATE utf8mb4_unicode_ci
-                    LEFT JOIN products p ON p.id = il.productId COLLATE utf8mb4_unicode_ci
-                    WHERE inv.posShiftId = ps.id COLLATE utf8mb4_unicode_ci
+                    JOIN invoice_lines il ON il.invoiceId = inv.id
+                    LEFT JOIN products p ON p.id = il.productId
+                    WHERE inv.posShiftId = ps.id
                       AND inv.type IN ('INVOICE_SALE', 'RETURN_SALE')
                 ), 0) AS totalCost,
                 COALESCE(ps.totalSales, 0) - COALESCE(ps.totalRefunds, 0)
                     - COALESCE((
                         SELECT SUM(CASE WHEN inv.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END)
                         FROM invoices inv
-                        JOIN invoice_lines il ON il.invoiceId = inv.id COLLATE utf8mb4_unicode_ci
-                        LEFT JOIN products p ON p.id = il.productId COLLATE utf8mb4_unicode_ci
-                        WHERE inv.posShiftId = ps.id COLLATE utf8mb4_unicode_ci
+                        JOIN invoice_lines il ON il.invoiceId = inv.id
+                        LEFT JOIN products p ON p.id = il.productId
+                        WHERE inv.posShiftId = ps.id
                           AND inv.type IN ('INVOICE_SALE', 'RETURN_SALE')
                     ), 0) AS grossProfit
              FROM pos_shifts ps
-             LEFT JOIN users u ON u.id = ps.userId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN warehouses w ON w.id = ps.warehouseId COLLATE utf8mb4_unicode_ci
+             LEFT JOIN users u ON u.id = ps.userId
+             LEFT JOIN warehouses w ON w.id = ps.warehouseId
              WHERE ${shiftConditions.join(' AND ')}
              ORDER BY ps.openedAt DESC
              LIMIT ? OFFSET ?`, [...shiftParams, parsedPageSize, offset]);
@@ -3969,9 +3942,9 @@ const getCategoryProfitabilityReport = (req, res) => __awaiter(void 0, void 0, v
                 END AS marginPercent,
                 SUM(CASE WHEN COALESCE(p.cost, 0) = 0 THEN 1 ELSE 0 END) AS missingCostCount
              FROM invoice_lines il
-             JOIN invoices i ON i.id = il.invoiceId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN products p ON p.id = il.productId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN categories c ON c.id = p.categoryId COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON i.id = il.invoiceId
+             LEFT JOIN products p ON p.id = il.productId
+             LEFT JOIN categories c ON c.id = p.categoryId
              ${dj}
              WHERE ${where}${dc}
              GROUP BY COALESCE(c.name, 'غير مصنف')
@@ -4009,9 +3982,9 @@ const getProductProfitabilityReport = (req, res) => __awaiter(void 0, void 0, vo
                 END AS marginPercent,
                 CASE WHEN COALESCE(p.cost, 0) = 0 THEN 1 ELSE 0 END AS missingCost
              FROM invoice_lines il
-             JOIN invoices i ON i.id = il.invoiceId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN products p ON p.id = il.productId COLLATE utf8mb4_unicode_ci
-             LEFT JOIN categories c ON c.id = p.categoryId COLLATE utf8mb4_unicode_ci
+             JOIN invoices i ON i.id = il.invoiceId
+             LEFT JOIN products p ON p.id = il.productId
+             LEFT JOIN categories c ON c.id = p.categoryId
              ${dj}
              WHERE ${where}${dc}
              GROUP BY il.productId, il.productName, COALESCE(c.name, 'غير مصنف'),
@@ -4041,9 +4014,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                     SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.price * il.quantity) ELSE (il.price * il.quantity) END) AS totalRevenue, COALESCE(SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.discount ELSE il.discount END),0) AS totalDiscount,
                     SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) AS totalNetSales
                  FROM invoice_lines il
-                 JOIN invoices i ON i.id=il.invoiceId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN products p ON p.id=il.productId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN categories c ON c.id=p.categoryId COLLATE utf8mb4_unicode_ci ${dj}
+                 JOIN invoices i ON i.id=il.invoiceId
+                 LEFT JOIN products p ON p.id=il.productId
+                 LEFT JOIN categories c ON c.id=p.categoryId ${dj}
                  WHERE ${where}${dc} GROUP BY COALESCE(c.name,'غير مصنف') ORDER BY totalRevenue DESC`, [...params, ...dp]);
             return rows;
         }),
@@ -4054,9 +4027,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                     SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty, AVG(il.price) AS avgPrice,
                     SUM(COALESCE(CASE WHEN i.type = 'RETURN_SALE' THEN -il.discount ELSE il.discount END,0)) AS totalDiscount, SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.price * il.quantity) ELSE (il.price * il.quantity) END) AS totalRevenue, SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) AS totalNetSales
                  FROM invoice_lines il
-                 JOIN invoices i ON i.id=il.invoiceId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN products p ON p.id=il.productId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN categories c ON c.id=p.categoryId COLLATE utf8mb4_unicode_ci ${dj}
+                 JOIN invoices i ON i.id=il.invoiceId
+                 LEFT JOIN products p ON p.id=il.productId
+                 LEFT JOIN categories c ON c.id=p.categoryId ${dj}
                  WHERE ${where}${dc}
                  GROUP BY il.productId,il.productName,COALESCE(c.name,'غير مصنف')
                  ORDER BY totalRevenue DESC`, [...params, ...dp]);
@@ -4070,14 +4043,14 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                 p.push(q.dateFrom, q.dateTo);
             }
             if (q.warehouseId) {
-                conds.push('ps.warehouseId=? COLLATE utf8mb4_unicode_ci');
+                conds.push('ps.warehouseId=?');
                 p.push(q.warehouseId);
             }
             const [rows] = yield conn.query(`SELECT ps.id AS shiftId, ps.openedAt, ps.closedAt, COALESCE(u.name,'Unknown') AS userName, ps.status,
                     COALESCE(ps.totalSales,0) AS totalSales, COALESCE(ps.totalRefunds,0) AS totalRefunds,
                     COALESCE(ps.salesCount,0) AS salesCount
                  FROM pos_shifts ps
-                 LEFT JOIN users u ON u.id = ps.userId COLLATE utf8mb4_unicode_ci
+                 LEFT JOIN users u ON u.id = ps.userId
                  WHERE ${conds.join(' AND ')} ORDER BY ps.openedAt DESC`, p);
             return rows;
         }),
@@ -4091,7 +4064,7 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
             const [rows] = yield conn.query(`SELECT ps.id AS shiftId, ps.openedAt, COALESCE(u.name,'Unknown') AS userName,
                     COALESCE(ps.totalSales,0)-COALESCE(ps.totalRefunds,0) AS netSales
                  FROM pos_shifts ps
-                 LEFT JOIN users u ON u.id = ps.userId COLLATE utf8mb4_unicode_ci
+                 LEFT JOIN users u ON u.id = ps.userId
                  WHERE ${conds.join(' AND ')} ORDER BY ps.openedAt DESC`, p);
             return rows;
         }),
@@ -4106,9 +4079,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                          THEN ROUND((SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END)-SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity*COALESCE(p.cost,0)) ELSE (il.quantity*COALESCE(p.cost,0)) END))/SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END)*100,2)
                          ELSE 0 END AS marginPercent
                  FROM invoice_lines il
-                 JOIN invoices i ON i.id=il.invoiceId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN products p ON p.id=il.productId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN categories c ON c.id=p.categoryId COLLATE utf8mb4_unicode_ci ${dj}
+                 JOIN invoices i ON i.id=il.invoiceId
+                 LEFT JOIN products p ON p.id=il.productId
+                 LEFT JOIN categories c ON c.id=p.categoryId ${dj}
                  WHERE ${where}${dc} GROUP BY COALESCE(c.name,'غير مصنف') ORDER BY grossProfit DESC`, [...params, ...dp]);
             return rows;
         }),
@@ -4123,9 +4096,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                          THEN ROUND((SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END)-SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity*COALESCE(p.cost,0)) ELSE (il.quantity*COALESCE(p.cost,0)) END))/SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END)*100,2)
                          ELSE 0 END AS marginPercent
                  FROM invoice_lines il
-                 JOIN invoices i ON i.id=il.invoiceId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN products p ON p.id=il.productId COLLATE utf8mb4_unicode_ci
-                 LEFT JOIN categories c ON c.id=p.categoryId COLLATE utf8mb4_unicode_ci ${dj}
+                 JOIN invoices i ON i.id=il.invoiceId
+                 LEFT JOIN products p ON p.id=il.productId
+                 LEFT JOIN categories c ON c.id=p.categoryId ${dj}
                  WHERE ${where}${dc}
                  GROUP BY il.productId,il.productName,COALESCE(c.name,'غير مصنف')
                  ORDER BY grossProfit DESC`, [...params, ...dp]);

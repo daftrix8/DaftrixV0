@@ -553,7 +553,7 @@ function runPhase1_RecalculateStocks() {
                 const [variantStockMovements] = yield conn.query(`
                 SELECT sm.product_id, sm.variant_id, sm.warehouse_id, SUM(sm.qty_change) as total_change
                 FROM stock_movements sm
-                INNER JOIN product_variants pv ON sm.variant_id COLLATE utf8mb4_unicode_ci = pv.id COLLATE utf8mb4_unicode_ci
+                INNER JOIN product_variants pv ON sm.variant_id = pv.id
                 WHERE sm.warehouse_id IS NOT NULL
                   AND sm.variant_id IS NOT NULL
                   AND (sm.reference_type IS NULL OR sm.reference_type NOT IN ('VAN_SALE', 'BALANCE_SYNC')) 
@@ -637,7 +637,7 @@ function runPhase2_UpdateProducts() {
                 SET stock = COALESCE((
                     SELECT SUM(sm.qty_change)
                     FROM stock_movements sm
-                    WHERE sm.variant_id COLLATE utf8mb4_unicode_ci = pv.id COLLATE utf8mb4_unicode_ci
+                    WHERE sm.variant_id = pv.id
                       AND (sm.reference_type IS NULL OR sm.reference_type NOT IN ('VAN_SALE', 'BALANCE_SYNC'))
                       AND (sm.notes IS NULL OR sm.notes NOT LIKE '%بيع متنقل%')
                 ), 0)

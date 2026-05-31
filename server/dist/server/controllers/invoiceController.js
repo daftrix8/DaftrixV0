@@ -2037,7 +2037,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // the affected accounts are typically: Cash (101), Bank (102), AR (104), AP (201)
         // This is handled when journals are synced via syncController.
         // For direct invoice creation with journal entries, we add the accounts.
-        if (paymentCollected > 0 && partnerId) {
+        if (paymentCollected > 0 || type === 'PAYMENT' || type === 'RECEIPT') {
             // FIX: Use explicit referenceId-based lookup instead of fragile createdBy+date query.
             // The old query matched ALL journals by the same user on the same date,
             // which caused incorrect balance updates under concurrent load.

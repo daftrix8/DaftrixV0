@@ -88,7 +88,7 @@ const createCashier = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             return res.status(400).json({ error: 'الرقم السري يجب أن يكون 4-6 أرقام' });
         }
         // Check username uniqueness
-        const [existing] = yield conn.query(`SELECT id FROM pos_cashiers WHERE username = ? COLLATE utf8mb4_unicode_ci`, [username]);
+        const [existing] = yield conn.query(`SELECT id FROM pos_cashiers WHERE username = ?`, [username]);
         if (existing.length > 0) {
             return res.status(400).json({ error: 'اسم المستخدم مستخدم بالفعل' });
         }
@@ -192,7 +192,7 @@ const endCashierSession = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const now = (0, dateUtils_1.getEgyptianISOString)();
         // Verify shift is still open
         const [shifts] = yield conn.query(`SELECT id, currentCashierId FROM pos_shifts
-             WHERE id = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [shiftId]);
+             WHERE id = ? AND status = 'OPEN'`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة أو مغلقة' });
         }
@@ -200,10 +200,10 @@ const endCashierSession = (req, res) => __awaiter(void 0, void 0, void 0, functi
         try {
             // Close all open cashier sub-shifts for this main shift
             yield conn.query(`UPDATE pos_cashier_shifts SET endedAt = ?
-                 WHERE shiftId = ? COLLATE utf8mb4_unicode_ci AND endedAt IS NULL`, [now, shiftId]);
+                 WHERE shiftId = ? AND endedAt IS NULL`, [now, shiftId]);
             // Clear currentCashierId — POS is now unattended until next login
             yield conn.query(`UPDATE pos_shifts SET currentCashierId = NULL
-                 WHERE id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+                 WHERE id = ?`, [shiftId]);
             yield conn.query('COMMIT');
         }
         catch (txError) {
@@ -230,7 +230,7 @@ const posCashierLogin = (req, res) => __awaiter(void 0, void 0, void 0, function
             return res.status(400).json({ error: 'اسم المستخدم والرقم السري مطلوبان' });
         }
         const [rows] = yield conn.query(`SELECT id, name, pinHash, failedAttempts, lockoutUntil FROM pos_cashiers
-             WHERE username = ? COLLATE utf8mb4_unicode_ci AND isActive = 1`, [username]);
+             WHERE username = ? AND isActive = 1`, [username]);
         if (rows.length === 0) {
             return res.status(401).json({ error: 'بيانات تسجيل الدخول غير صحيحة' });
         }
@@ -296,13 +296,13 @@ const switchCashier = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             return res.status(400).json({ error: 'اسم المستخدم والرقم السري مطلوبان' });
         }
         // Verify shift is open
-        const [shifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE id = ? COLLATE utf8mb4_unicode_ci AND status = 'OPEN' COLLATE utf8mb4_unicode_ci`, [shiftId]);
+        const [shifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE id = ? AND status = 'OPEN'`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة أو مغلقة' });
         }
         // Find cashier
         const [cashierRows] = yield conn.query(`SELECT id, name, pinHash, failedAttempts, lockoutUntil FROM pos_cashiers
-             WHERE username = ? COLLATE utf8mb4_unicode_ci AND isActive = 1`, [username]);
+             WHERE username = ? AND isActive = 1`, [username]);
         if (cashierRows.length === 0) {
             return res.status(401).json({ error: 'الكاشير غير موجود' });
         }
@@ -346,11 +346,11 @@ const switchCashier = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         try {
             // Close the current cashier's open sub-shift
             yield conn.query(`UPDATE pos_cashier_shifts SET endedAt = ?
-                 WHERE shiftId = ? COLLATE utf8mb4_unicode_ci AND endedAt IS NULL`, [now, shiftId]);
+                 WHERE shiftId = ? AND endedAt IS NULL`, [now, shiftId]);
             // Open new cashier sub-shift
             yield conn.query(`INSERT INTO pos_cashier_shifts (id, shiftId, cashierId, startedAt) VALUES (?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), shiftId, cashier.id, now]);
             // Update currentCashierId on the shift
-            yield conn.query(`UPDATE pos_shifts SET currentCashierId = ? WHERE id = ? COLLATE utf8mb4_unicode_ci`, [cashier.id, shiftId]);
+            yield conn.query(`UPDATE pos_shifts SET currentCashierId = ? WHERE id = ?`, [cashier.id, shiftId]);
             yield conn.query('COMMIT');
         }
         catch (txError) {
