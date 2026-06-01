@@ -826,7 +826,7 @@ const getInvoiceById = (req, res) => __awaiter(void 0, void 0, void 0, function*
 });
 exports.getInvoiceById = getInvoiceById;
 const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m;
     const conn = yield (0, db_1.getConnection)();
     try {
         (0, logger_1.logDebug)('🚀 [createInvoice] Called with body:', { id: req.body.id, type: req.body.type, paymentCollected: req.body.paymentCollected });
@@ -877,10 +877,68 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             // BUG FIX: Use the authoritative server-calculated total for all subsequent logic
             total = validation.calculated;
         }
+        // === INVOICE PAYLOAD VALIDATION ===
+        const LINE_BEARING_TYPES = ['INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE'];
+        // Guard 1: Line-bearing invoice types must have at least one line
+        if (LINE_BEARING_TYPES.includes(type) && (!lines || lines.length === 0)) {
+            conn.release();
+            return res.status(400).json({
+                code: 'EMPTY_INVOICE',
+                message: '\u064a\u062c\u0628 \u0625\u0636\u0627\u0641\u0629 \u0635\u0646\u0641 \u0648\u0627\u062d\u062f \u0639\u0644\u0649 \u0627\u0644\u0623\u0642\u0644 \u0644\u0644\u0641\u0627\u062a\u0648\u0631\u0629'
+            });
+        }
+        // Guard 2: Discount per line must not exceed its own line total
+        if (lines && lines.length > 0) {
+            for (const line of lines) {
+                const lineTotal = (Number(line.quantity) || 0) * (Number(line.price) || 0);
+                const lineDiscount = Number(line.discount) || 0;
+                if (lineDiscount > lineTotal + 0.001) {
+                    conn.release();
+                    return res.status(400).json({
+                        code: 'INVALID_DISCOUNT',
+                        message: `\u0627\u0644\u062e\u0635\u0645 \u0644\u0644\u0635\u0646\u0641 "${line.productName || line.productId}" \u064a\u062a\u062c\u0627\u0648\u0632 \u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0633\u0637\u0631`,
+                        lineProductId: line.productId
+                    });
+                }
+            }
+        }
+        // Guards 3 & 4: Return-specific validations
+        const isReturnType = type === 'RETURN_SALE' || type === 'RETURN_PURCHASE';
+        const referenceInvoiceId = req.body.referenceInvoiceId;
+        if (isReturnType && referenceInvoiceId) {
+            // Guard 3: Referenced invoice must exist
+            const [refInvoiceRows] = yield conn.query('SELECT id FROM invoices WHERE id = ? LIMIT 1', [referenceInvoiceId]);
+            if (refInvoiceRows.length === 0) {
+                conn.release();
+                return res.status(404).json({
+                    code: 'REFERENCE_NOT_FOUND',
+                    message: `\u0627\u0644\u0641\u0627\u062a\u0648\u0631\u0629 \u0627\u0644\u0645\u0631\u062c\u0639\u064a\u0629 \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f\u0629: ${referenceInvoiceId}`
+                });
+            }
+            // Guard 4: Return quantity must not exceed original line quantity
+            if (lines && lines.length > 0) {
+                const [originalLines] = yield conn.query('SELECT productId, SUM(quantity) as originalQty FROM invoice_lines WHERE invoiceId = ? GROUP BY productId', [referenceInvoiceId]);
+                const originalQtyMap = new Map(originalLines.map((l) => [String(l.productId), Number(l.originalQty)]));
+                for (const line of lines) {
+                    const originalQty = (_a = originalQtyMap.get(String(line.productId))) !== null && _a !== void 0 ? _a : 0;
+                    const returnQty = Number(line.quantity) || 0;
+                    if (returnQty > originalQty + 0.001) {
+                        conn.release();
+                        return res.status(400).json({
+                            code: 'RETURN_EXCEEDS_ORIGINAL',
+                            message: `\u0643\u0645\u064a\u0629 \u0627\u0644\u0645\u0631\u062a\u062c\u0639 \u0644\u0644\u0635\u0646\u0641 "${line.productName || line.productId}" (${returnQty}) \u062a\u062a\u062c\u0627\u0648\u0632 \u0627\u0644\u0643\u0645\u064a\u0629 \u0627\u0644\u0623\u0635\u0644\u064a\u0629 (${originalQty})`,
+                            productId: line.productId,
+                            returnQty,
+                            originalQty
+                        });
+                    }
+                }
+            }
+        }
         // === POLICY ENFORCEMENT: Full server-side validation ===
         const authReqPolicy = req;
         if (authReqPolicy.systemConfig) {
-            const currentUser = ((_a = authReqPolicy.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = authReqPolicy.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.createdBy || null;
+            const currentUser = ((_b = authReqPolicy.user) === null || _b === void 0 ? void 0 : _b.name) || ((_c = authReqPolicy.user) === null || _c === void 0 ? void 0 : _c.username) || req.body.createdBy || null;
             const policyContext = {
                 type,
                 date,
@@ -890,7 +948,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 costCenterId: req.body.costCenterId,
                 warehouseId: req.body.warehouseId,
                 currentUser: currentUser,
-                currentUserRole: (_c = authReqPolicy.user) === null || _c === void 0 ? void 0 : _c.role,
+                currentUserRole: (_d = authReqPolicy.user) === null || _d === void 0 ? void 0 : _d.role,
                 lines: lines === null || lines === void 0 ? void 0 : lines.map((l) => ({
                     productId: l.productId,
                     quantity: l.quantity || 0,
@@ -949,7 +1007,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         console.log(`📋 [createInvoice] Final invoice: id=${id}, number=${invoiceNumber}, type=${type}`);
         // Get createdBy from request user or body
         const authReq = req;
-        const createdBy = ((_d = authReq.user) === null || _d === void 0 ? void 0 : _d.name) || ((_e = authReq.user) === null || _e === void 0 ? void 0 : _e.username) || req.body.createdBy || req.body.user || null;
+        const createdBy = ((_e = authReq.user) === null || _e === void 0 ? void 0 : _e.name) || ((_f = authReq.user) === null || _f === void 0 ? void 0 : _f.username) || req.body.createdBy || req.body.user || null;
         // Sanitize dates - convert empty strings to null
         const sanitizedDueDate = dueDate && dueDate !== '' ? dueDate : null;
         // Sanitize warehouseId
@@ -996,10 +1054,10 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 break; // Success — exit retry loop
             }
             catch (insertErr) {
-                if (insertErr.code === 'ER_DUP_ENTRY' && ((_f = insertErr.message) === null || _f === void 0 ? void 0 : _f.includes('number'))) {
+                if (insertErr.code === 'ER_DUP_ENTRY' && ((_g = insertErr.message) === null || _g === void 0 ? void 0 : _g.includes('number'))) {
                     insertAttempts++;
                     // Auto-increment the number and retry
-                    const prefix = ((_g = invoiceNumber.match(/^[A-Z]+-(?:[A-Z]+-)?/)) === null || _g === void 0 ? void 0 : _g[0]) || 'TRX-';
+                    const prefix = ((_h = invoiceNumber.match(/^[A-Z]+-(?:[A-Z]+-)?/)) === null || _h === void 0 ? void 0 : _h[0]) || 'TRX-';
                     const currentNum = parseInt(invoiceNumber.substring(prefix.length), 10) || 0;
                     invoiceNumber = `${prefix}${String(currentNum + 1).padStart(5, '0')}`;
                     // SERIAL FIX: For PAY/REC, id must track number
@@ -1152,7 +1210,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         if (type === 'INVOICE_PURCHASE') {
                             // Fetch warranty info
                             const [pRows] = yield conn.query('SELECT warrantyMonths FROM products WHERE id = ?', [line.productId]);
-                            const wMonths = ((_h = pRows[0]) === null || _h === void 0 ? void 0 : _h.warrantyMonths) || 0;
+                            const wMonths = ((_j = pRows[0]) === null || _j === void 0 ? void 0 : _j.warrantyMonths) || 0;
                             let wStart = null;
                             let wEnd = null;
                             if (wMonths > 0) {
@@ -1233,7 +1291,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (configObj.inventoryValuationMethod) {
                         inventoryValuationMethod = configObj.inventoryValuationMethod;
                     }
-                    if (((_j = configObj.inventory) === null || _j === void 0 ? void 0 : _j.reserveOnSale) === true) {
+                    if (((_k = configObj.inventory) === null || _k === void 0 ? void 0 : _k.reserveOnSale) === true) {
                         reserveOnSale = true;
                     }
                 }
@@ -1315,12 +1373,12 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (!line.variantId && line.productId) {
                         try {
                             const [variantCheck] = yield conn.query(`SELECT COUNT(*) as cnt FROM product_variants WHERE productId = ? LIMIT 1`, [line.productId]);
-                            if (((_k = variantCheck[0]) === null || _k === void 0 ? void 0 : _k.cnt) > 0) {
+                            if (((_l = variantCheck[0]) === null || _l === void 0 ? void 0 : _l.cnt) > 0) {
                                 console.warn(`⚠️ [Invoice] Blocked parent product "${line.productName}" (${line.productId}) — has variants but no variantId specified`);
                                 continue; // Skip this line — don't create movement against parent
                             }
                         }
-                        catch ( /* product_variants table may not exist — skip check */_m) { /* product_variants table may not exist — skip check */ }
+                        catch ( /* product_variants table may not exist — skip check */_o) { /* product_variants table may not exist — skip check */ }
                     }
                     // === DAMAGED RETURN HANDLING (الهالك) ===
                     const isReturn = type === 'RETURN_SALE' || type === 'RETURN_PURCHASE';
@@ -1693,7 +1751,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (partialPaymentMethod === 'BANK' && req.body.partialPaymentBankId) {
                         // Find the bank by its linked GL account ID
                         const [bankRows] = yield conn.query(`SELECT id FROM banks WHERE accountId = ? LIMIT 1`, [req.body.partialPaymentBankId]);
-                        const bankId = (_l = bankRows[0]) === null || _l === void 0 ? void 0 : _l.id;
+                        const bankId = (_m = bankRows[0]) === null || _m === void 0 ? void 0 : _m.id;
                         if (bankId) {
                             // For RECEIPT: money comes IN (positive), for PAYMENT: money goes OUT (negative)
                             const balanceChange = paymentType === 'RECEIPT' ? paymentCollected : -paymentCollected;
@@ -1976,13 +2034,29 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     console.error(`⚠️ Extreme fallback used for Payment Account in createInvoice!`);
                 }
                 // Get partner account
-                const partnerAccountCode = type === 'RECEIPT' ? '104%' : '201%';
-                let [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [partnerAccountCode]);
-                if (partnerAccounts.length === 0) {
-                    const searchName = type === 'RECEIPT' ? '%عملاء%' : '%موردين%';
-                    [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1`, [searchName]);
+                let ptAcc = null;
+                if (req.body.accountId) {
+                    const [directAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [req.body.accountId]);
+                    ptAcc = directAccs[0];
                 }
-                let ptAcc = partnerAccounts[0];
+                if (!ptAcc && partnerId) {
+                    const [partnerRows] = yield conn.query(`SELECT type FROM partners WHERE id = ? LIMIT 1`, [partnerId]);
+                    if (partnerRows[0]) {
+                        const pType = partnerRows[0].type;
+                        const pCode = pType === 'CUSTOMER' ? '104%' : pType === 'SUPPLIER' ? '201%' : (type === 'RECEIPT' ? '104%' : '201%');
+                        const [accs] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [pCode]);
+                        ptAcc = accs[0];
+                    }
+                }
+                if (!ptAcc) {
+                    const partnerAccountCode = type === 'RECEIPT' ? '104%' : '201%';
+                    let [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [partnerAccountCode]);
+                    if (partnerAccounts.length === 0) {
+                        const searchName = type === 'RECEIPT' ? '%عملاء%' : '%موردين%';
+                        [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1`, [searchName]);
+                    }
+                    ptAcc = partnerAccounts[0];
+                }
                 // Fallback for extreme cases to prevent silent GL deletion
                 if (!ptAcc) {
                     const searchNameFallback = type === 'RECEIPT' ? '%إيرادات%' : '%مصروفات%';
@@ -3294,13 +3368,29 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     console.error(`⚠️ Extreme fallback used for Payment Account in updateInvoice!`);
                 }
                 // Get partner account
-                const partnerAccountCode = type === 'RECEIPT' ? '104%' : '201%';
-                let [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [partnerAccountCode]);
-                if (partnerAccounts.length === 0) {
-                    const searchName = type === 'RECEIPT' ? '%عملاء%' : '%موردين%';
-                    [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1`, [searchName]);
+                let ptAcc = null;
+                if (req.body.accountId) {
+                    const [directAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [req.body.accountId]);
+                    ptAcc = directAccs[0];
                 }
-                let ptAcc = partnerAccounts[0];
+                if (!ptAcc && partnerId) {
+                    const [partnerRows] = yield conn.query(`SELECT type FROM partners WHERE id = ? LIMIT 1`, [partnerId]);
+                    if (partnerRows[0]) {
+                        const pType = partnerRows[0].type;
+                        const pCode = pType === 'CUSTOMER' ? '104%' : pType === 'SUPPLIER' ? '201%' : (type === 'RECEIPT' ? '104%' : '201%');
+                        const [accs] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [pCode]);
+                        ptAcc = accs[0];
+                    }
+                }
+                if (!ptAcc) {
+                    const partnerAccountCode = type === 'RECEIPT' ? '104%' : '201%';
+                    let [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [partnerAccountCode]);
+                    if (partnerAccounts.length === 0) {
+                        const searchName = type === 'RECEIPT' ? '%عملاء%' : '%موردين%';
+                        [partnerAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1`, [searchName]);
+                    }
+                    ptAcc = partnerAccounts[0];
+                }
                 // Fallback for extreme cases to prevent silent GL deletion
                 if (!ptAcc) {
                     const searchNameFallback = type === 'RECEIPT' ? '%إيرادات%' : '%مصروفات%';

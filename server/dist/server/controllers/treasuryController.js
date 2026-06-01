@@ -261,6 +261,18 @@ const createBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         const authReq = req;
         const bankBranchId = bank.branchId || ((_a = authReq.branchContext) === null || _a === void 0 ? void 0 : _a.branchId) || null;
         const openingBalance = Number((_b = bank.openingBalance) !== null && _b !== void 0 ? _b : bank.balance) || 0;
+        // Validate currencyExchangeRate — must be a positive number if provided
+        if (bank.currencyExchangeRate !== undefined && bank.currencyExchangeRate !== null && bank.currencyExchangeRate !== '') {
+            const rate = Number(bank.currencyExchangeRate);
+            if (isNaN(rate) || rate <= 0) {
+                yield connection.rollback();
+                connection.release();
+                return res.status(400).json({
+                    code: 'INVALID_EXCHANGE_RATE',
+                    message: '\u0633\u0639\u0631 \u0627\u0644\u0635\u0631\u0641 \u064a\u062c\u0628 \u0623\u0646 \u064a\u0643\u0648\u0646 \u0631\u0642\u0645\u0627\u064b \u0645\u0648\u062c\u0628\u0627\u064b \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u0635\u0641\u0631'
+                });
+            }
+        }
         // Strict Uniqueness Checks
         if (bank.name) {
             const [dupName] = yield connection.query('SELECT id FROM banks WHERE name = ? AND id != ? LIMIT 1', [bank.name, id]);

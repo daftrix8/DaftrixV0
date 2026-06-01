@@ -1417,6 +1417,13 @@ const createAdvanceAccountingEntry = (connection, advanceId, amount, employeeId,
 const createAdvance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { employeeId, type, amount, reason, issueDate, monthlyDeduction, paymentMethod, financialAccountId } = req.body;
     const user = req.user;
+    const parsedAmount = parseFloat(amount);
+    if (!amount || isNaN(parsedAmount) || parsedAmount <= 0) {
+        return res.status(400).json({
+            code: 'INVALID_AMOUNT',
+            message: '\u0645\u0628\u0644\u063a \u0627\u0644\u0633\u0644\u0641\u0629 \u064a\u062c\u0628 \u0623\u0646 \u064a\u0643\u0648\u0646 \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u0635\u0641\u0631'
+        });
+    }
     const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();

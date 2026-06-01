@@ -28,7 +28,8 @@ const money_1 = require("./money");
 /** Generate a globally unique cart line ID. Uses crypto.randomUUID for safety
  *  across HMR resets, tab duplication, and multi-terminal POS sessions. */
 function generateCartLineId() {
-    return `cl_${crypto.randomUUID()}`;
+    var _a;
+    return `cl_${((_a = crypto.randomUUID) === null || _a === void 0 ? void 0 : _a.call(crypto)) || `${Date.now()}_${Math.random().toString(36).slice(2)}`}`;
 }
 // ── Line Total Calculation ───────────────────────────────────────────────────
 /** Compute line total in display currency (pounds). Uses piasters internally. */

@@ -9,7 +9,10 @@ exports.validateRequired = exports.validateInvoiceTotal = exports.handleControll
  */
 const handleControllerError = (res, error, context) => {
     var _a, _b, _c;
-    console.error(`❌ Error in ${context}:`, error);
+    console.error(`\n🚨 [CONTROLLER ERROR] in ${context}:`, error.message);
+    if (error.sql) {
+        console.error(`SQL: ${error.sql}`);
+    }
     // Safety check: specific for when this might be called without a valid response object (e.g. sockets)
     if (!res || typeof res.status !== 'function') {
         console.error(`⚠️ handleControllerError called without valid Response object in ${context}`, error);

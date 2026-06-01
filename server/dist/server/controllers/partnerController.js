@@ -41,7 +41,7 @@ function buildInvAggSQL(opts) {
                 WHEN i.type IN ('PAYMENT', 'DISCOUNT_EARNED', 'CHEQUE_CASHED') AND COALESCE(i.voucherCategory, '') != 'customer' THEN i.total
                 WHEN i.type = 'RECEIPT' AND i.voucherCategory = 'supplier' THEN -(i.total)
                 ELSE 0 END) as sImpact,
-            ${(opts === null || opts === void 0 ? void 0 : opts.includeSupplierReceipt) ? `SUM(CASE WHEN i.type = 'RECEIPT' THEN -(i.total) ELSE 0 END) as supplierReceiptImpact,` : ''}
+            SUM(CASE WHEN i.type = 'RECEIPT' THEN -(i.total) ELSE 0 END) as supplierReceiptImpact,
             SUM(CASE WHEN i.type = 'CHEQUE_BOUNCE' THEN i.total ELSE 0 END) as bounceImpact
         FROM invoices i
         WHERE i.status IN ('POSTED', 'COMPLETED', 'PARTIAL') ${pf} ${df}

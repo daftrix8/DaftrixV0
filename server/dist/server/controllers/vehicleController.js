@@ -215,7 +215,7 @@ exports.getAllVehicleInventory = getAllVehicleInventory;
 // VEHICLE OPERATIONS (تحميل/تفريغ)
 // ==========================================
 const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c;
     const { id } = req.params; // vehicleId
     const { warehouseId, items, notes } = req.body;
     const user = req.user;
@@ -231,6 +231,40 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         // Create operation record
         const operationId = (0, crypto_1.randomUUID)();
         const now = new Date().toISOString().slice(0, 19).replace('T', ' ');
+        // === STOCK AVAILABILITY CHECK ===
+        // Read allowNegativeStock from system_settings (default: false = strict mode)
+        let allowNegativeStock = false;
+        try {
+            const [settingRows] = yield conn.query("SELECT settingValue FROM system_settings WHERE settingKey = 'allowNegativeStock' LIMIT 1");
+            if (settingRows[0]) {
+                allowNegativeStock = settingRows[0].settingValue === 'true' || settingRows[0].settingValue === '1';
+            }
+        }
+        catch (_d) {
+            // Table may not exist on all installations — default remains false
+        }
+        if (!allowNegativeStock) {
+            const productIds = items.map((i) => i.productId).filter(Boolean);
+            if (productIds.length > 0) {
+                const [stockRows] = yield conn.query('SELECT productId, COALESCE(stock, 0) as stock FROM product_stocks WHERE productId IN (?) AND warehouseId = ?', [productIds, warehouseId]);
+                const stockMap = new Map(stockRows.map((r) => [r.productId, Number(r.stock)]));
+                for (const item of items) {
+                    if (!item.productId || !item.quantity || item.quantity <= 0)
+                        continue;
+                    const available = (_a = stockMap.get(item.productId)) !== null && _a !== void 0 ? _a : 0;
+                    if (available < item.quantity) {
+                        yield conn.rollback();
+                        return res.status(400).json({
+                            code: 'INSUFFICIENT_STOCK',
+                            message: `\u0627\u0644\u0643\u0645\u064a\u0629 \u063a\u064a\u0631 \u0643\u0627\u0641\u064a\u0629 \u0644\u0644\u0635\u0646\u0641 "${item.productName || item.productId}". \u0627\u0644\u0645\u062a\u0627\u062d: ${available}, \u0627\u0644\u0645\u0637\u0644\u0648\u0628: ${item.quantity}`,
+                            productId: item.productId,
+                            available,
+                            requested: item.quantity
+                        });
+                    }
+                }
+            }
+        }
         yield conn.query(`
             INSERT INTO vehicle_operations (id, vehicleId, operationType, date, warehouseId, notes, createdBy)
             VALUES (?, ?, 'LOAD', ?, ?, ?, ?)
@@ -242,8 +276,8 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                 continue;
             // Get product cost
             const [productRows] = yield conn.query('SELECT cost, name FROM products WHERE id = ?', [productId]);
-            const cost = ((_a = productRows[0]) === null || _a === void 0 ? void 0 : _a.cost) || 0;
-            const name = productName || ((_b = productRows[0]) === null || _b === void 0 ? void 0 : _b.name) || '';
+            const cost = ((_b = productRows[0]) === null || _b === void 0 ? void 0 : _b.cost) || 0;
+            const name = productName || ((_c = productRows[0]) === null || _c === void 0 ? void 0 : _c.name) || '';
             // Insert operation item
             yield conn.query(`
                 INSERT INTO vehicle_operation_items (operationId, productId, productName, quantity, cost)

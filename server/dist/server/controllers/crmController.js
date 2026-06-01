@@ -194,6 +194,7 @@ const getLeadById = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
 });
 exports.getLeadById = getLeadById;
 const createLead = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const { title, contactName, companyName, email, phone, stageId, salespersonId, expectedRevenue, probability, expectedClosingDate, source, notes, tags, appointmentDate } = req.body;
         if (!title || !contactName) {
@@ -223,7 +224,7 @@ const createLead = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             expectedRevenue || 0, probability || 0, expectedClosingDate || null,
             source || null, notes || null, tagsJson, appointmentDate || null]);
         // Automatically log creation in timeline
-        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (?, ?, 'SYSTEM', 'Lead created', ?)`, [(0, crypto_1.randomUUID)(), id, user === null || user === void 0 ? void 0 : user.id]);
+        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (?, ?, 'SYSTEM', 'Lead created', ?)`, [(0, crypto_1.randomUUID)(), id, (_a = user === null || user === void 0 ? void 0 : user.id) !== null && _a !== void 0 ? _a : null]);
         res.status(201).json({ id, title, contactName });
     }
     catch (err) {
@@ -295,7 +296,7 @@ const deleteLead = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
 });
 exports.deleteLead = deleteLead;
 const moveLeadToStage = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c;
     try {
         const { id } = req.params;
         const { stageId } = req.body;
@@ -318,7 +319,7 @@ const moveLeadToStage = (req, res) => __awaiter(void 0, void 0, void 0, function
         const statusUpdate = isWon ? "status = 'WON'," : "";
         yield db_1.pool.query(`UPDATE crm_leads SET stage_id = ?, probability = ?, ${statusUpdate} updated_at = CURRENT_TIMESTAMP WHERE id = ?`, [stageId, probability, id]);
         // Log the movement in the timeline
-        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (?, ?, 'SYSTEM', ?, ?)`, [(0, crypto_1.randomUUID)(), id, `Moved to stage: ${(_b = stages[0]) === null || _b === void 0 ? void 0 : _b.name}`, user === null || user === void 0 ? void 0 : user.id]);
+        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (?, ?, 'SYSTEM', ?, ?)`, [(0, crypto_1.randomUUID)(), id, `Moved to stage: ${(_b = stages[0]) === null || _b === void 0 ? void 0 : _b.name}`, (_c = user === null || user === void 0 ? void 0 : user.id) !== null && _c !== void 0 ? _c : null]);
         res.json({ success: true, isWon });
     }
     catch (err) {
@@ -328,6 +329,7 @@ const moveLeadToStage = (req, res) => __awaiter(void 0, void 0, void 0, function
 });
 exports.moveLeadToStage = moveLeadToStage;
 const convertLeadToPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const { id } = req.params;
         const [leads] = yield db_1.pool.query(`SELECT * FROM crm_leads WHERE id = ?`, [id]);
@@ -342,7 +344,7 @@ const convertLeadToPartner = (req, res) => __awaiter(void 0, void 0, void 0, fun
        VALUES (?, ?, ?, ?, 'CUSTOMER', 1, 0, NOW())`, [partnerId, lead.company_name || lead.contact_name, lead.phone, lead.email]);
         yield db_1.pool.query(`UPDATE crm_leads SET partner_id = ?, status = 'WON' WHERE id = ?`, [partnerId, id]);
         const user = req.user;
-        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (?, ?, 'SYSTEM', 'Converted to Partner (Customer)', ?)`, [(0, crypto_1.randomUUID)(), id, user === null || user === void 0 ? void 0 : user.id]);
+        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (?, ?, 'SYSTEM', 'Converted to Partner (Customer)', ?)`, [(0, crypto_1.randomUUID)(), id, (_a = user === null || user === void 0 ? void 0 : user.id) !== null && _a !== void 0 ? _a : null]);
         res.json({ success: true, partnerId, message: 'Lead converted to customer successfully' });
     }
     catch (err) {
@@ -390,6 +392,7 @@ const getActivities = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 });
 exports.getActivities = getActivities;
 const createActivity = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const { leadId, type, summary, dueDate } = req.body;
         if (!leadId || !type || !summary) {
@@ -398,7 +401,7 @@ const createActivity = (req, res) => __awaiter(void 0, void 0, void 0, function*
         const id = (0, crypto_1.randomUUID)();
         const user = req.user;
         yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, due_date, created_by)
-       VALUES (?, ?, ?, ?, ?, ?)`, [id, leadId, type, summary, dueDate || null, user === null || user === void 0 ? void 0 : user.id]);
+       VALUES (?, ?, ?, ?, ?, ?)`, [id, leadId, type, summary, dueDate || null, (_a = user === null || user === void 0 ? void 0 : user.id) !== null && _a !== void 0 ? _a : null]);
         res.status(201).json({ id, summary });
     }
     catch (err) {
@@ -457,14 +460,14 @@ exports.deleteActivity = deleteActivity;
 // PIPELINE STATS & FORECASTING
 // ========================================
 const markLeadLost = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a;
+    var _a, _b;
     try {
         const { id } = req.params;
         const { lostReasonId } = req.body;
         // Set lead status to LOST and probability to 0
         yield db_1.pool.query(`UPDATE crm_leads SET status = 'LOST', lost_reason_id = ?, probability = 0 WHERE id = ?`, [lostReasonId, id]);
         // Create system activity
-        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (UUID(), ?, 'SYSTEM', 'تم وسم الفرصة كمفقودة', ?)`, [id, (_a = req.user) === null || _a === void 0 ? void 0 : _a.id]);
+        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (UUID(), ?, 'SYSTEM', 'تم وسم الفرصة كمفقودة', ?)`, [id, (_b = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id) !== null && _b !== void 0 ? _b : null]);
         res.json({ success: true });
     }
     catch (err) {
@@ -474,7 +477,7 @@ const markLeadLost = (req, res) => __awaiter(void 0, void 0, void 0, function* (
 });
 exports.markLeadLost = markLeadLost;
 const createQuotationFromLead = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c;
     try {
         const { id } = req.params;
         const [leads] = yield db_1.pool.query(`SELECT * FROM crm_leads WHERE id = ?`, [id]);
@@ -499,7 +502,7 @@ const createQuotationFromLead = (req, res) => __awaiter(void 0, void 0, void 0, 
         yield db_1.pool.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, total)
        VALUES (?, NULL, ?, 1, ?, ?)`, [invoiceId, `مشروع / خدمة: ${lead.title}`, revenue, revenue]);
         // Activity Log
-        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (UUID(), ?, 'SYSTEM', 'تم إنشاء عرض سعر (فاتورة مسودة)', ?)`, [id, (_b = req.user) === null || _b === void 0 ? void 0 : _b.id]);
+        yield db_1.pool.query(`INSERT INTO crm_activities (id, lead_id, type, summary, created_by) VALUES (UUID(), ?, 'SYSTEM', 'تم إنشاء عرض سعر (فاتورة مسودة)', ?)`, [id, (_c = (_b = req.user) === null || _b === void 0 ? void 0 : _b.id) !== null && _c !== void 0 ? _c : null]);
         res.json({ success: true, invoiceId });
     }
     catch (err) {

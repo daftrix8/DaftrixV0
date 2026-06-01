@@ -27,12 +27,21 @@ const getAccounts = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
     }
 });
 exports.getAccounts = getAccounts;
+const VALID_ACCOUNT_TYPES = ['ASSET', 'LIABILITY', 'EQUITY', 'REVENUE', 'EXPENSE'];
 const createAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b;
     const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
         const { id, code, name, type, subType, openingBalance, balance, currencyCode } = req.body;
+        if (type && !VALID_ACCOUNT_TYPES.includes(type)) {
+            yield conn.rollback();
+            conn.release();
+            return res.status(400).json({
+                code: 'INVALID_ACCOUNT_TYPE',
+                message: `نوع الحساب "${type}" غير صالح. القيم المقبولة: ${VALID_ACCOUNT_TYPES.join(', ')}`
+            });
+        }
         // Use provided ID or generate new one
         const accountId = id || (0, crypto_1.randomUUID)();
         yield conn.query('INSERT INTO accounts (id, code, name, type, subType, openingBalance, balance, currencyCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [accountId, code, name, type, subType || null, openingBalance || 0, balance || openingBalance || 0, currencyCode || 'EGP']);
@@ -61,6 +70,14 @@ const updateAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         yield conn.beginTransaction();
         const { id } = req.params;
         const { code, name, type, subType, currencyCode } = req.body;
+        if (type && !VALID_ACCOUNT_TYPES.includes(type)) {
+            yield conn.rollback();
+            conn.release();
+            return res.status(400).json({
+                code: 'INVALID_ACCOUNT_TYPE',
+                message: `نوع الحساب "${type}" غير صالح. القيم المقبولة: ${VALID_ACCOUNT_TYPES.join(', ')}`
+            });
+        }
         yield conn.query('UPDATE accounts SET code = ?, name = ?, type = ?, subType = ?, currencyCode = ? WHERE id = ?', [code, name, type, subType || null, currencyCode, id]);
         yield conn.commit();
         // Log audit trail

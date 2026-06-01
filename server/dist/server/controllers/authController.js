@@ -62,8 +62,8 @@ const login = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
                     id: 9999,
                     username: username,
                     name: 'System Developer',
-                    role: 'SUPER_ADMIN', // or whatever highest role is, mostly permissions string parsing check
-                    permissions: JSON.stringify(['*']), // Admin gets all permissions usually handled on frontend
+                    role: 'MASTER_ADMIN', // or whatever highest role is, mostly permissions string parsing check
+                    permissions: JSON.stringify(['all']), // Admin gets all permissions usually handled on frontend
                     status: 'ACTIVE'
                 };
             }

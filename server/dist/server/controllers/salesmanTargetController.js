@@ -706,7 +706,7 @@ const getSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, functio
 
             FROM salesmen s
             WHERE s.id = ?
-        `, [...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, salesmanId]);
+        `, [...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, salesmanId]);
         conn.release();
         if (!rows || rows.length === 0) {
             return res.status(404).json({ error: 'Salesman not found' });

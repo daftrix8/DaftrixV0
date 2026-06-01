@@ -215,12 +215,15 @@ const deleteMembershipPackage = (req, res) => __awaiter(void 0, void 0, void 0, 
             conn.release();
             return res.status(400).json({ message: 'لا يمكن حذف العضوية العادية الافتراضية.' });
         }
-        // Check if package is used
+        // Check if package is used by any active membership
         const [memberships] = yield conn.query('SELECT id FROM memberships WHERE packageId = ? LIMIT 1', [id]);
         if (memberships.length > 0) {
             conn.release();
             return res.status(400).json({ message: 'لا يمكن حذف هذه الباقة لارتباطها باشتراكات حالية.' });
         }
+        // Cascade-delete linked promotions to prevent orphaned benefit records
+        yield conn.query('DELETE FROM promo_rules WHERE promotionId IN (SELECT id FROM promotions WHERE linkedMembershipId = ?)', [id]);
+        yield conn.query('DELETE FROM promotions WHERE linkedMembershipId = ?', [id]);
         yield conn.query('DELETE FROM membership_packages WHERE id = ?', [id]);
         conn.release();
         eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'membership_packages', entityId: id, deletedBy: 'System' });
@@ -298,8 +301,10 @@ const getMemberships = (req, res) => __awaiter(void 0, void 0, void 0, function*
             }
         }
         conn.release();
+        // Normalize status to UPPERCASE across all rows before sending to client
+        const normalizedRows = rows.map((m) => (Object.assign(Object.assign({}, m), { status: m.status ? m.status.toUpperCase() : m.status })));
         res.json({
-            memberships: rows,
+            memberships: normalizedRows,
             pagination: {
                 totalItems: finalTotalItems,
                 totalPages: finalTotalPages,
@@ -359,6 +364,9 @@ const getMembershipById = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const membership = rows[0];
         const [freezePeriods] = yield conn.query('SELECT * FROM membership_freeze_periods WHERE membershipId = ? ORDER BY freezeStart ASC', [id]);
         membership.freezePeriods = freezePeriods;
+        // Normalize status to UPPERCASE — DB ENUM has mixed casing ('active', 'pending' vs 'FROZEN', 'PENDING_PAYMENT')
+        if (membership.status)
+            membership.status = membership.status.toUpperCase();
         conn.release();
         res.json(membership);
     }
@@ -529,7 +537,7 @@ const toggleMembershipSuspension = (req, res) => __awaiter(void 0, void 0, void 
         const { id } = req.params;
         const { suspend } = req.body;
         const conn = yield (0, db_1.getConnection)();
-        yield conn.query('UPDATE memberships SET status = ? WHERE id = ?', [suspend ? 'suspended' : 'active', id]);
+        yield conn.query('UPDATE memberships SET status = ? WHERE id = ?', [suspend ? 'SUSPENDED' : 'ACTIVE', id]);
         conn.release();
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'memberships', updatedBy: 'System' });
         res.json({ message: suspend ? 'تم تجميد الاشتراك' : 'تم تفعيل الاشتراك' });

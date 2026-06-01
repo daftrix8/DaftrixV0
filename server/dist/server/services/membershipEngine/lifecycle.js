@@ -21,7 +21,10 @@ class MembershipLifecycle {
                 const [rows] = yield connection.query(query, [id]);
                 if (rows.length === 0)
                     throw new Error('Membership not found');
-                return rows[0];
+                const membership = rows[0];
+                if (membership.status)
+                    membership.status = membership.status.toUpperCase();
+                return membership;
             }
             finally {
                 if (!conn)
@@ -59,15 +62,18 @@ class MembershipLifecycle {
         });
     }
     static validateTransition(currentStatus, newStatus) {
+        const cs = currentStatus.toUpperCase();
+        const ns = newStatus.toUpperCase();
         const allowedTransitions = {
             ['PENDING_PAYMENT']: ['ACTIVE', 'CANCELLED'],
-            ['ACTIVE']: ['FROZEN', 'EXPIRED', 'CANCELLED'],
+            ['ACTIVE']: ['FROZEN', 'SUSPENDED', 'EXPIRED', 'CANCELLED'],
             ['FROZEN']: ['ACTIVE', 'CANCELLED'],
+            ['SUSPENDED']: ['ACTIVE', 'CANCELLED'],
             ['EXPIRED']: ['ACTIVE', 'CANCELLED'], // Renewals create a new membership or reactivate
             ['CANCELLED']: [] // Terminal state
         };
-        const allowed = allowedTransitions[currentStatus] || [];
-        if (!allowed.includes(newStatus)) {
+        const allowed = allowedTransitions[cs] || [];
+        if (!allowed.includes(ns)) {
             throw new Error(`Invalid status transition from ${currentStatus} to ${newStatus}`);
         }
     }

@@ -23,20 +23,15 @@ class MembershipFreezes {
                 const membership = yield lifecycle_1.MembershipLifecycle.getMembership(id, conn, true);
                 // Must be active to freeze
                 if (membership.status !== 'ACTIVE') {
-                    throw new Error('Can only freeze active memberships');
+                    throw new Error(`Can only freeze active memberships. Current status: ${membership.status}`);
                 }
                 // Record freeze in periods
                 const freezeStart = dateEngine_1.DateEngine.todayStr();
+                const { randomUUID } = require('crypto');
                 yield conn.query(`
-                INSERT INTO membership_freeze_periods (membershipId, freezeStart, freezeEnd, reason)
-                VALUES (?, ?, ?, ?)
-            `, [id, freezeStart, freezeEndDate, reason]);
-                // Update membership fields
-                yield conn.query(`
-                UPDATE memberships 
-                SET freezeReason = ?, freezeStartDate = ?, freezeEndDate = ?
-                WHERE id = ?
-            `, [reason, freezeStart, freezeEndDate, id]);
+                INSERT INTO membership_freeze_periods (id, membershipId, freezeStart, freezeEnd, freezeReason)
+                VALUES (?, ?, ?, ?, ?)
+            `, [randomUUID(), id, freezeStart, freezeEndDate, reason]);
                 // Change status
                 yield lifecycle_1.MembershipLifecycle.changeStatus(id, 'FROZEN', 'Freeze Membership', `Reason: ${reason}, Until: ${freezeEndDate}`, userId, conn);
                 if (!providedConn)
@@ -64,8 +59,12 @@ class MembershipFreezes {
                 if (membership.status !== 'FROZEN') {
                     throw new Error('Membership is not frozen');
                 }
+                // Get active freeze period
+                const [periods] = yield conn.query('SELECT freezeStart FROM membership_freeze_periods WHERE membershipId = ? AND actualUnfreezeDate IS NULL ORDER BY freezeStart DESC LIMIT 1', [id]);
+                if (periods.length === 0)
+                    throw new Error('No active freeze period found');
                 // Calculate frozen days
-                const freezeStart = membership.freezeStartDate;
+                const freezeStart = periods[0].freezeStart;
                 const daysFrozen = dateEngine_1.DateEngine.diffDays(freezeStart, dateEngine_1.DateEngine.todayStr());
                 // Extend end date
                 const currentEndDate = membership.endDate;
@@ -80,10 +79,9 @@ class MembershipFreezes {
                 // Update membership
                 yield conn.query(`
                 UPDATE memberships 
-                SET freezeReason = NULL, freezeStartDate = NULL, freezeEndDate = NULL, 
-                    endDate = ?, totalFrozenDays = COALESCE(totalFrozenDays, 0) + ?
+                SET endDate = ?
                 WHERE id = ?
-            `, [newEndDate, daysFrozen, id]);
+            `, [newEndDate, id]);
                 // Change status
                 yield lifecycle_1.MembershipLifecycle.changeStatus(id, 'ACTIVE', 'Unfreeze Membership', `Extended end date by ${daysFrozen} days`, userId, conn);
                 if (!providedConn)

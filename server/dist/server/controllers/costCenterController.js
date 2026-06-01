@@ -28,23 +28,22 @@ const getCostCenters = (req, res) => __awaiter(void 0, void 0, void 0, function*
     }
 });
 exports.getCostCenters = getCostCenters;
-// CREATE a cost center
 const createCostCenter = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b;
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { name, code, description, parentId } = req.body;
+        const { name, code, description } = req.body;
         const id = (0, crypto_1.randomUUID)();
         const authReq = req;
         const user = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.username) || ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
-        yield conn.query('INSERT INTO cost_centers (id, name, code, description, parentId) VALUES (?, ?, ?, ?, ?)', [id, name, code || null, description || null, parentId || null]);
+        yield conn.query('INSERT INTO cost_centers (id, name, code, description) VALUES (?, ?, ?, ?)', [id, name, code || null, description || null]);
         conn.release();
         try {
             yield (0, auditController_1.logAction)(user, 'ACCOUNTING', 'CREATE_COST_CENTER', `إنشاء مركز تكلفة: ${name}`, `الرمز: ${code || '-'}`);
         }
         catch (e) { }
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'cost-centers', updatedBy: user });
-        res.status(201).json({ id, name, code, description, parentId });
+        res.status(201).json({ id, name, code, description });
     }
     catch (error) {
         conn.release();
@@ -58,17 +57,17 @@ const updateCostCenter = (req, res) => __awaiter(void 0, void 0, void 0, functio
     const conn = yield (0, db_1.getConnection)();
     try {
         const { id } = req.params;
-        const { name, code, description, parentId } = req.body;
+        const { name, code, description } = req.body;
         const authReq = req;
         const user = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.username) || ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
-        yield conn.query('UPDATE cost_centers SET name = ?, code = ?, description = ?, parentId = ? WHERE id = ?', [name, code || null, description || null, parentId || null, id]);
+        yield conn.query('UPDATE cost_centers SET name = ?, code = ?, description = ? WHERE id = ?', [name, code || null, description || null, id]);
         conn.release();
         try {
             yield (0, auditController_1.logAction)(user, 'ACCOUNTING', 'UPDATE_COST_CENTER', `تحديث مركز تكلفة: ${name}`, `الرمز: ${code || '-'}`);
         }
         catch (e) { }
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'cost-centers', updatedBy: user });
-        res.json({ id, name, code, description, parentId });
+        res.json({ id, name, code, description });
     }
     catch (error) {
         conn.release();

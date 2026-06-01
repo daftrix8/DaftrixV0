@@ -242,12 +242,25 @@ exports.createDefaultSalaryStructure = createDefaultSalaryStructure;
  * Create a new salary component
  */
 const createSalaryComponent = (component) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
     const { randomUUID: uuidv4 } = require('crypto');
     const id = uuidv4();
+    // ON DUPLICATE KEY UPDATE prevents a crash when the same code is submitted
+    // twice (e.g. rapid double-click). Returns the existing row's id instead.
     yield db_1.pool.query(`
     INSERT INTO salary_components 
     (id, code, name, nameEn, type, category, isTaxable, isInsuranceSubject, defaultFormula, displayOrder, isActive)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+    ON DUPLICATE KEY UPDATE
+      name               = VALUES(name),
+      nameEn             = VALUES(nameEn),
+      type               = VALUES(type),
+      category           = VALUES(category),
+      isTaxable          = VALUES(isTaxable),
+      isInsuranceSubject = VALUES(isInsuranceSubject),
+      defaultFormula     = VALUES(defaultFormula),
+      displayOrder       = VALUES(displayOrder),
+      isActive           = 1
   `, [
         id,
         component.code,
@@ -255,26 +268,37 @@ const createSalaryComponent = (component) => __awaiter(void 0, void 0, void 0, f
         component.nameEn || null,
         component.type,
         component.category,
-        component.isTaxable,
-        component.isInsuranceSubject,
+        component.isTaxable ? 1 : 0,
+        component.isInsuranceSubject ? 1 : 0,
         component.defaultFormula || null,
         component.displayOrder || 0
     ]);
-    return id;
+    // Fetch the real id in case an existing row was updated instead of inserted
+    const [existing] = yield db_1.pool.query('SELECT id FROM salary_components WHERE code = ?', [component.code]);
+    return (_b = (_a = existing[0]) === null || _a === void 0 ? void 0 : _a.id) !== null && _b !== void 0 ? _b : id;
 });
 exports.createSalaryComponent = createSalaryComponent;
 /**
  * Update a salary component
  */
+// Only these keys are actual DB columns — any extra UI fields sent by the
+// frontend (e.g. uiPercentage) are silently ignored instead of crashing.
+const SALARY_COMPONENT_DB_COLUMNS = new Set([
+    'code', 'name', 'nameEn', 'type', 'category',
+    'isTaxable', 'isInsuranceSubject', 'defaultFormula',
+    'displayOrder', 'isActive',
+]);
 const updateSalaryComponent = (id, updates) => __awaiter(void 0, void 0, void 0, function* () {
     const fields = [];
     const values = [];
-    Object.entries(updates).forEach(([key, value]) => {
-        if (value !== undefined) {
-            fields.push(`${key} = ?`);
-            values.push(value);
-        }
-    });
+    for (const [key, value] of Object.entries(updates)) {
+        if (!SALARY_COMPONENT_DB_COLUMNS.has(key))
+            continue;
+        if (value === undefined)
+            continue;
+        fields.push(`${key} = ?`);
+        values.push(value);
+    }
     if (fields.length === 0)
         return;
     values.push(id);
