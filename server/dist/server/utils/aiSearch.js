@@ -29,6 +29,10 @@ function initAIModel() {
     return __awaiter(this, void 0, void 0, function* () {
         if (extractor)
             return;
+        if (process.env.ENABLE_SEMANTIC_SEARCH !== 'true') {
+            console.log('🤖 AI Search: Semantic search is disabled (ENABLE_SEMANTIC_SEARCH !== true). Model will not be loaded.');
+            return;
+        }
         if (isInitializing && initializationPromise) {
             return initializationPromise;
         }
@@ -61,11 +65,14 @@ function initAIModel() {
  */
 function getEmbedding(text) {
     return __awaiter(this, void 0, void 0, function* () {
+        if (process.env.ENABLE_SEMANTIC_SEARCH !== 'true') {
+            return [];
+        }
         if (!extractor) {
             yield initAIModel();
         }
         if (!extractor) {
-            throw new Error('AI Model failed to load');
+            throw new Error('AI Model failed to load (Semantic Search is disabled or loading failed)');
         }
         // Extract features with mean pooling and normalization (essential for cosine similarity)
         const output = yield extractor(text, { pooling: 'mean', normalize: true });

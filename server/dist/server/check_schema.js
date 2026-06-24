@@ -8,31 +8,20 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-var __importDefault = (this && this.__importDefault) || function (mod) {
-    return (mod && mod.__esModule) ? mod : { "default": mod };
-};
 Object.defineProperty(exports, "__esModule", { value: true });
-const promise_1 = __importDefault(require("mysql2/promise"));
-const dotenv_1 = __importDefault(require("dotenv"));
-const path_1 = __importDefault(require("path"));
-dotenv_1.default.config({ path: path_1.default.join(__dirname, '.env') });
-const dbConfig = {
-    host: process.env.DB_HOST || 'localhost',
-    user: process.env.DB_USER || 'root',
-    password: process.env.DB_PASSWORD || '',
-    database: process.env.DB_NAME || 'cloud_erp',
-};
-function checkSchema() {
+const db_1 = require("./db");
+function main() {
     return __awaiter(this, void 0, void 0, function* () {
         try {
-            const conn = yield promise_1.default.createConnection(dbConfig);
-            const [rows] = yield conn.query('SHOW COLUMNS FROM invoices');
-            console.log('Invoices Columns:', rows.map((r) => r.Field));
-            yield conn.end();
+            const [rows] = yield db_1.pool.query('DESCRIBE crm_leads');
+            console.log(rows);
         }
-        catch (e) {
-            console.error(e);
+        catch (err) {
+            console.error(err);
+        }
+        finally {
+            process.exit(0);
         }
     });
 }
-checkSchema();
+main();

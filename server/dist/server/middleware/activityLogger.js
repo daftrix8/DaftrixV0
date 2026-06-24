@@ -219,26 +219,24 @@ function activityLogger(req, res, next) {
     next();
 }
 // ── Preferences Size Guard ──
-// Prevents any user from saving preferences larger than MAX_PREFERENCES_SIZE
+// If preferences are too large, strip them from the request instead of blocking.
+// This prevents unrelated saves (e.g. permission edits) from failing due to
+// bloated preferences accumulated in the frontend state.
 function preferencesGuard(req, res, next) {
     var _a, _b;
     if ((_a = req.body) === null || _a === void 0 ? void 0 : _a.preferences) {
         const prefsSize = JSON.stringify(req.body.preferences).length;
         if (prefsSize > MAX_PREFERENCES_SIZE) {
             const username = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || 'unknown';
-            console.error(`🚫 [GUARD] User "${username}" tried to save ${(prefsSize / 1024).toFixed(0)}KB preferences (max: ${MAX_PREFERENCES_SIZE / 1024}KB). BLOCKED.`);
-            // Log this attempt
-            writeAuditLog(username, 'SECURITY', 'BLOCKED_OVERSIZE_PREFERENCES', `Blocked ${(prefsSize / 1024).toFixed(0)}KB preferences save (max: ${MAX_PREFERENCES_SIZE / 1024}KB)`, JSON.stringify({
+            console.warn(`⚠️ [GUARD] User "${username}" has ${(prefsSize / 1024).toFixed(0)}KB preferences (max: ${MAX_PREFERENCES_SIZE / 1024}KB). Stripping from request.`);
+            // Log this event
+            writeAuditLog(username, 'SECURITY', 'STRIPPED_OVERSIZE_PREFERENCES', `Stripped ${(prefsSize / 1024).toFixed(0)}KB preferences from save (max: ${MAX_PREFERENCES_SIZE / 1024}KB)`, JSON.stringify({
                 size: prefsSize,
                 limit: MAX_PREFERENCES_SIZE,
                 ip: getClientIp(req)
             }), getClientIp(req));
-            return res.status(413).json({
-                error: 'Preferences too large',
-                message: 'حجم التفضيلات كبير جداً. الحد الأقصى 500KB.',
-                size: prefsSize,
-                limit: MAX_PREFERENCES_SIZE
-            });
+            // Remove the oversized preferences — let the rest of the save proceed
+            delete req.body.preferences;
         }
     }
     next();

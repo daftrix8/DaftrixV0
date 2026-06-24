@@ -293,10 +293,10 @@ const loadVehicle = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
             `, [(0, crypto_1.randomUUID)(), id, productId, quantity, now, quantity, now]);
             // Decrease warehouse stock
             yield conn.query(`
-                UPDATE product_stocks 
-                SET stock = stock - ? 
-                WHERE productId = ? AND warehouseId = ?
-            `, [quantity, productId, warehouseId]);
+                INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)
+            `, [(0, crypto_1.randomUUID)(), productId, warehouseId, -quantity, quantity]);
             // Also decrease global product stock
             yield conn.query(`
                 UPDATE products SET stock = stock - ? WHERE id = ?

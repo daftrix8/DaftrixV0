@@ -44,11 +44,13 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 const express_1 = require("express");
 const posController_1 = require("../controllers/posController");
+const posActiveCartsController_1 = require("../controllers/posActiveCartsController");
 const posExpensesController_1 = require("../controllers/posExpensesController");
 const posCashiersController_1 = require("../controllers/posCashiersController");
 const posShiftApprovalController_1 = require("../controllers/posShiftApprovalController");
 const posConfigController_1 = require("../controllers/posConfigController");
 const authMiddleware_1 = require("../middleware/authMiddleware");
+const rateLimiter_1 = require("../middleware/rateLimiter");
 const router = (0, express_1.Router)();
 // ============================================
 // SHIFT MANAGEMENT
@@ -78,12 +80,14 @@ router.post('/shift/validate', (0, authMiddleware_1.requirePermission)('pos.vali
 router.post('/shift/unvalidate', (0, authMiddleware_1.requirePermission)('pos.validate'), posController_1.unvalidateShift);
 // Reopen a closed/pending shift
 router.post('/shift/reopen', (0, authMiddleware_1.requirePermission)('pos.validate'), posController_1.reopenShift);
-// Delete a shift
+// Delete a shift (cascade-deletes all related data)
 router.delete('/sessions/:id', (0, authMiddleware_1.requirePermission)('pos.sessions.delete'), posController_1.deleteShift);
+// Cleanup orphaned POS invoices (shifts deleted without cascade)
+router.post('/cleanup-orphaned', (0, authMiddleware_1.requirePermission)('pos.sessions.delete'), posController_1.cleanupOrphanedPOSInvoices);
 // Get all shifts (with filters)
 router.get('/shifts', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getShifts);
 // Get shift report (X/Z report)
-router.get('/shift/:shiftId/report', (0, authMiddleware_1.requirePermission)('pos.reports'), posController_1.getShiftReport);
+router.get('/shift/:shiftId/report', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getShiftReport);
 // Get shift cash movements
 router.get('/shift/:shiftId/movements', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getShiftMovements);
 // Get hourly sales report
@@ -126,7 +130,7 @@ router.get('/product/barcode/:barcode', (0, authMiddleware_1.requirePermission)(
 // Get rich product detail for POS info popup (stock per warehouse, 28/7-day sales)
 router.get('/products/:id/detail', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getPOSProductDetail);
 // Get embedded variants for a product (product_variants table)
-router.get('/products/:id/embedded-variants', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getEmbeddedVariants);
+router.get('/products/:id/embedded-variants', (0, authMiddleware_1.requireAnyPermission)(['pos.access', 'master.products.view', 'inventory.view', 'inventory.manage', 'inventory.receipt.view', 'inventory.release.view', 'inventory.transfer.view', 'sales.create', 'purchase.create', 'sales.quotations.create']), posController_1.getEmbeddedVariants);
 // ============================================
 // HELD ORDERS
 // ============================================
@@ -176,7 +180,7 @@ router.get('/treasuries', (0, authMiddleware_1.requirePermission)('pos.access'),
 router.get('/treasuries/:id/previous-balance', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getTreasuryPreviousBalance);
 // POS settings (discount lock, admin password)
 router.get('/settings', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.getPOSSettings);
-router.put('/settings', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.updatePOSSettings);
+router.put('/settings', (0, authMiddleware_1.requirePermission)('pos.manage'), posController_1.updatePOSSettings);
 // Warehouse stock count check — lightweight pre-flight for shift setup
 router.get('/warehouse-stock-count', (0, authMiddleware_1.requirePermission)('pos.access'), (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
@@ -199,14 +203,17 @@ router.get('/warehouse-stock-count', (0, authMiddleware_1.requirePermission)('po
     }
 }));
 // Verify admin password → returns 15-min adminToken
-router.post('/verify-admin-password', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.verifyAdminPassword);
+router.post('/verify-admin-password', rateLimiter_1.authLimiter, (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.verifyAdminPassword);
 // ============================================
 // PHASE 2: QUICK EXPENSES
 // ============================================
 router.get('/expense-categories', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.getExpenseCategories);
+router.post('/expense-categories', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.createExpenseCategory);
+router.post('/expense-accounts', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.createPOSExpenseAccount);
 router.post('/shifts/:shiftId/expenses', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.addExpense);
 router.get('/shifts/:shiftId/expenses', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.getShiftExpenses);
 router.delete('/expenses/:id', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.deleteExpense);
+router.put('/expenses/:id', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.updateExpense);
 // Contextual pickers for expense categories
 router.get('/expense-meta/employees', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.getExpenseEmployees);
 router.get('/expense-meta/suppliers', (0, authMiddleware_1.requirePermission)('pos.access'), posExpensesController_1.getExpenseSuppliers);
@@ -235,8 +242,26 @@ router.get('/shifts/:shiftId/summary', (0, authMiddleware_1.requirePermission)('
 // Approve shift (with or without discrepancy)
 router.post('/shifts/:shiftId/approve', (0, authMiddleware_1.requirePermission)('pos.access'), posShiftApprovalController_1.approveShift);
 router.post('/shifts/:shiftId/force-approve', (0, authMiddleware_1.requirePermission)('pos.access'), posShiftApprovalController_1.forceApproveShift);
+// Force close active/open shift by admin
+router.post('/shifts/:shiftId/admin-close', (0, authMiddleware_1.requirePermission)('pos.close_shift'), posShiftApprovalController_1.adminCloseShift);
 // ============================================
 // ADMIN INVOICE EDIT
 // ============================================
 router.put('/invoice/:invoiceId/edit', (0, authMiddleware_1.requirePermission)('pos.admin_edit_invoice'), posController_1.updatePOSInvoice);
+router.put('/invoice/:invoiceId/payment', (0, authMiddleware_1.requirePermission)('pos.admin_edit_invoice'), posController_1.updatePOSInvoicePayment);
+// ============================================
+// PHASE 15 & 16: OFFLINE SYNC & CROSS-BRANCH
+// ============================================
+router.post('/sync/queue', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.syncQueue);
+router.post('/transfer', (0, authMiddleware_1.requirePermission)('pos.access'), posController_1.requestStockTransfer);
+// ============================================
+// ACTIVE CASHIERS MONITOR (Hostinger-Ready Polling APIs)
+// ============================================
+router.post('/active-carts/sync', (0, authMiddleware_1.requirePermission)('pos.access'), posActiveCartsController_1.syncActiveCart);
+router.get('/active-carts/list', (0, authMiddleware_1.requirePermission)('pos.manage'), posActiveCartsController_1.listActiveCarts);
+router.post('/active-carts/remote-update', (0, authMiddleware_1.requirePermission)('pos.manage'), posActiveCartsController_1.remoteUpdateActiveCart);
+router.get('/active-carts/check-update/:cashierId', (0, authMiddleware_1.requirePermission)('pos.access'), posActiveCartsController_1.checkActiveCartUpdate);
+router.post('/active-carts/lock', (0, authMiddleware_1.requirePermission)('pos.manage'), posActiveCartsController_1.lockActiveCart);
+router.post('/active-carts/unlock', (0, authMiddleware_1.requirePermission)('pos.manage'), posActiveCartsController_1.unlockActiveCart);
+router.post('/active-carts/message', (0, authMiddleware_1.requirePermission)('pos.manage'), posActiveCartsController_1.sendAdminMessage);
 exports.default = router;

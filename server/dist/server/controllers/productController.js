@@ -57,7 +57,17 @@ const getProducts = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         const search = (req.query.search || '').replace(/[\x00-\x1F\x7F\r\n\t]/g, '').trim();
         const offset = (page - 1) * limit;
         // Exclude heavy 'image' column (can be 1MB+ per row in base64)
-        const columns = 'id, name, sku, barcode, price, cost, stock, warehouseId, categoryId, bomId, type, unit, isManufactured, leadTimeDays, trackSerials, trackInventory, warrantyMonths, ceramic_size, ceramic_color, ceramic_color_grade, ceramic_color_desc, ceramic_name, ceramic_pattern, ceramicItemDesc, ceramicGroup, minStock, description, isActive';
+        let stockExpr = 'stock';
+        let embeddedVariantSelect = '';
+        try {
+            const [pvTableCheck] = yield conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'product_variants' AND TABLE_SCHEMA = DATABASE() LIMIT 1`);
+            if (pvTableCheck.length > 0) {
+                embeddedVariantSelect = ', (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = products.id AND pv.isActive = 1) AS embeddedVariantCount';
+                stockExpr = '(CASE WHEN (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = products.id AND pv.isActive = 1) > 0 THEN COALESCE((SELECT SUM(pvs.stock) FROM product_variant_stocks pvs JOIN product_variants pv ON pv.id = pvs.variantId WHERE pv.productId = products.id AND pv.isActive = 1), 0) ELSE stock END)';
+            }
+        }
+        catch ( /* table doesn't exist */_b) { /* table doesn't exist */ }
+        const columns = `id, name, sku, barcode, price, cost, ${stockExpr} as stock, warehouseId, categoryId, bomId, type, unit, isManufactured, leadTimeDays, trackSerials, trackInventory, warrantyMonths, ceramic_size, ceramic_color, ceramic_color_grade, ceramic_color_desc, ceramic_name, ceramic_pattern, ceramicItemDesc, ceramicGroup, minStock, description, isActive${embeddedVariantSelect}`;
         // Allow Product Master UI to see inactive items via ?showInactive=true
         const showInactive = req.query.showInactive === 'true';
         let query = `SELECT ${columns} FROM products`;
@@ -70,7 +80,7 @@ const getProducts = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
             query += activeFilter;
             countQuery += activeFilter;
         }
-        let orderByClause = ' ORDER BY CASE WHEN sku REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(sku AS UNSIGNED) ASC, name ASC LIMIT ? OFFSET ?';
+        let orderByClause = ' ORDER BY CASE WHEN sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(sku AS UNSIGNED) ASC, name ASC LIMIT ? OFFSET ?';
         const exactBarcode = req.query.exactBarcode === 'true';
         if (search) {
             const joiner = showInactive ? ' WHERE ' : ' AND ';
@@ -89,7 +99,7 @@ const getProducts = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                 const exactParam = search;
                 params = [searchParam, searchParam, searchParam, exactParam, exactParam];
                 countParams = [...params];
-                orderByClause = ' ORDER BY CASE WHEN sku = ? OR barcode = ? THEN 0 ELSE 1 END, CASE WHEN sku REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(sku AS UNSIGNED) ASC, name LIMIT ? OFFSET ?';
+                orderByClause = ' ORDER BY CASE WHEN sku = ? OR barcode = ? THEN 0 ELSE 1 END, CASE WHEN sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(sku AS UNSIGNED) ASC, name LIMIT ? OFFSET ?';
                 // Add the exact params twice for the CASE WHEN condition
                 params.push(exactParam, exactParam);
             }
@@ -167,16 +177,18 @@ const getPaginatedProducts = (req, res) => __awaiter(void 0, void 0, void 0, fun
         const skipPrices = req.query.skipPrices === 'true';
         const conn = yield (0, db_1.getConnection)();
         // Safely check if product_variants table exists for embeddedVariantCount subquery
-        let embeddedVariantSelect = ', 0 AS embeddedVariantCount';
+        let embeddedVariantSelect = '';
+        let stockExpr = 'p.stock';
         try {
             const [pvTableCheck] = yield conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'product_variants' AND TABLE_SCHEMA = DATABASE() LIMIT 1`);
             if (pvTableCheck.length > 0) {
                 embeddedVariantSelect = ', (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) AS embeddedVariantCount';
+                stockExpr = '(CASE WHEN (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) > 0 THEN COALESCE((SELECT SUM(pvs.stock) FROM product_variant_stocks pvs JOIN product_variants pv ON pv.id = pvs.variantId WHERE pv.productId = p.id AND pv.isActive = 1), 0) ELSE COALESCE((SELECT SUM(ps2.stock) FROM product_stocks ps2 WHERE ps2.productId = p.id), p.stock, 0) END)';
             }
         }
         catch ( /* table doesn't exist */_a) { /* table doesn't exist */ }
         const isMasterList = req.query.isMasterList === 'true';
-        let selectColumns = 'p.id, p.name, p.sku, p.barcode, p.price, p.cost, p.stock, p.warehouseId, p.categoryId, p.subcategoryId, p.bomId, p.type, p.unit, p.isManufactured, p.leadTimeDays, p.trackSerials, p.trackInventory, p.warrantyMonths, p.ceramic_size, p.ceramic_color, p.ceramic_color_grade, p.ceramic_color_desc, p.ceramic_name, p.ceramic_pattern, p.ceramicItemDesc, p.ceramicGroup, p.minStock, p.description, p.isActive, p.variantAttributes, c.name as categoryName';
+        let selectColumns = `p.id, p.name, p.sku, p.barcode, p.price, p.cost, ${stockExpr} as stock, p.warehouseId, p.categoryId, p.subcategoryId, p.bomId, p.type, p.unit, p.isManufactured, p.leadTimeDays, p.trackSerials, p.trackInventory, p.warrantyMonths, p.ceramic_size, p.ceramic_color, p.ceramic_color_grade, p.ceramic_color_desc, p.ceramic_name, p.ceramic_pattern, p.ceramicItemDesc, p.ceramicGroup, p.minStock, p.description, p.isActive, p.variantAttributes, c.name as categoryName`;
         if (isMasterList) {
             selectColumns += ', p.image';
         }
@@ -262,11 +274,11 @@ const getPaginatedProducts = (req, res) => __awaiter(void 0, void 0, void 0, fun
         // Prioritize exact sku/barcode matches at the top of results
         if (search && !exactBarcode) {
             const exactParam = search.trim();
-            query += ' ORDER BY CASE WHEN p.sku = ? OR p.barcode = ? THEN 0 ELSE 1 END, CASE WHEN p.sku REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ? OFFSET ?';
+            query += ' ORDER BY CASE WHEN p.sku = ? OR p.barcode = ? THEN 0 ELSE 1 END, CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ? OFFSET ?';
             params.push(exactParam, exactParam, limit, offset);
         }
         else {
-            query += ' ORDER BY CASE WHEN p.sku REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ? OFFSET ?';
+            query += ' ORDER BY CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ? OFFSET ?';
             params.push(limit, offset);
         }
         let [[rows], [countResult]] = yield Promise.all([
@@ -277,7 +289,7 @@ const getPaginatedProducts = (req, res) => __awaiter(void 0, void 0, void 0, fun
         // ═══════════════════════════════════════════════════════════
         // GOD MODE: Semantic AI Fallback if FTS / Native Search Yields Nothing
         // ═══════════════════════════════════════════════════════════
-        if (products.length === 0 && search && !exactBarcode) {
+        if (products.length === 0 && search && !exactBarcode && process.env.ENABLE_SEMANTIC_SEARCH === 'true') {
             const { InMemoryVectorDB } = yield Promise.resolve().then(() => __importStar(require('../utils/aiSearch')));
             // Ensure we pass categoryId so God Mode respects the dropdown!
             const semanticMatches = yield InMemoryVectorDB.search(search, 15, categoryId);
@@ -396,12 +408,13 @@ const createProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const id = reqId || (0, crypto_1.randomUUID)();
         // Auto-populate barcode with SKU if not provided
         const barcode = req.body.barcode || sku || null;
-        // Check for duplicate Name globally
-        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) LIMIT 1', [name]);
+        // Check for duplicate Name within the same category
+        // Different categories can have products with the same name
+        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND (categoryId = ? OR (categoryId IS NULL AND ? IS NULL)) LIMIT 1', [name, categoryId || null, categoryId || null]);
         if (existingName.length > 0) {
             yield conn.rollback();
             conn.release();
-            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً` });
+            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً في نفس التصنيف` });
         }
         // Check for duplicate SKU or Barcode
         const barcodeToCheck = barcode || null;
@@ -446,25 +459,27 @@ const createProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const newProduct = Object.assign(Object.assign({}, req.body), { id });
         eventBus_1.eventBus.broadcast('product:changed', { product: newProduct, updatedBy: user });
         // Asynchronously update Semantic Embedding (God Mode)
-        Promise.resolve().then(() => __awaiter(void 0, void 0, void 0, function* () {
-            try {
-                const { getEmbedding, InMemoryVectorDB } = yield Promise.resolve().then(() => __importStar(require('../utils/aiSearch')));
-                const pPool = (yield Promise.resolve().then(() => __importStar(require('../db')))).pool;
-                // Fetch latest name & category if missing from request
-                const [current] = yield pPool.query('SELECT p.name, p.categoryId, c.name as catName FROM products p LEFT JOIN categories c ON p.categoryId = c.id WHERE p.id = ?', [id]);
-                if (!current[0])
-                    return;
-                const finalName = name || current[0].name;
-                const finalCategory = current[0].catName || '';
-                const finalCatId = categoryId !== undefined ? categoryId : current[0].categoryId;
-                const vector = yield getEmbedding(`${finalName} ${finalCategory}`.trim());
-                yield pPool.query('UPDATE products SET embedding = ? WHERE id = ?', [JSON.stringify(vector), id]);
-                InMemoryVectorDB.addOrUpdateVector(id, vector, finalCatId || null);
-            }
-            catch (e) {
-                console.error('Failed to semantic-embed product:', e);
-            }
-        }));
+        if (process.env.ENABLE_SEMANTIC_SEARCH === 'true') {
+            Promise.resolve().then(() => __awaiter(void 0, void 0, void 0, function* () {
+                try {
+                    const { getEmbedding, InMemoryVectorDB } = yield Promise.resolve().then(() => __importStar(require('../utils/aiSearch')));
+                    const pPool = (yield Promise.resolve().then(() => __importStar(require('../db')))).pool;
+                    // Fetch latest name & category if missing from request
+                    const [current] = yield pPool.query('SELECT p.name, p.categoryId, c.name as catName FROM products p LEFT JOIN categories c ON p.categoryId = c.id WHERE p.id = ?', [id]);
+                    if (!current[0])
+                        return;
+                    const finalName = name || current[0].name;
+                    const finalCategory = current[0].catName || '';
+                    const finalCatId = categoryId !== undefined ? categoryId : current[0].categoryId;
+                    const vector = yield getEmbedding(`${finalName} ${finalCategory}`.trim());
+                    yield pPool.query('UPDATE products SET embedding = ? WHERE id = ?', [JSON.stringify(vector), id]);
+                    InMemoryVectorDB.addOrUpdateVector(id, vector, finalCatId || null);
+                }
+                catch (e) {
+                    console.error('Failed to semantic-embed product:', e);
+                }
+            }));
+        }
         console.log(`✅ Product created: ${name} (transaction committed)`);
         res.status(201).json(Object.assign(Object.assign({}, req.body), { id }));
     }
@@ -489,12 +504,13 @@ const updateProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const { name, sku, price, cost, stock, warehouseId, categoryId, bomId, type, unit, isManufactured, leadTimeDays, trackSerials, trackInventory } = req.body;
         // Sync barcode with SKU if barcode is not explicitly provided or is empty
         const barcode = req.body.barcode || sku || null;
-        // Check for duplicate Name globally (excluding this product)
-        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND id != ? LIMIT 1', [name, id]);
+        // Check for duplicate Name within the same category (excluding this product)
+        // Different categories can have products with the same name
+        const [existingName] = yield conn.query('SELECT id FROM products WHERE TRIM(name) = TRIM(?) AND (categoryId = ? OR (categoryId IS NULL AND ? IS NULL)) AND id != ? LIMIT 1', [name, categoryId || null, categoryId || null, id]);
         if (existingName.length > 0) {
             yield conn.rollback();
             conn.release();
-            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً` });
+            return res.status(400).json({ error: `خطأ: الصنف "${name}" مسجل مسبقاً في نفس التصنيف` });
         }
         // Check for duplicate SKU or Barcode (excluding this product)
         const barcodeToCheck = barcode || null;
@@ -645,13 +661,15 @@ const deleteProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // Broadcast real-time deletion
         eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'product', entityId: id, deletedBy: user });
         // Remove from Semantic DB
-        Promise.resolve().then(() => __awaiter(void 0, void 0, void 0, function* () {
-            try {
-                const { InMemoryVectorDB } = yield Promise.resolve().then(() => __importStar(require('../utils/aiSearch')));
-                InMemoryVectorDB.removeVector(id);
-            }
-            catch (e) { }
-        }));
+        if (process.env.ENABLE_SEMANTIC_SEARCH === 'true') {
+            Promise.resolve().then(() => __awaiter(void 0, void 0, void 0, function* () {
+                try {
+                    const { InMemoryVectorDB } = yield Promise.resolve().then(() => __importStar(require('../utils/aiSearch')));
+                    InMemoryVectorDB.removeVector(id);
+                }
+                catch (e) { }
+            }));
+        }
         res.json({ message: 'Product deleted' });
     }
     catch (error) {
@@ -713,7 +731,7 @@ const getNextSku = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
     try {
         const conn = yield (0, db_1.getConnection)();
         // Find the maximum numeric SKU
-        const [rows] = yield conn.query('SELECT MAX(CAST(sku AS UNSIGNED)) as maxSku FROM products WHERE sku REGEXP "^[0-9]+$"');
+        const [rows] = yield conn.query('SELECT MAX(CAST(sku AS UNSIGNED)) as maxSku FROM products WHERE sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$"');
         conn.release();
         const maxSku = rows[0].maxSku || 1000;
         const nextSku = (maxSku + 1).toString();
@@ -767,11 +785,11 @@ const searchProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
         // Exact match first
         if (query.trim()) {
             const exactParam = query.trim();
-            sql += ' ORDER BY CASE WHEN p.sku = ? OR p.barcode = ? THEN 0 ELSE 1 END, CASE WHEN p.sku REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ?';
+            sql += ' ORDER BY CASE WHEN p.sku = ? OR p.barcode = ? THEN 0 ELSE 1 END, CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ?';
             params.push(exactParam, exactParam, limit);
         }
         else {
-            sql += ' ORDER BY CASE WHEN p.sku REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ?';
+            sql += ' ORDER BY CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ?';
             params.push(limit);
         }
         const [rows] = yield conn.query(sql, params);

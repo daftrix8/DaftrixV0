@@ -13,7 +13,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getSalesmanCommissionReport = exports.getUnassignedCustomers = exports.unassignCustomer = exports.bulkAssignCustomers = exports.assignCustomer = exports.getSalesmanCustomers = exports.getCommissionSummary = exports.markCommissionPaid = exports.rejectCommission = exports.approveCommission = exports.calculateCommission = exports.getCommissionRecords = exports.deleteCommissionTier = exports.updateCommissionTier = exports.createCommissionTier = exports.getCommissionTiers = void 0;
+exports.payMembershipCommission = exports.getMembershipCommissions = exports.getSalesmanCommissionReport = exports.getUnassignedCustomers = exports.unassignCustomer = exports.bulkAssignCustomers = exports.assignCustomer = exports.getSalesmanCustomers = exports.getCommissionSummary = exports.markCommissionPaid = exports.rejectCommission = exports.approveCommission = exports.calculateCommission = exports.getCommissionRecords = exports.deleteCommissionTier = exports.updateCommissionTier = exports.createCommissionTier = exports.getCommissionTiers = void 0;
 const crypto_1 = require("crypto");
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -200,7 +200,7 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
             conn.release();
             return res.status(404).json({ error: 'Salesman not found' });
         }
-        // Calculate sales for the period (totals for summary)
+        // Calculate sales for the period (totals for summary) - EXCLUDING MEMBERSHIP INVOICES
         const [salesResult] = yield conn.query(`
             SELECT 
                 COALESCE(SUM(CASE WHEN type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN total ELSE 0 END), 0) as totalSales,
@@ -210,6 +210,7 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
               AND date >= ?
               AND date <= ?
               AND status = 'POSTED'
+              AND id NOT IN (SELECT invoiceId FROM memberships WHERE invoiceId IS NOT NULL)
         `, [salesmanId, periodStart, periodEnd]);
         const { totalSales, totalReturns } = salesResult[0];
         const netSales = totalSales - totalReturns;
@@ -227,7 +228,7 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
         // Find the Global (SALES_AMOUNT) target
         const globalTarget = targets.find(t => t.targetType === 'SALES_AMOUNT');
         const globalCommissionRate = (globalTarget === null || globalTarget === void 0 ? void 0 : globalTarget.commissionPercentage) || 0;
-        // Get product-level sales for detailed calculation
+        // Get product-level sales for detailed calculation - EXCLUDING MEMBERSHIP INVOICES
         const [productSalesResult] = yield conn.query(`
             SELECT 
                 il.productId,
@@ -243,9 +244,30 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
               AND i.date >= ?
               AND i.date <= ?
               AND i.status = 'POSTED'
+              AND i.id NOT IN (SELECT invoiceId FROM memberships WHERE invoiceId IS NOT NULL)
             GROUP BY il.productId, p.categoryId
         `, [salesmanId, periodStart, periodEnd]);
         const productSales = productSalesResult;
+        // Query membership sales for this salesman in this period
+        const [membershipSalesResult] = yield conn.query(`
+            SELECT 
+                m.packageId,
+                pk.name as packageName,
+                pk.price as packagePrice,
+                pk.commissionType,
+                pk.commissionValue,
+                COUNT(m.id) as netQuantity,
+                SUM(pk.price) as netAmount
+            FROM memberships m
+            JOIN membership_packages pk ON m.packageId = pk.id
+            JOIN invoices i ON m.invoiceId = i.id
+            WHERE i.salesmanId = ?
+              AND i.date >= ?
+              AND i.date <= ?
+              AND i.status = 'POSTED'
+            GROUP BY m.packageId, pk.name, pk.price, pk.commissionType, pk.commissionValue
+        `, [salesmanId, periodStart, periodEnd]);
+        const membershipSales = membershipSalesResult;
         // Calculate commission based on Product > Category > Global > Tier > Default hierarchy
         let totalCommission = 0;
         const defaultRate = salesman.commissionRate || 0;
@@ -287,6 +309,21 @@ const calculateCommission = (req, res) => __awaiter(void 0, void 0, void 0, func
             const productCommission = product.netAmount > 0 ? (product.netAmount * rate / 100) : 0;
             totalCommission += productCommission;
         }
+        // Calculate membership commissions - DISABLED for normal/invoice commissions
+        // Memberships now have their own tab and immediate payment flow
+        /*
+        for (const ms of membershipSales) {
+            let commission = 0;
+            const val = ms.commissionValue || 0;
+            if (ms.commissionType === 'FIXED') {
+                commission = ms.netQuantity * val;
+            } else {
+                const pct = val > 0 ? val : defaultRate;
+                commission = ms.netAmount * (pct / 100);
+            }
+            totalCommission += commission;
+        }
+        */
         // Round the total commission
         const commissionAmount = Math.round(totalCommission * 100) / 100;
         const finalAmount = commissionAmount + (bonusAmount || 0) - (deductions || 0);
@@ -713,6 +750,54 @@ const getSalesmanCommissionReport = (req, res) => __awaiter(void 0, void 0, void
               AND status = 'POSTED'
         `, [salesmanId, startDate, endDate]);
         const totals = totalsResult[0];
+        // Get membership-level sales data for the period
+        const [membershipSalesResult] = yield conn.query(`
+            SELECT 
+                m.packageId,
+                pk.name as packageName,
+                pk.price as packagePrice,
+                pk.commissionType,
+                pk.commissionValue,
+                COUNT(m.id) as quantity,
+                SUM(pk.price) as salesAmount
+            FROM memberships m
+            JOIN membership_packages pk ON m.packageId = pk.id
+            JOIN invoices i ON m.invoiceId = i.id
+            WHERE i.salesmanId = ?
+              AND i.date >= ?
+              AND i.date <= ?
+              AND i.status = 'POSTED'
+            GROUP BY m.packageId, pk.name, pk.price, pk.commissionType, pk.commissionValue
+        `, [salesmanId, startDate, endDate]);
+        const membershipData = membershipSalesResult.map(item => {
+            const qty = item.quantity || 0;
+            const price = item.packagePrice || 0;
+            const amount = item.salesAmount || 0;
+            const commissionType = item.commissionType || 'PERCENT';
+            const commissionValue = item.commissionValue || 0;
+            let commissionAmount = 0;
+            let usedRate = 0;
+            if (commissionType === 'FIXED') {
+                commissionAmount = qty * commissionValue;
+                usedRate = commissionValue;
+            }
+            else {
+                const pct = commissionValue > 0 ? commissionValue : (salesman.commissionRate || 0);
+                commissionAmount = amount * (pct / 100);
+                usedRate = pct;
+            }
+            return {
+                packageId: item.packageId,
+                packageName: item.packageName,
+                quantity: qty,
+                price: price,
+                salesAmount: amount,
+                commissionType,
+                commissionValue,
+                commissionAmount: Math.round(commissionAmount * 100) / 100,
+                usedRate
+            };
+        });
         conn.release();
         res.json({
             salesman: {
@@ -726,19 +811,182 @@ const getSalesmanCommissionReport = (req, res) => __awaiter(void 0, void 0, void
                 endDate
             },
             productSales: productData,
+            membershipSales: membershipData,
             summary: {
                 totalSales: totals.totalSales || 0,
                 totalReturns: totals.totalReturns || 0,
                 netSales: (totals.totalSales || 0) - (totals.totalReturns || 0),
                 salesInvoiceCount: totals.salesInvoiceCount || 0,
                 returnInvoiceCount: totals.returnInvoiceCount || 0,
-                productCount: productData.length
+                productCount: productData.length,
+                membershipCount: membershipData.reduce((sum, m) => sum + m.quantity, 0)
             }
         });
     }
     catch (error) {
         console.error('Error generating salesman commission report:', error);
-        return (0, errorHandler_1.handleControllerError)(res, error, 'generate commission repor');
+        return (0, errorHandler_1.handleControllerError)(res, error, 'generate commission report');
     }
 });
 exports.getSalesmanCommissionReport = getSalesmanCommissionReport;
+// =================== MEMBERSHIP COMMISSIONS ===================
+const getMembershipCommissions = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { salesmanId, status, startDate, endDate } = req.query;
+        const conn = yield (0, db_1.getConnection)();
+        let query = `
+            SELECT 
+                m.id,
+                m.customerId,
+                p.name as customerName,
+                p.phone as customerPhone,
+                m.packageId,
+                pk.name as packageName,
+                pk.price as packagePrice,
+                m.joinDate,
+                m.endDate,
+                m.status as membershipStatus,
+                m.salesmanId,
+                s.name as salesmanName,
+                m.commissionAmount,
+                m.commissionStatus,
+                m.commissionPaidAt,
+                m.commissionPaidAmount,
+                m.commissionPaidJournalId
+            FROM memberships m
+            LEFT JOIN partners p ON m.customerId = p.id
+            LEFT JOIN membership_packages pk ON m.packageId = pk.id
+            LEFT JOIN salesmen s ON m.salesmanId = s.id
+            WHERE m.salesmanId IS NOT NULL
+              AND m.status != 'PENDING_PAYMENT'
+        `;
+        const params = [];
+        if (salesmanId && salesmanId !== 'ALL') {
+            query += ' AND m.salesmanId = ?';
+            params.push(salesmanId);
+        }
+        if (status && status !== 'ALL') {
+            query += ' AND m.commissionStatus = ?';
+            params.push(status);
+        }
+        if (startDate) {
+            query += ' AND m.joinDate >= ?';
+            params.push(startDate);
+        }
+        if (endDate) {
+            query += ' AND m.joinDate <= ?';
+            params.push(endDate);
+        }
+        query += ' ORDER BY m.joinDate DESC';
+        const [rows] = yield conn.query(query, params);
+        conn.release();
+        res.json(rows);
+    }
+    catch (error) {
+        console.error('Error fetching membership commissions:', error);
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetching membership commissions');
+    }
+});
+exports.getMembershipCommissions = getMembershipCommissions;
+const payMembershipCommission = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        yield conn.beginTransaction();
+        const authReq = req;
+        const { id } = req.params;
+        const { treasuryAccountId, notes } = req.body;
+        const userId = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.id) || 'System';
+        // 1. Get membership details
+        const [membershipResult] = yield conn.query(`SELECT m.*, s.name as salesmanName, pk.name as packageName, p.name as customerName, i.branchId 
+             FROM memberships m
+             LEFT JOIN salesmen s ON m.salesmanId = s.id
+             LEFT JOIN membership_packages pk ON m.packageId = pk.id
+             LEFT JOIN partners p ON m.customerId = p.id
+             LEFT JOIN invoices i ON m.invoiceId = i.id
+             WHERE m.id = ? AND m.salesmanId IS NOT NULL`, [id]);
+        const membership = membershipResult[0];
+        if (!membership) {
+            yield conn.rollback();
+            conn.release();
+            return res.status(404).json({ error: 'Membership not found or does not have a salesman' });
+        }
+        if (membership.commissionStatus === 'PAID') {
+            yield conn.rollback();
+            conn.release();
+            return res.status(400).json({ error: 'Commission already paid for this membership' });
+        }
+        if (membership.status === 'PENDING_PAYMENT') {
+            yield conn.rollback();
+            conn.release();
+            return res.status(400).json({ error: 'Membership is unpaid; commission cannot be paid yet' });
+        }
+        const commissionAmount = membership.commissionAmount || 0;
+        if (commissionAmount <= 0) {
+            yield conn.rollback();
+            conn.release();
+            return res.status(400).json({ error: 'Commission amount is zero or negative' });
+        }
+        let journalId = null;
+        if (treasuryAccountId) {
+            // Verify treasury account exists
+            const [accountResult] = yield conn.query('SELECT * FROM accounts WHERE id = ?', [treasuryAccountId]);
+            const account = accountResult[0];
+            if (!account) {
+                yield conn.rollback();
+                conn.release();
+                return res.status(404).json({ error: 'Treasury account not found' });
+            }
+            // Create Journal Entry
+            journalId = (0, crypto_1.randomUUID)();
+            const journalNumber = `MCOM-${Date.now()}`;
+            const description = `صرف عمولة مبيعات فورية للمندوب ${membership.salesmanName} - اشتراك العميل ${membership.customerName} (باقة: ${membership.packageName})`;
+            // Insert Journal Entry (Reference user's branch if available)
+            // Stamping branchId on the journal entry ensures it shows up in branch daily reports!
+            const branchId = membership.branchId || null;
+            yield conn.query(`
+                INSERT INTO journal_entries (id, referenceId, date, description, createdBy, branchId)
+                VALUES (?, ?, NOW(), ?, ?, ?)
+            `, [journalId, journalNumber, description, userId, branchId]);
+            // Debit: Commission Expense
+            const [expenseAccResult] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%عمولات%' AND type = 'EXPENSE' LIMIT 1`);
+            const expenseAccount = expenseAccResult[0];
+            if (expenseAccount) {
+                yield conn.query(`
+                    INSERT INTO journal_lines (journalId, accountId, debit, credit, accountName)
+                    VALUES (?, ?, ?, 0, ?)
+                `, [journalId, expenseAccount.id, commissionAmount, `مصروفات عمولات - ${membership.salesmanName}`]);
+            }
+            // Credit: Treasury Account (reduce cash balance)
+            yield conn.query(`
+                INSERT INTO journal_lines (journalId, accountId, debit, credit, accountName)
+                VALUES (?, ?, 0, ?, ?)
+            `, [journalId, treasuryAccountId, commissionAmount, `صرف عمولة ${membership.salesmanName}`]);
+            // Update treasury account balance
+            yield conn.query(`
+                UPDATE accounts SET balance = balance - ? WHERE id = ?
+            `, [commissionAmount, treasuryAccountId]);
+        }
+        // Update membership commission status
+        yield conn.query(`
+            UPDATE memberships 
+            SET commissionStatus = 'PAID',
+                commissionPaidAt = NOW(),
+                commissionPaidAmount = ?,
+                commissionPaidJournalId = ?
+            WHERE id = ?
+        `, [commissionAmount, journalId, id]);
+        // Commit transaction
+        yield conn.commit();
+        conn.release();
+        console.log(`✅ Membership commission ${id} paid: ${commissionAmount} EGP`);
+        res.json({ message: 'Commission paid successfully', commissionAmount, journalId });
+    }
+    catch (error) {
+        yield conn.rollback();
+        conn.release();
+        console.error('Error paying membership commission:', error);
+        return (0, errorHandler_1.handleControllerError)(res, error, 'paying membership commission');
+    }
+});
+exports.payMembershipCommission = payMembershipCommission;

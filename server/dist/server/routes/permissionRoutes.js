@@ -8,14 +8,31 @@ const permissionController_1 = require("../controllers/permissionController");
 const authMiddleware_1 = require("../middleware/authMiddleware");
 const responseCache_1 = require("../middleware/responseCache");
 const router = express_1.default.Router();
-// GET — any authenticated user can read permissions (needed for user management UI dropdowns)
-// PERF: Cache for 120s, auto-invalidated on entity:changed for 'permissions'
-router.get('/', (0, responseCache_1.responseCache)('permissions', 120000), permissionController_1.getPermissions);
-// Mutations — require system.users permission
-// SECURITY: Without this, any authenticated user could create/modify/delete permissions,
-// which is a privilege escalation vulnerability
-router.post('/', (0, authMiddleware_1.requirePermission)('system.users'), permissionController_1.createPermission);
-router.post('/seed', (0, authMiddleware_1.requirePermission)('system.users'), permissionController_1.seedPermissions); // Bulk seed — single request instead of 80+
-router.put('/:id', (0, authMiddleware_1.requirePermission)('system.users'), permissionController_1.updatePermission);
-router.delete('/:id', (0, authMiddleware_1.requirePermission)('system.users'), permissionController_1.deletePermission);
+// ── 1. Read Operations ──
+// Requires permissions.view permission
+router.get('/', (0, authMiddleware_1.requirePermission)('permissions.view'), (0, responseCache_1.responseCache)('permissions', 120000), permissionController_1.getPermissions);
+router.get('/:id', (0, authMiddleware_1.requirePermission)('permissions.view'), (req, res, next) => {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+        return res.status(400).json({ error: 'INVALID_PERMISSION_ID', message: 'معرف الصلاحية غير صالح' });
+    }
+    next();
+}, permissionController_1.getPermissionById);
+// ── 2. Mutation Operations ──
+router.post('/seed', (0, authMiddleware_1.requirePermission)('permissions.seed'), permissionController_1.seedPermissions);
+router.post('/', (0, authMiddleware_1.requirePermission)('permissions.create'), permissionController_1.createPermission);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('permissions.edit'), (req, res, next) => {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+        return res.status(400).json({ error: 'INVALID_PERMISSION_ID', message: 'معرف الصلاحية غير صالح' });
+    }
+    next();
+}, permissionController_1.updatePermission);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('permissions.delete'), (req, res, next) => {
+    const { id } = req.params;
+    if (!id || typeof id !== 'string' || id.trim() === '') {
+        return res.status(400).json({ error: 'INVALID_PERMISSION_ID', message: 'معرف الصلاحية غير صالح' });
+    }
+    next();
+}, permissionController_1.deletePermission);
 exports.default = router;

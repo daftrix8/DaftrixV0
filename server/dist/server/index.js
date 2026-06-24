@@ -160,8 +160,27 @@ const http_1 = __importDefault(require("http"));
 const path_1 = __importDefault(require("path"));
 const cors_1 = __importDefault(require("cors"));
 const compression_1 = __importDefault(require("compression"));
+const express_static_gzip_1 = __importDefault(require("express-static-gzip"));
 const body_parser_1 = __importDefault(require("body-parser"));
 const dotenv_1 = __importDefault(require("dotenv"));
+const multer_1 = __importDefault(require("multer"));
+const fs_1 = __importDefault(require("fs"));
+// ── Sites and Uploads Path Resolution ───────────────────────────────
+const sitesPath = fs_1.default.existsSync(path_1.default.join(process.cwd(), 'sites'))
+    ? path_1.default.join(process.cwd(), 'sites')
+    : fs_1.default.existsSync(path_1.default.join(process.cwd(), '..', 'sites'))
+        ? path_1.default.join(process.cwd(), '..', 'sites')
+        : path_1.default.join(__dirname, '..', 'sites'); // Fallback
+const sitesPrivatePath = fs_1.default.existsSync(path_1.default.join(process.cwd(), 'sites_private'))
+    ? path_1.default.join(process.cwd(), 'sites_private')
+    : fs_1.default.existsSync(path_1.default.join(process.cwd(), '..', 'sites_private'))
+        ? path_1.default.join(process.cwd(), '..', 'sites_private')
+        : path_1.default.join(__dirname, '..', 'sites_private'); // Fallback
+const uploadsPath = fs_1.default.existsSync(path_1.default.join(process.cwd(), 'uploads'))
+    ? path_1.default.join(process.cwd(), 'uploads')
+    : fs_1.default.existsSync(path_1.default.join(process.cwd(), '..', 'uploads'))
+        ? path_1.default.join(process.cwd(), '..', 'uploads')
+        : path_1.default.join(__dirname, '..', 'uploads'); // Fallback
 // CRITICAL: Load .env BEFORE any middleware imports that read process.env
 // authMiddleware.ts reads JWT_SECRET at module load time
 dotenv_1.default.config();
@@ -225,6 +244,7 @@ const costCenterRoutes_1 = __importDefault(require("./routes/costCenterRoutes"))
 const ceramicRoutes_1 = __importDefault(require("./routes/ceramicRoutes"));
 const authMiddleware_1 = require("./middleware/authMiddleware");
 const activityLogger_1 = require("./middleware/activityLogger");
+const errorHandler_1 = require("./middleware/errorHandler");
 const backupController_1 = require("./controllers/backupController");
 const loyaltyExpiryJob_1 = require("./controllers/loyaltyExpiryJob");
 // Initialize cron jobs
@@ -506,8 +526,19 @@ app.use((0, compression_1.default)({
     }
 }));
 // Security headers (CSP, HSTS, X-Content-Type-Options, etc.)
-app.use(securityMiddleware_1.securityHeaders);
-app.use(securityMiddleware_1.additionalSecurityHeaders);
+// Skip security headers for client storefronts to allow CDNs and inline event handlers
+app.use((req, res, next) => {
+    if (req.path.startsWith('/sites/')) {
+        return next();
+    }
+    (0, securityMiddleware_1.securityHeaders)(req, res, next);
+});
+app.use((req, res, next) => {
+    if (req.path.startsWith('/sites/')) {
+        return next();
+    }
+    (0, securityMiddleware_1.additionalSecurityHeaders)(req, res, next);
+});
 app.use(body_parser_1.default.json({ limit: '50mb' }));
 app.use(body_parser_1.default.urlencoded({ limit: '50mb', extended: true }));
 // Automatic Database Connection Leak Sweeper
@@ -644,8 +675,8 @@ app.use('/api/', (req, res, next) => {
 // IMPORTANT: Mount sync BEFORE the global 30s timeout — sync runs 90+ sequential
 // DB queries in a single transaction and needs 120s.
 app.use('/api/sync', requestTimeout_1.reportTimeout, syncRoutes_1.default);
-// Backup timeout constant — applied when backup routes are mounted in protected section below
-const backupTimeout = (0, requestTimeout_1.requestTimeout)(300000); // 5 minutes for backup/restore
+// Backup routes use default API timeout — create responds instantly,
+// client polls /backup/status/:backupId for progress
 // Global 30s timeout — skip sync (already has 120s), backup (300s), inventory (120s), product writes (image uploads 120s)
 app.use('/api/', (req, res, next) => {
     if (req.path.startsWith('/backup') || req.path.startsWith('/inventory'))
@@ -688,10 +719,83 @@ app.use('/api/whatsapp/webhook', whatsappRoutes_1.webhookRouter);
 // Protected Routes Middleware
 // Protect all other API routes + load system config (fiscal year filter, user policies)
 const policyMiddleware_1 = require("./middleware/policyMiddleware");
+// Shared Storefront Guest Authentication Middleware
+const storefrontAuthMiddleware = (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const privateConfigPath = path_1.default.join(sitesPrivatePath, slug, 'private-config.json');
+    if (!fs_1.default.existsSync(privateConfigPath)) {
+        return res.status(404).json({ error: `Private configuration not found for storefront: ${slug}` });
+    }
+    try {
+        const privateConfig = JSON.parse(fs_1.default.readFileSync(privateConfigPath, 'utf8'));
+        const username = (_b = (_a = privateConfig === null || privateConfig === void 0 ? void 0 : privateConfig.api) === null || _a === void 0 ? void 0 : _a.autoLogin) === null || _b === void 0 ? void 0 : _b.username;
+        if (!username) {
+            return res.status(400).json({ error: 'Storefront user not configured on the server.' });
+        }
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const [rows] = yield pool.query(`SELECT id, name, email, username, role, status, permissions, branchId, defaultTreasuryId, warehouseId 
+             FROM users 
+             WHERE username = ? LIMIT 1`, [username]);
+        const dbUser = rows[0];
+        if (!dbUser || dbUser.status !== 'ACTIVE') {
+            return res.status(403).json({ error: 'Designated storefront user is inactive or does not exist.' });
+        }
+        let permissions = [];
+        if (dbUser.permissions) {
+            try {
+                permissions = typeof dbUser.permissions === 'string'
+                    ? JSON.parse(dbUser.permissions)
+                    : dbUser.permissions;
+            }
+            catch (e) {
+                permissions = [];
+            }
+        }
+        req.user = {
+            id: dbUser.id,
+            username: dbUser.username,
+            role: dbUser.role,
+            permissions: permissions,
+            branchId: dbUser.branchId,
+            warehouseId: dbUser.warehouseId
+        };
+        yield (0, policyMiddleware_1.loadSystemConfig)(req, res, next);
+    }
+    catch (err) {
+        console.error(`❌ Storefront auth middleware error for ${slug}:`, err.message);
+        res.status(500).json({ error: `Storefront authentication failed: ${err.message}` });
+    }
+});
+// Storefront guest checkout order submission
+app.post('/api/storefront/:slug/order', storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { createInvoice } = yield Promise.resolve().then(() => __importStar(require('./controllers/invoiceController')));
+    if (!req.body.type) {
+        req.body.type = 'SALES'; // Default to Sales Invoice
+    }
+    createInvoice(req, res);
+}));
+// Storefront guest coupon validation
+app.post('/api/storefront/:slug/validate-coupon', storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { validateCoupon } = yield Promise.resolve().then(() => __importStar(require('./controllers/promotionController')));
+    validateCoupon(req, res);
+}));
 app.use('/api', (req, res, next) => {
     // Exclude auth routes (already handled above, but double check)
     if (req.path.startsWith('/auth'))
         return next();
+    // Allow public access to view invoices & memberships by ID without credentials
+    if (req.method === 'GET' && (req.path.startsWith('/invoices/public/') || req.path.startsWith('/memberships/public/'))) {
+        return (0, policyMiddleware_1.loadSystemConfig)(req, res, next);
+    }
+    // E-commerce public access: Allow read-only operations for products and categories
+    // But /products/next-sku is a management route requiring auth/permissions check
+    const isPublicGet = req.method === 'GET' && ((req.path.startsWith('/products') && !req.path.startsWith('/products/next-sku')) ||
+        req.path.startsWith('/master/categories'));
+    if (isPublicGet) {
+        return (0, policyMiddleware_1.loadSystemConfig)(req, res, next);
+    }
     (0, authMiddleware_1.authenticateToken)(req, res, () => {
         // After authentication succeeds, load system config for fiscal year filtering & data policies
         (0, policyMiddleware_1.loadSystemConfig)(req, res, () => {
@@ -740,7 +844,7 @@ app.use('/api/routings', routingRoutes_1.default);
 app.use('/api/quality', qualityRoutes_1.default);
 app.use('/api/batches', batchRoutes_1.default);
 app.use('/api/stock-permits', stockPermitRoutes_1.default);
-app.use('/api/backup', backupTimeout, backupRoutes_1.default); // 5-min timeout for large DB backup/restore
+app.use('/api/backup', backupRoutes_1.default); // create responds instantly, client polls for progress
 app.use('/api/audit', auditRoutes_1.default);
 app.use('/api/migration', migrationRoutes_1.default);
 app.use('/api/installments', installmentRoutes_1.default);
@@ -779,9 +883,32 @@ const aiChatRoutes_1 = __importDefault(require("./routes/aiChatRoutes"));
 app.use('/api/ai-chat', aiChatRoutes_1.default);
 const aiReconciliationRoutes_1 = __importDefault(require("./routes/aiReconciliationRoutes"));
 app.use('/api/ai-reconciliation', aiReconciliationRoutes_1.default);
+// Payment Terms, Credit Limits & Terms & Conditions Routes (شروط الدفع)
+const paymentTermsRoutes_1 = __importDefault(require("./routes/paymentTermsRoutes"));
+app.use('/api/finance', paymentTermsRoutes_1.default);
+// Budget Management Routes (الموازنات)
+const budgetRoutes_1 = __importDefault(require("./routes/budgetRoutes"));
+app.use('/api/budgets', budgetRoutes_1.default);
+// Subscription / Recurring Invoices Routes (الاشتراكات)
+const subscriptionRoutes_1 = __importDefault(require("./routes/subscriptionRoutes"));
+app.use('/api/subscriptions', subscriptionRoutes_1.default);
+// Financial Reports Routes (التقارير المالية المتقدمة)
+const financialReportRoutes_1 = __importDefault(require("./routes/financialReportRoutes"));
+app.use('/api/financial-reports', financialReportRoutes_1.default);
 // WhatsApp Integration Routes (تكامل واتساب)
 const whatsappRoutes_2 = __importDefault(require("./routes/whatsappRoutes"));
 app.use('/api/whatsapp', whatsappRoutes_2.default);
+// Phase 4 — Operational Modules (الوحدات التشغيلية)
+const deliveryNoteRoutes_1 = __importDefault(require("./routes/deliveryNoteRoutes"));
+app.use('/api/delivery-notes', deliveryNoteRoutes_1.default);
+const purchaseReceiptRoutes_1 = __importDefault(require("./routes/purchaseReceiptRoutes"));
+app.use('/api/purchase-receipts', purchaseReceiptRoutes_1.default);
+const projectRoutes_1 = __importDefault(require("./routes/projectRoutes"));
+app.use('/api/projects', projectRoutes_1.default);
+const contractRoutes_1 = __importDefault(require("./routes/contractRoutes"));
+app.use('/api/contracts', contractRoutes_1.default);
+const campaignRoutes_1 = __importDefault(require("./routes/campaignRoutes"));
+app.use('/api/campaigns', campaignRoutes_1.default);
 // ==========================================
 // DASHBOARD KPIs — Server-computed aggregates
 // Replaces loading 100K journals into browser for KPI calculation
@@ -811,13 +938,13 @@ app.get('/api/dashboard-kpis', authMiddleware_1.authenticateToken, (req, res) =>
                     SELECT accountId, SUM(COALESCE(debit, 0)) - SUM(COALESCE(credit, 0)) as netDebit
                     FROM journal_lines GROUP BY accountId
                 ) m ON m.accountId = a.id
-                WHERE a.code LIKE '101%' OR a.code LIKE '102%' OR a.code LIKE '106%' OR a.code LIKE '107%'
+                WHERE (a.code LIKE '101%' OR a.code LIKE '102%' OR a.code LIKE '106%' OR a.code LIKE '107%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND (a.name LIKE '%صندوق%' OR a.name LIKE '%خزينة%' OR a.name LIKE '%نقدية%' OR a.name LIKE '%بنك%')))
             `),
             // Net Profit: JOIN-based aggregation (avoids N+1 correlated subqueries)
             conn.query(`
                 SELECT
-                    COALESCE(SUM(CASE WHEN a.type = 'REVENUE' THEN COALESCE(m.netCredit, 0) ELSE 0 END), 0) as totalRevenue,
-                    COALESCE(SUM(CASE WHEN a.type = 'EXPENSE' THEN COALESCE(m.netDebit, 0) ELSE 0 END), 0) as totalExpenses
+                    COALESCE(SUM(CASE WHEN a.type = 'REVENUE' OR a.code LIKE '4%' THEN COALESCE(m.netCredit, 0) ELSE 0 END), 0) as totalRevenue,
+                    COALESCE(SUM(CASE WHEN a.type = 'EXPENSE' OR a.code LIKE '5%' THEN COALESCE(m.netDebit, 0) ELSE 0 END), 0) as totalExpenses
                 FROM accounts a
                 LEFT JOIN (
                     SELECT accountId,
@@ -825,7 +952,7 @@ app.get('/api/dashboard-kpis', authMiddleware_1.authenticateToken, (req, res) =>
                         SUM(COALESCE(credit, 0)) - SUM(COALESCE(debit, 0)) as netCredit
                     FROM journal_lines GROUP BY accountId
                 ) m ON m.accountId = a.id
-                WHERE a.type IN ('REVENUE', 'EXPENSE')
+                WHERE a.type IN ('REVENUE', 'EXPENSE') OR a.code LIKE '4%' OR a.code LIKE '5%'
             `),
             // Today's Sales
             conn.query(`
@@ -985,9 +1112,9 @@ app.get('/api/init', (req, res) => __awaiter(void 0, void 0, void 0, function* (
             // System Config
             safeQuery(`SELECT * FROM system_config LIMIT 1`),
             // Users — fallback drops newer columns
-            safeQuery(`SELECT id, name, email, username, role, status, permissions, lastLogin, avatar, salesmanId, preferences, isHidden FROM users WHERE isHidden = FALSE OR isHidden IS NULL`, `SELECT id, name, email, username, role, status, permissions, lastLogin, avatar FROM users`),
+            safeQuery(`SELECT id, name, email, username, plain_password, role, status, permissions, lastLogin, avatar, salesmanId, preferences, branchId, defaultTreasuryId, warehouseId, isHidden FROM users WHERE isHidden = FALSE OR isHidden IS NULL`, `SELECT id, name, email, username, role, status, permissions, lastLogin, avatar FROM users`),
             // Permissions
-            safeQuery(`SELECT id, name, module, description FROM permissions ORDER BY module`),
+            safeQuery(`SELECT id, label, module FROM permissions ORDER BY module`),
             // Branches — table might not exist
             safeQuery(`SELECT id, name, code, isActive FROM branches ORDER BY name`),
             // Warehouses — table might not exist
@@ -1009,6 +1136,17 @@ app.get('/api/init', (req, res) => __awaiter(void 0, void 0, void 0, function* (
             }
             else if (row.config && typeof row.config === 'object') {
                 additionalConfig = row.config;
+            }
+            // Handle double-encoded legacy format: config column may contain
+            // {"config": "{\"modules\":{...}}", ...} where the inner config is
+            // itself a JSON string that needs a second parse.
+            if (additionalConfig.config && typeof additionalConfig.config === 'string') {
+                try {
+                    const nested = JSON.parse(additionalConfig.config);
+                    additionalConfig = Object.assign(Object.assign({}, additionalConfig), nested);
+                    delete additionalConfig.config;
+                }
+                catch (e) { /* ignore */ }
             }
             config = Object.assign(Object.assign({}, additionalConfig), { companyName: row.companyName, companyAddress: row.companyAddress, companyPhone: row.companyPhone, companyEmail: row.companyEmail, taxId: row.taxId, commercialRegister: row.commercialRegister, currency: row.currency, vatRate: row.vatRate, modules: Object.assign({ sales: true, purchase: true, inventory: true, accounting: true, treasury: true, banks: true, partners: true, manufacturing: true, hr: true }, additionalConfig.modules) });
         }
@@ -1047,17 +1185,63 @@ app.get('/api/init', (req, res) => __awaiter(void 0, void 0, void 0, function* (
 // ========================================
 // CHAT API (persistent team chat - دردشة الفريق)
 // ========================================
+// Helper to parse JSON fields safely
+function parseJSONField(field, defaultValue) {
+    if (field === null || field === undefined)
+        return defaultValue;
+    if (typeof field === 'object')
+        return field;
+    try {
+        return typeof field === 'string' ? JSON.parse(field) : field;
+    }
+    catch (_a) {
+        return defaultValue;
+    }
+}
+// Multer configuration for chat file uploads
+const chatUploadDir = path_1.default.join(uploadsPath, 'chat');
+if (!fs_1.default.existsSync(chatUploadDir))
+    fs_1.default.mkdirSync(chatUploadDir, { recursive: true });
+const chatStorage = multer_1.default.diskStorage({
+    destination: (_req, _file, cb) => cb(null, chatUploadDir),
+    filename: (_req, file, cb) => {
+        const ext = path_1.default.extname(file.originalname);
+        cb(null, `chat-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+    },
+});
+const chatUpload = (0, multer_1.default)({
+    storage: chatStorage,
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
+    fileFilter: (_req, file, cb) => {
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
+        cb(null, allowedTypes.includes(file.mimetype));
+    },
+});
+// File upload endpoint for chat attachments
+app.post('/api/chat/upload', chatUpload.single('file'), (req, res) => {
+    if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded or invalid file format' });
+    }
+    const type = req.file.mimetype.startsWith('image/') ? 'image' : 'pdf';
+    res.json({
+        url: `/uploads/chat/${req.file.filename}`,
+        type,
+        name: req.file.originalname,
+        size: req.file.size
+    });
+});
 // Get public messages (last 200)
 app.get('/api/chat/messages', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
-        const [rows] = yield pool.query(`SELECT id, userId, userName, message, type, targetUserId, timestamp 
+        const [rows] = yield pool.query(`SELECT id, userId, userName, message, type, targetUserId, reactions, replyTo, attachment, timestamp, readReceipts, editedAt, isPinned, pinnedAt, pinnedBy 
              FROM chat_messages 
              WHERE type != 'private'
              ORDER BY timestamp DESC 
              LIMIT 200`);
-        // Return in chronological order
-        res.json({ messages: rows.reverse() });
+        // Return in chronological order and parse JSON columns
+        const mapped = rows.map((m) => (Object.assign(Object.assign({}, m), { reactions: parseJSONField(m.reactions, {}), readReceipts: parseJSONField(m.readReceipts, {}), replyTo: parseJSONField(m.replyTo, null), attachment: parseJSONField(m.attachment, null) })));
+        res.json({ messages: mapped.reverse() });
     }
     catch (error) {
         console.error('❌ Chat fetch error:', error.message);
@@ -1071,17 +1255,69 @@ app.get('/api/chat/private/:userId', (req, res) => __awaiter(void 0, void 0, voi
         const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
         const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
         const otherUserId = req.params.userId;
-        const [rows] = yield pool.query(`SELECT id, userId, userName, message, type, targetUserId, timestamp 
+        const [rows] = yield pool.query(`SELECT id, userId, userName, message, type, targetUserId, reactions, replyTo, attachment, timestamp, readReceipts, editedAt, isPinned, pinnedAt, pinnedBy 
              FROM chat_messages 
              WHERE type = 'private'
                AND ((userId = ? AND targetUserId = ?) OR (userId = ? AND targetUserId = ?))
              ORDER BY timestamp DESC 
              LIMIT 100`, [currentUserId, otherUserId, otherUserId, currentUserId]);
-        res.json({ messages: rows.reverse() });
+        // Return in chronological order and parse JSON columns
+        const mapped = rows.map((m) => (Object.assign(Object.assign({}, m), { reactions: parseJSONField(m.reactions, {}), readReceipts: parseJSONField(m.readReceipts, {}), replyTo: parseJSONField(m.replyTo, null), attachment: parseJSONField(m.attachment, null) })));
+        res.json({ messages: mapped.reverse() });
     }
     catch (error) {
         console.error('❌ Private chat fetch error:', error.message);
         res.json({ messages: [] });
+    }
+}));
+// Clear messages in a chat (public, private, or group)
+app.delete('/api/chat/messages/clear', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const currentUserRole = (((_b = req.user) === null || _b === void 0 ? void 0 : _b.role) || '').toUpperCase();
+        const isAdmin = currentUserRole === 'ADMIN' || currentUserRole === 'SUPERADMIN';
+        const chatMode = req.query.chatMode;
+        const targetId = req.query.targetId;
+        if (chatMode === 'public') {
+            if (isAdmin) {
+                yield pool.query("DELETE FROM chat_messages WHERE type != 'private' AND type != 'group'");
+            }
+            else {
+                yield pool.query("DELETE FROM chat_messages WHERE type != 'private' AND type != 'group' AND userId = ?", [currentUserId]);
+            }
+        }
+        else if (chatMode === 'private') {
+            if (!targetId) {
+                return res.status(400).json({ error: 'targetId is required for private chat clear' });
+            }
+            if (isAdmin) {
+                yield pool.query("DELETE FROM chat_messages WHERE type = 'private' AND ((userId = ? AND targetUserId = ?) OR (userId = ? AND targetUserId = ?))", [currentUserId, targetId, targetId, currentUserId]);
+            }
+            else {
+                yield pool.query("DELETE FROM chat_messages WHERE type = 'private' AND userId = ? AND targetUserId = ?", [currentUserId, targetId]);
+            }
+        }
+        else if (chatMode === 'group') {
+            if (!targetId) {
+                return res.status(400).json({ error: 'targetId is required for group chat clear' });
+            }
+            if (isAdmin) {
+                yield pool.query("DELETE FROM chat_messages WHERE type = 'group' AND groupId = ?", [targetId]);
+            }
+            else {
+                yield pool.query("DELETE FROM chat_messages WHERE type = 'group' AND groupId = ? AND userId = ?", [targetId, currentUserId]);
+            }
+        }
+        else {
+            return res.status(400).json({ error: 'Invalid chatMode' });
+        }
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('❌ Chat clear error:', error.message);
+        res.status(500).json({ error: 'Failed to clear chat messages' });
     }
 }));
 // Delete a message (own messages only)
@@ -1098,16 +1334,317 @@ app.delete('/api/chat/messages/:id', (req, res) => __awaiter(void 0, void 0, voi
         res.status(500).json({ error: 'Failed to delete' });
     }
 }));
+// Mark messages in a chat as read
+app.post('/api/chat/read', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const { chatMode, targetId } = req.body;
+        if (!chatMode || !targetId) {
+            return res.status(400).json({ error: 'chatMode and targetId are required' });
+        }
+        const now = new Date().toISOString();
+        const jsonPath = `$."${currentUserId}"`;
+        if (chatMode === 'private') {
+            yield pool.query(`UPDATE chat_messages 
+                 SET readReceipts = JSON_SET(COALESCE(readReceipts, '{}'), ?, ?) 
+                 WHERE type = 'private' 
+                   AND userId = ? 
+                   AND targetUserId = ? 
+                   AND (readReceipts IS NULL OR JSON_EXTRACT(readReceipts, ?) IS NULL)`, [jsonPath, now, targetId, currentUserId, jsonPath]);
+        }
+        else if (chatMode === 'group') {
+            yield pool.query(`UPDATE chat_messages 
+                 SET readReceipts = JSON_SET(COALESCE(readReceipts, '{}'), ?, ?) 
+                 WHERE type = 'group' 
+                   AND groupId = ? 
+                   AND userId != ?
+                   AND (readReceipts IS NULL OR JSON_EXTRACT(readReceipts, ?) IS NULL)`, [jsonPath, now, targetId, currentUserId, jsonPath]);
+        }
+        // Broadcast read receipt event
+        const { eventBus } = yield Promise.resolve().then(() => __importStar(require('./utils/eventBus')));
+        eventBus.broadcast('chat:read', {
+            chatMode,
+            targetId,
+            userId: currentUserId,
+            readTime: now,
+            targetUserId: chatMode === 'private' ? targetId : undefined,
+            messageSenderId: currentUserId
+        });
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('❌ Chat read receipt error:', error.message);
+        res.status(500).json({ error: 'Failed to mark messages as read' });
+    }
+}));
+// Edit a message (own messages only, within 15 minutes, until someone replies)
+app.put('/api/chat/messages/:id', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const messageId = req.params.id;
+        const { message } = req.body;
+        if (!message || !message.trim()) {
+            return res.status(400).json({ error: 'Message text is required' });
+        }
+        // Fetch existing message to validate ownership & time limit
+        const [rows] = yield pool.query('SELECT userId, type, targetUserId, groupId, timestamp FROM chat_messages WHERE id = ?', [messageId]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Message not found' });
+        }
+        const msg = rows[0];
+        if (msg.userId !== currentUserId) {
+            return res.status(403).json({ error: 'Cannot edit another user\'s message' });
+        }
+        // 15-minute time limit check
+        const elapsed = Date.now() - new Date(msg.timestamp).getTime();
+        if (elapsed > 15 * 60 * 1000) {
+            return res.status(400).json({ error: 'Messages can only be edited within 15 minutes' });
+        }
+        // Check if there are any subsequent messages in the conversation (until replies)
+        let checkReplySql = '';
+        let checkParams = [];
+        if (msg.type === 'private') {
+            checkReplySql = `
+                SELECT COUNT(*) as count FROM chat_messages 
+                WHERE type = 'private' 
+                  AND ((userId = ? AND targetUserId = ?) OR (userId = ? AND targetUserId = ?)) 
+                  AND timestamp > ?`;
+            checkParams = [currentUserId, msg.targetUserId, msg.targetUserId, currentUserId, msg.timestamp];
+        }
+        else if (msg.type === 'group') {
+            checkReplySql = `
+                SELECT COUNT(*) as count FROM chat_messages 
+                WHERE type = 'group' 
+                  AND groupId = ? 
+                  AND timestamp > ?`;
+            checkParams = [msg.groupId, msg.timestamp];
+        }
+        else {
+            checkReplySql = `
+                SELECT COUNT(*) as count FROM chat_messages 
+                WHERE type = 'message' 
+                  AND timestamp > ?`;
+            checkParams = [msg.timestamp];
+        }
+        const [replyRows] = yield pool.query(checkReplySql, checkParams);
+        if (((_b = replyRows[0]) === null || _b === void 0 ? void 0 : _b.count) > 0) {
+            return res.status(400).json({ error: 'Cannot edit message after replies have been sent' });
+        }
+        const editedAt = new Date();
+        yield pool.query('UPDATE chat_messages SET message = ?, editedAt = ? WHERE id = ?', [message.trim(), editedAt, messageId]);
+        // Broadcast the edit event
+        const { eventBus } = yield Promise.resolve().then(() => __importStar(require('./utils/eventBus')));
+        eventBus.broadcast('chat:edit', {
+            messageId,
+            message: message.trim(),
+            editedAt: editedAt.toISOString(),
+            type: msg.type,
+            targetUserId: msg.targetUserId,
+            messageSenderId: msg.userId,
+            groupId: msg.groupId
+        });
+        res.json({ success: true, editedAt });
+    }
+    catch (error) {
+        console.error('❌ Chat edit error:', error.message);
+        res.status(500).json({ error: 'Failed to edit message' });
+    }
+}));
+// Pin a message
+app.post('/api/chat/messages/:id/pin', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'مستخدم';
+        const messageId = req.params.id;
+        // Fetch existing message
+        const [rows] = yield pool.query('SELECT userId, type, targetUserId, groupId FROM chat_messages WHERE id = ?', [messageId]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Message not found' });
+        }
+        const msg = rows[0];
+        const pinnedAt = new Date();
+        yield pool.query('UPDATE chat_messages SET isPinned = TRUE, pinnedAt = ?, pinnedBy = ? WHERE id = ?', [pinnedAt, userName, messageId]);
+        // Broadcast pin event
+        const { eventBus } = yield Promise.resolve().then(() => __importStar(require('./utils/eventBus')));
+        eventBus.broadcast('chat:pin', {
+            messageId,
+            isPinned: true,
+            pinnedBy: userName,
+            pinnedAt: pinnedAt.toISOString(),
+            type: msg.type,
+            groupId: msg.groupId,
+            targetUserId: msg.targetUserId,
+            messageSenderId: msg.userId
+        });
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('❌ Chat pin error:', error.message);
+        res.status(500).json({ error: 'Failed to pin message' });
+    }
+}));
+// Unpin a message
+app.delete('/api/chat/messages/:id/pin', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const messageId = req.params.id;
+        const [rows] = yield pool.query('SELECT userId, type, targetUserId, groupId FROM chat_messages WHERE id = ?', [messageId]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Message not found' });
+        }
+        const msg = rows[0];
+        yield pool.query('UPDATE chat_messages SET isPinned = FALSE, pinnedAt = NULL, pinnedBy = NULL WHERE id = ?', [messageId]);
+        // Broadcast unpin event
+        const { eventBus } = yield Promise.resolve().then(() => __importStar(require('./utils/eventBus')));
+        eventBus.broadcast('chat:pin', {
+            messageId,
+            isPinned: false,
+            type: msg.type,
+            groupId: msg.groupId,
+            targetUserId: msg.targetUserId,
+            messageSenderId: msg.userId
+        });
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('❌ Chat unpin error:', error.message);
+        res.status(500).json({ error: 'Failed to unpin message' });
+    }
+}));
+// Get all groups for current user (plus sync auto-groups first)
+app.get('/api/chat/groups', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const { pool, syncBranchChatGroups } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        if (!currentUserId)
+            return res.status(401).json({ error: 'Unauthorized' });
+        // Ensure branch groups and memberships are synced
+        yield syncBranchChatGroups();
+        // Query all groups the user is a member of
+        const [groups] = yield pool.query(`SELECT g.id, g.name, g.description, g.type, g.branchId, g.createdBy, g.createdAt 
+             FROM chat_groups g
+             JOIN chat_group_members m ON g.id = m.groupId
+             WHERE m.userId = ?
+             ORDER BY g.type = 'GLOBAL' DESC, g.type = 'BRANCH' DESC, g.name ASC`, [currentUserId]);
+        res.json({ groups });
+    }
+    catch (error) {
+        console.error('❌ Chat groups fetch error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch groups' });
+    }
+}));
+// Create a custom chat group
+app.post('/api/chat/groups', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const currentUserName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'User';
+        const { name, description, userIds } = req.body;
+        if (!(name === null || name === void 0 ? void 0 : name.trim())) {
+            return res.status(400).json({ error: 'Group name is required' });
+        }
+        const groupId = `custom-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+        // Use connection for transaction
+        const conn = yield pool.getConnection();
+        try {
+            yield conn.beginTransaction();
+            // Insert group
+            yield conn.query(`INSERT INTO chat_groups (id, name, description, type, createdBy) 
+                 VALUES (?, ?, ?, 'CUSTOM', ?)`, [groupId, name.trim(), description || null, currentUserName]);
+            // Add members (creator + selected users)
+            const membersToInsert = Array.from(new Set([currentUserId, ...(userIds || [])]));
+            for (const memberId of membersToInsert) {
+                if (memberId) {
+                    yield conn.query(`INSERT INTO chat_group_members (groupId, userId) VALUES (?, ?)`, [groupId, memberId]);
+                }
+            }
+            yield conn.commit();
+            // Fetch the created group to return it
+            const [grpRows] = yield conn.query(`SELECT id, name, description, type, branchId, createdBy, createdAt FROM chat_groups WHERE id = ?`, [groupId]);
+            res.status(201).json({ success: true, group: grpRows[0] });
+        }
+        catch (txErr) {
+            yield conn.rollback();
+            throw txErr;
+        }
+        finally {
+            conn.release();
+        }
+    }
+    catch (error) {
+        console.error('❌ Group creation error:', error.message);
+        res.status(500).json({ error: 'Failed to create group' });
+    }
+}));
+// Get messages for a specific group (only if user is a member)
+app.get('/api/chat/groups/:groupId/messages', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const { groupId } = req.params;
+        // Verify membership first
+        const [membership] = yield pool.query(`SELECT 1 FROM chat_group_members WHERE groupId = ? AND userId = ?`, [groupId, currentUserId]);
+        if (membership.length === 0) {
+            return res.status(403).json({ error: 'You are not a member of this group' });
+        }
+        // Fetch last 150 group messages
+        const [messages] = yield pool.query(`SELECT id, userId, userName, message, type, groupId, reactions, replyTo, attachment, timestamp, readReceipts, editedAt, isPinned, pinnedAt, pinnedBy 
+             FROM chat_messages 
+             WHERE type = 'group' AND groupId = ?
+             ORDER BY timestamp DESC
+             LIMIT 150`, [groupId]);
+        // Parse JSON columns safely
+        const mapped = messages.map((m) => (Object.assign(Object.assign({}, m), { reactions: parseJSONField(m.reactions, {}), readReceipts: parseJSONField(m.readReceipts, {}), replyTo: parseJSONField(m.replyTo, null), attachment: parseJSONField(m.attachment, null) })));
+        res.json({ messages: mapped.reverse() });
+    }
+    catch (error) {
+        console.error('❌ Group messages fetch error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch messages' });
+    }
+}));
+// Get list of members in a group
+app.get('/api/chat/groups/:groupId/members', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const currentUserId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const { groupId } = req.params;
+        // Verify membership first
+        const [membership] = yield pool.query(`SELECT 1 FROM chat_group_members WHERE groupId = ? AND userId = ?`, [groupId, currentUserId]);
+        if (membership.length === 0) {
+            return res.status(403).json({ error: 'You are not a member of this group' });
+        }
+        // Fetch users in the group (excluding password and sensitive fields)
+        const [members] = yield pool.query(`SELECT u.id, u.name, u.email, u.username, u.role, u.avatar 
+             FROM users u
+             JOIN chat_group_members m ON u.id = m.userId
+             WHERE m.groupId = ? AND (u.isHidden = FALSE OR u.isHidden IS NULL)
+             ORDER BY u.name ASC`, [groupId]);
+        res.json({ members });
+    }
+    catch (error) {
+        console.error('❌ Group members fetch error:', error.message);
+        res.status(500).json({ error: 'Failed to fetch members' });
+    }
+}));
 // Serve static frontend files (production build)
 // Check multiple possible locations for the frontend build:
 // 1. Root-level dist (when running with ts-node from server/)
 // 2. Root-level dist (when running compiled JS from server/dist/server/)
 // 3. Fallback to build folder for legacy packages
-const fs = require('fs');
 // Robust frontend path resolution
 const findFrontendPath = () => {
     // 1. Allow env var override
-    if (process.env.FRONTEND_PATH && fs.existsSync(path_1.default.join(process.env.FRONTEND_PATH, 'index.html'))) {
+    if (process.env.FRONTEND_PATH && fs_1.default.existsSync(path_1.default.join(process.env.FRONTEND_PATH, 'index.html'))) {
         return process.env.FRONTEND_PATH;
     }
     const searchPaths = [
@@ -1129,8 +1666,8 @@ const findFrontendPath = () => {
     for (const p of searchPaths) {
         const testPath = path_1.default.resolve(p);
         const indexPath = path_1.default.join(testPath, 'index.html');
-        console.log(`   Checking: ${indexPath} → ${fs.existsSync(indexPath) ? '✅ FOUND' : '❌'}`);
-        if (fs.existsSync(indexPath)) {
+        console.log(`   Checking: ${indexPath} → ${fs_1.default.existsSync(indexPath) ? '✅ FOUND' : '❌'}`);
+        if (fs_1.default.existsSync(indexPath)) {
             console.log(`✅ Found frontend at: ${testPath}`);
             return testPath;
         }
@@ -1148,7 +1685,7 @@ console.log(`📂 Serving frontend from: ${frontendPath}`);
 // in the 404 handler to prevent caching 404s for 1 year!)
 // ==========================================
 app.use((req, res, next) => {
-    if (req.path.endsWith('.html') || req.path === '/') {
+    if (req.path.endsWith('.html') || req.path === '/' || req.path.startsWith('/sites/')) {
         res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
         res.setHeader('Pragma', 'no-cache');
         res.setHeader('Expires', '0');
@@ -1167,10 +1704,116 @@ app.use((req, res, next) => {
     }
     next();
 });
-app.use(express_1.default.static(frontendPath, {
-    etag: true,
-    lastModified: true,
-    maxAge: 0 // Per-path caching is handled by the middleware above
+app.use('/uploads', express_1.default.static(uploadsPath));
+// Serve storefronts with server-side SEO pre-rendering for HTML routes
+app.get(['/sites/:slug', '/sites/:slug/', '/sites/:slug/index.html'], (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    const slug = req.params.slug;
+    if (slug === '_template') {
+        return next();
+    }
+    const configPath = path_1.default.join(sitesPath, slug, 'config.json');
+    const indexPath = path_1.default.join(sitesPath, slug, 'index.html');
+    if (fs_1.default.existsSync(indexPath) && fs_1.default.existsSync(configPath)) {
+        try {
+            let html = fs_1.default.readFileSync(indexPath, 'utf8');
+            const config = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
+            const seoTitle = ((_a = config.seo) === null || _a === void 0 ? void 0 : _a.title) || config.brandName || 'Store';
+            const seoDesc = ((_b = config.seo) === null || _b === void 0 ? void 0 : _b.description) || config.tagline || '';
+            const logoUrl = config.logoUrl || '';
+            const host = req.get('host') || '';
+            const protocol = req.protocol || 'http';
+            const fullLogoUrl = logoUrl ? (logoUrl.startsWith('http') ? logoUrl : `${protocol}://${host}${logoUrl}`) : '';
+            // Inject SEO tags
+            html = html.replace('<title>Loading...</title>', `<title>${seoTitle}</title>`);
+            const metaTags = `
+    <meta name="description" content="${seoDesc}">
+    <meta property="og:title" content="${seoTitle}">
+    <meta property="og:description" content="${seoDesc}">
+    <meta property="og:image" content="${fullLogoUrl}">
+    <meta property="og:type" content="website">
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:title" content="${seoTitle}">
+    <meta name="twitter:description" content="${seoDesc}">
+    <meta name="twitter:image" content="${fullLogoUrl}">
+            `;
+            html = html.replace('</head>', `${metaTags}\n</head>`);
+            res.setHeader('Content-Type', 'text/html');
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            return res.send(html);
+        }
+        catch (err) {
+            console.error(`❌ Failed to inject SEO tags for site ${slug}:`, err.message);
+            return res.sendFile(indexPath);
+        }
+    }
+    next();
+}));
+app.use('/sites', express_1.default.static(sitesPath));
+// ── Site Customization API ───────────────────────────────────────────
+const siteUploadStorage = multer_1.default.diskStorage({
+    destination: (req, file, cb) => {
+        const rawSlug = req.params.slug;
+        const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+        const dest = path_1.default.join(sitesPath, slug);
+        if (!fs_1.default.existsSync(dest)) {
+            fs_1.default.mkdirSync(dest, { recursive: true });
+        }
+        cb(null, dest);
+    },
+    filename: (req, file, cb) => {
+        const ext = path_1.default.extname(file.originalname).toLowerCase();
+        cb(null, `logo${ext}`);
+    }
+});
+const siteUpload = (0, multer_1.default)({ storage: siteUploadStorage });
+app.post('/api/sites/:slug/logo', authMiddleware_1.authenticateToken, siteUpload.single('logo'), (req, res) => {
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+    }
+    const relativeUrl = `/sites/${slug}/${req.file.filename}`;
+    const configPath = path_1.default.join(sitesPath, slug, 'config.json');
+    if (fs_1.default.existsSync(configPath)) {
+        try {
+            const config = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
+            config.logoUrl = relativeUrl;
+            fs_1.default.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
+        }
+        catch (e) {
+            console.error('Failed to update config.json logoUrl:', e.message);
+        }
+    }
+    res.json({ success: true, logoUrl: relativeUrl });
+});
+app.post('/api/sites/:slug/config', authMiddleware_1.authenticateToken, (req, res) => {
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const configPath = path_1.default.join(sitesPath, slug, 'config.json');
+    if (!fs_1.default.existsSync(configPath)) {
+        return res.status(404).json({ error: `Config not found for site ${slug}` });
+    }
+    try {
+        const currentConfig = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
+        const newConfig = Object.assign(Object.assign({}, currentConfig), req.body);
+        fs_1.default.writeFileSync(configPath, JSON.stringify(newConfig, null, 2), 'utf8');
+        res.json({ success: true, config: newConfig });
+    }
+    catch (err) {
+        res.status(500).json({ error: `Failed to save config: ${err.message}` });
+    }
+});
+// Serve pre-compressed .br/.gz files when available (built by vite-plugin-compression2)
+// Falls back to raw files + dynamic compression() middleware for uncompressed assets
+app.use((0, express_static_gzip_1.default)(frontendPath, {
+    enableBrotli: true,
+    orderPreference: ['br', 'gzip'],
+    serveStatic: {
+        etag: true,
+        lastModified: true,
+        maxAge: 0 // Per-path caching is handled by the middleware above
+    }
 }));
 // Debug endpoint removed for production security (C7)
 // Handle SPA routing - send all non-API requests to index.html
@@ -1194,6 +1837,8 @@ app.get('*', (req, res) => {
     }
     res.sendFile(path_1.default.join(frontendPath, 'index.html'));
 });
+// Register global error handler after all routes
+app.use(errorHandler_1.handleGlobalErrors);
 // ============================================================
 // SERVER STARTUP
 // Always starts directly — no supervisor fork.

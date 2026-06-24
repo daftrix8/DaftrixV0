@@ -37,12 +37,17 @@ function responseCache(entityType, ttlMs = DEFAULT_TTL, keyFn) {
                 }
             }
         };
+        const affectsAccounts = ['journal', 'journals', 'invoice', 'invoices', 'cheque', 'cheques'];
         eventBus_1.eventBus.on('entity:changed', (data) => {
             if ((data === null || data === void 0 ? void 0 : data.entityType) === entityType)
+                invalidate();
+            if (entityType === 'accounts' && affectsAccounts.includes(data === null || data === void 0 ? void 0 : data.entityType))
                 invalidate();
         });
         eventBus_1.eventBus.on('entity:deleted', (data) => {
             if ((data === null || data === void 0 ? void 0 : data.entityType) === entityType)
+                invalidate();
+            if (entityType === 'accounts' && affectsAccounts.includes(data === null || data === void 0 ? void 0 : data.entityType))
                 invalidate();
         });
     }

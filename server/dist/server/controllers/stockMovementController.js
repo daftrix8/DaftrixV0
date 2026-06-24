@@ -154,9 +154,12 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                     il.quantity,
                     COALESCE(il.bonusQty, 0) as bonusQty,
                     COALESCE(il.warehouseId, i.warehouseId) as docWarehouseId,
-                    il.returnCondition
+                    il.returnCondition,
+                    il.variantId,
+                    pv.name as variantName
                 FROM invoice_lines il
                 JOIN invoices i ON il.invoiceId = i.id
+                LEFT JOIN product_variants pv ON il.variantId = pv.id
                 WHERE il.productId = ? 
                   AND i.status IN ('POSTED', 'COMPLETED', 'PARTIAL') 
                   AND i.number NOT LIKE 'VAN-%'
@@ -195,9 +198,12 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                     i.notes,
                     il.quantity,
                     COALESCE(il.bonusQty, 0) as bonusQty,
-                    COALESCE(il.warehouseId, i.warehouseId) as docWarehouseId
+                    COALESCE(il.warehouseId, i.warehouseId) as docWarehouseId,
+                    il.variantId,
+                    pv.name as variantName
                 FROM invoice_lines il
                 JOIN invoices i ON il.invoiceId = i.id
+                LEFT JOIN product_variants pv ON il.variantId = pv.id
                 WHERE il.productId = ? 
                   AND i.status IN ('POSTED', 'COMPLETED', 'PARTIAL') 
                   AND i.number NOT LIKE 'VAN-%'
@@ -222,9 +228,6 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
             const [rows] = yield db_1.pool.query(fallbackQuery, fallbackParams);
             invoiceRows = rows;
         }
-        // 2. Stock Permits are now tracked via stock_movements table
-        // (stockPermitController creates stock_movements entries when permits are saved)
-        // The permitRows query was removed to prevent double-counting
         // 2. Fetch Stock Movements (Invoices, Production, Adjustments, Opening Balances, etc.)
         // This includes ALL stock changes - invoices now write here via invoiceController
         let stockMovementQuery = `
@@ -237,8 +240,11 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 COALESCE(sm.notes, CONCAT(sm.movement_type, '-', sm.id)) as docNumber,
                 sm.notes as description,
                 sm.qty_change,
-                sm.warehouse_id
+                sm.warehouse_id,
+                sm.variant_id as variantId,
+                pv.name as variantName
             FROM stock_movements sm
+            LEFT JOIN product_variants pv ON sm.variant_id = pv.id
             WHERE sm.product_id = ?
               AND (sm.reference_type IS NULL OR sm.reference_type NOT IN ('BALANCE_SYNC', 'SYSTEM_ADJUSTMENT'))
         `;
@@ -321,7 +327,9 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 sourceWarehouse: null,
                 destWarehouse: null,
                 transferQty: 0,
-                returnCondition: row.returnCondition || null
+                returnCondition: row.returnCondition || null,
+                variantId: row.variantId || null,
+                variantName: row.variantName || null
             });
         });
         // 3. Fetch HISTORICAL Stock Permits (those NOT already in stock_movements)
@@ -336,9 +344,12 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 sp.description as permitDescription,
                 spi.productId,
                 spi.productName,
-                spi.quantity
+                spi.quantity,
+                spi.variantId,
+                pv.name as variantName
             FROM stock_permits sp
             JOIN stock_permit_items spi ON sp.id = spi.permitId
+            LEFT JOIN product_variants pv ON spi.variantId = pv.id
             WHERE spi.productId = ?
               AND NOT EXISTS (
                   SELECT 1 FROM stock_movements sm 
@@ -348,6 +359,10 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
               )
         `;
         const permitParams = [productId];
+        if (variantId) {
+            permitQuery += ' AND spi.variantId = ?';
+            permitParams.push(variantId);
+        }
         if (warehouseId) {
             permitQuery += ' AND (sp.sourceWarehouseId = ? OR sp.destWarehouseId = ?)';
             permitParams.push(warehouseId, warehouseId);
@@ -407,7 +422,9 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 warehouseId: whId,
                 warehouseName: warehouseName,
                 sourceWarehouse,
-                destWarehouse
+                destWarehouse,
+                variantId: row.variantId || null,
+                variantName: row.variantName || null
             });
         });
         // Process Stock Movements (Production, Adjustments, Opening Balances)
@@ -527,7 +544,9 @@ const getProductMovementHistory = (req, res) => __awaiter(void 0, void 0, void 0
                 warehouseName: warehouseName,
                 sourceWarehouse: null,
                 destWarehouse: null,
-                returnCondition
+                returnCondition,
+                variantId: row.variantId || null,
+                variantName: row.variantName || null
             });
         });
         // Sort: Oldest First to calculate running balance

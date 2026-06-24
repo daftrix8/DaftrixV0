@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const subscriptionController_1 = require("../controllers/subscriptionController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const router = (0, express_1.Router)();
+router.get('/', (0, authMiddleware_1.requirePermission)('accounting.view'), subscriptionController_1.getSubscriptions);
+router.get('/due', (0, authMiddleware_1.requirePermission)('accounting.manage'), subscriptionController_1.getDueSubscriptions);
+router.post('/', (0, authMiddleware_1.requirePermission)('accounting.manage'), subscriptionController_1.createSubscription);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('accounting.manage'), subscriptionController_1.updateSubscription);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('accounting.manage'), subscriptionController_1.deleteSubscription);
+router.post('/:subscriptionId/generate-invoice', (0, authMiddleware_1.requirePermission)('invoices.create'), subscriptionController_1.generateSubscriptionInvoice);
+exports.default = router;

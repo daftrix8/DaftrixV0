@@ -35,7 +35,7 @@ const requireAdminForEditDelete = (req, res, next) => __awaiter(void 0, void 0, 
             const { getConnection } = require('../db');
             const conn = yield getConnection();
             try {
-                const [rows] = yield conn.query('SELECT type FROM permits WHERE id = ? LIMIT 1', [req.params.id]);
+                const [rows] = yield conn.query('SELECT type FROM stock_permits WHERE id = ? LIMIT 1', [req.params.id]);
                 permitType = (_d = rows[0]) === null || _d === void 0 ? void 0 : _d.type;
             }
             finally {

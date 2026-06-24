@@ -23,23 +23,8 @@ const invoiceNumberGenerator_1 = require("../utils/invoiceNumberGenerator");
 const decimalUtils_1 = require("../utils/decimalUtils");
 const policyEnforcement_1 = require("../utils/policyEnforcement");
 const index_1 = require("../index");
-// Helper function to convert ISO datetime to MySQL format
-const toMySQLDateTime = (isoDate) => {
-    if (!isoDate)
-        return null;
-    try {
-        if (/^\d{4}-\d{2}-\d{2}$/.test(isoDate)) {
-            // CRITICAL: Append 12:00:00 to prevent timezone-induced day shifting!
-            // Without this, the date will evaluate to 00:00:00 local time. If the server is UTC
-            // or the db timezone differs, it can shift back into the previous day (e.g. 22:00 PM).
-            return `${isoDate} 12:00:00`;
-        }
-        return new Date(isoDate).toISOString().slice(0, 19).replace('T', ' ');
-    }
-    catch (_a) {
-        return null;
-    }
-};
+const dateEngine_1 = require("../utils/dateEngine");
+const paymentGeneration_1 = require("../utils/paymentGeneration");
 // Helper to sanitize ID fields to prevent "Data too long" errors
 // Mobile clients may send IDs longer than the VARCHAR(36) column allows
 const sanitizeId = (value, maxLen = 36) => {
@@ -263,8 +248,71 @@ const checkPermissions = (user, body) => {
             throw new Error('Permission denied: delete journal');
     }
 };
+const resolveSyncCashBankAccount = (conn, bankAccountId) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    if (!bankAccountId)
+        return null;
+    const [accRowsDirect] = yield conn.query('SELECT id, name FROM accounts WHERE id = ? LIMIT 1', [bankAccountId]);
+    if (accRowsDirect[0])
+        return accRowsDirect[0];
+    const [bankRows] = yield conn.query('SELECT accountId FROM banks WHERE id = ? LIMIT 1', [bankAccountId]);
+    const expAccountId = (_a = bankRows[0]) === null || _a === void 0 ? void 0 : _a.accountId;
+    if (expAccountId) {
+        const [expAccRows] = yield conn.query('SELECT id, name FROM accounts WHERE id = ? LIMIT 1', [expAccountId]);
+        if (expAccRows[0])
+            return expAccRows[0];
+    }
+    return null;
+});
 const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w, _x, _y, _z, _0, _1, _2, _3, _4, _5, _6, _7, _8, _9, _10, _11, _12, _13, _14, _15, _16, _17, _18, _19, _20, _21, _22, _23, _24, _25, _26, _27, _28, _29, _30, _31, _32, _33, _34, _35, _36, _37, _38, _39, _40, _41, _42, _43, _44, _45, _46, _47, _48, _49, _50, _51, _52, _53, _54;
+    const currentUser = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
+    const syncInvoiceCashMovement = (conn, inv, posShiftId) => __awaiter(void 0, void 0, void 0, function* () {
+        // Delete existing movement for this invoice
+        yield conn.query('DELETE FROM pos_cash_movements WHERE referenceId = ?', [inv.id]);
+        if (posShiftId && inv.paymentMethod === 'CASH' && inv.status !== 'VOID' && inv.status !== 'DRAFT') {
+            const movementId = (0, crypto_1.randomUUID)();
+            let movementType = 'SALE';
+            if (inv.type === 'INVOICE_SALE' || inv.type === 'SALE_INVOICE') {
+                movementType = 'SALE';
+            }
+            else if (inv.type === 'RETURN_SALE' || inv.type === 'SALE_RETURN') {
+                movementType = 'REFUND';
+            }
+            else if (inv.type === 'INVOICE_PURCHASE' || inv.type === 'PURCHASE_INVOICE') {
+                movementType = 'PURCHASE';
+            }
+            else if (inv.type === 'RETURN_PURCHASE' || inv.type === 'PURCHASE_RETURN') {
+                movementType = 'DEPOSIT';
+            }
+            yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
+                 VALUES (?, ?, ?, ?, ?, ?, 'INVOICE', ?, NOW())`, [
+                movementId,
+                posShiftId,
+                movementType,
+                inv.total,
+                inv.paymentMethod,
+                inv.id,
+                `مزامنة فاتورة ${inv.number || inv.id} - ${inv.partnerName || ''}`
+            ]);
+            try {
+                const { recalculateShiftTotals } = require('./posController');
+                yield recalculateShiftTotals(conn, posShiftId, inv.createdBy || currentUser);
+            }
+            catch (e) {
+                console.error('⚠️ [syncController] Error recalculating shift totals:', e.message);
+            }
+        }
+        else if (posShiftId) {
+            try {
+                const { recalculateShiftTotals } = require('./posController');
+                yield recalculateShiftTotals(conn, posShiftId, inv.createdBy || currentUser);
+            }
+            catch (e) {
+                console.error('⚠️ [syncController] Error recalculating shift totals:', e.message);
+            }
+        }
+    });
     const getStockChange = (line, invType) => {
         const isPurchase = invType === 'PURCHASE_INVOICE' || invType === 'INVOICE_PURCHASE' || invType === 'PURCHASE_RETURN' || invType === 'RETURN_PURCHASE';
         const isSale = invType === 'SALE_INVOICE' || invType === 'INVOICE_SALE' || invType === 'SALE_RETURN' || invType === 'RETURN_SALE';
@@ -388,6 +436,12 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                 productWarehouseStockChanges.delete(key);
         }
         if (productWarehouseStockChanges.size > 0) {
+            // FIX: Delete old stock_movements for this invoice before creating new ones.
+            // Without this, editing an invoice through sync creates DUPLICATE movements
+            // instead of replacing them (invoiceController.updateInvoice already does this).
+            if (inv.id) {
+                yield conn.query('DELETE FROM stock_movements WHERE reference_id = ?', [inv.id]);
+            }
             // Ensure a fallback warehouse exists if any line has no warehouse
             let fallbackWhId = whId;
             if (!fallbackWhId) {
@@ -436,8 +490,8 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                 const effectiveWhId = lineWhId || fallbackWhId;
                 if (!effectiveWhId)
                     continue;
-                yield conn.query(`INSERT INTO product_variant_stocks (variantId, productId, warehouseId, stock)
-                     VALUES (?, ?, ?, ?)
+                yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                     VALUES (UUID(), ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [variantId, productId, effectiveWhId, change, change]).catch((e) => console.warn(`⚠️ [syncController] Variant warehouse stock update failed:`, e.message));
             }
             // ── Record stock_movements for historical balance report ──
@@ -453,21 +507,36 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     return 'RETURN_OUT';
                 return 'SALE';
             })();
+            // FIX: Use invoice date for movement_date instead of letting MySQL default to NOW().
+            // Without this, editing a historical invoice creates movements dated today,
+            // corrupting the stock movement timeline.
+            const movementDate = inv.date || new Date().toISOString();
             const movementValues = [];
-            for (const [key, stockChange] of detailedStockChanges.entries()) {
-                if (Math.abs(stockChange) < 0.0001)
-                    continue;
-                const [productId, lineWhId, variantId] = key.split('|');
-                const effectiveWhId = lineWhId || fallbackWhId;
-                movementValues.push(productId, effectiveWhId || null, stockChange, movementType, inv.type, inv.id || null, null, `Auto: ${inv.type} #${inv.invoiceNumber || inv.id}`, variantId || null);
+            if (isNowPosted && inv.lines && inv.lines.length > 0) {
+                for (const line of inv.lines) {
+                    if (!line.productId)
+                        continue;
+                    const stockChange = getStockChange(line, inv.type);
+                    if (stockChange !== 0) {
+                        const parentId = resolveProductId(line.productId);
+                        const lineWh = resolveLineWarehouse(line);
+                        const effectiveWhId = lineWh || fallbackWhId;
+                        const vId = getLineVariantId(line);
+                        const invNumber = inv.number || inv.invoiceNumber || inv.id;
+                        const movementNote = inv.partnerName
+                            ? `Invoice #${invNumber} - ${inv.partnerName}`
+                            : `Invoice #${invNumber}`;
+                        movementValues.push(parentId, effectiveWhId || null, stockChange, movementType, inv.type, inv.id || null, null, movementNote, movementDate, vId || null);
+                    }
+                }
             }
             if (movementValues.length > 0) {
                 const movementTuples = [];
-                for (let i = 0; i < movementValues.length; i += 9) {
-                    movementTuples.push('(?, ?, ?, ?, ?, ?, ?, ?, ?)');
+                for (let i = 0; i < movementValues.length; i += 10) {
+                    movementTuples.push('(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
                 }
                 try {
-                    yield conn.query(`INSERT INTO stock_movements (product_id, warehouse_id, qty_change, movement_type, reference_type, reference_id, unit_cost, notes, variant_id)
+                    yield conn.query(`INSERT INTO stock_movements (product_id, warehouse_id, qty_change, movement_type, reference_type, reference_id, unit_cost, notes, movement_date, variant_id)
                          VALUES ${movementTuples.join(', ')}`, movementValues);
                 }
                 catch (mvErr) {
@@ -591,7 +660,6 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
         checkPermissions(req.user, req.body);
         const { invoice, invoices, journal, products, partners, accounts, cheques, productStocks, allocations, deletedInvoiceId, deletedJournalId } = req.body;
         // Use authenticated user from token if available, otherwise fallback to body (for legacy/migration)
-        const currentUser = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
         const currentUserRole = ((_c = req.user) === null || _c === void 0 ? void 0 : _c.role) || 'SALES';
         // ============================================
         // POLICY ENFORCEMENT - Before any DB changes
@@ -751,6 +819,11 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
         }
         // Track skipped invoices to prevent journal creation for duplicates
         const skippedInvoiceIds = new Set();
+        // BUG FIX: Track original UUID → new sequential ID for PAYMENT/RECEIPT invoices.
+        // The SERIAL FIX (inv.id = inv.number) mutates the invoice ID, but the frontend
+        // journal still has referenceId = originalUUID. Without this map, the auto-journal
+        // logic can't detect the frontend journal and creates a duplicate.
+        const originalIdToNewId = new Map();
         if (invoicesToProcess.length > 0) {
             for (const inv of invoicesToProcess) {
                 // =================================================
@@ -787,10 +860,43 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     // BUG FIX: Assign the authoritative server-calculated total
                     inv.total = validation.calculated;
                 }
+                // Check if user has an open POS shift and link this cash transaction to it
+                let posShiftId = inv.posShiftId || null;
+                if (!posShiftId && inv.paymentMethod === 'CASH') {
+                    try {
+                        const creator = inv.createdBy || '';
+                        let userId = ((_g = authReq.user) === null || _g === void 0 ? void 0 : _g.id) || '';
+                        if (creator) {
+                            const [userRows] = yield conn.query("SELECT id FROM users WHERE username = ? OR name = ? LIMIT 1", [creator, creator]);
+                            if (userRows.length > 0) {
+                                userId = userRows[0].id;
+                            }
+                        }
+                        if (userId) {
+                            const [openShifts] = yield conn.query("SELECT id FROM pos_shifts WHERE userId = ? AND status = 'OPEN' LIMIT 1", [userId]);
+                            if (openShifts.length > 0) {
+                                posShiftId = openShifts[0].id;
+                            }
+                            else {
+                                // Fallback: Find the most recent shift for this user active around the invoice date
+                                const [recentShifts] = yield conn.query("SELECT id FROM pos_shifts WHERE userId = ? AND openedAt <= ? ORDER BY openedAt DESC LIMIT 1", [userId, (0, dateEngine_1.toMySQLDateTime)(inv.date)]);
+                                if (recentShifts.length > 0) {
+                                    posShiftId = recentShifts[0].id;
+                                }
+                            }
+                        }
+                    }
+                    catch (err) {
+                        console.warn(`⚠️ [syncTransaction] Could not resolve posShiftId:`, err);
+                    }
+                }
                 // Check if exists
-                const [existing] = yield conn.query('SELECT id, status, createdBy FROM invoices WHERE id = ?', [inv.id]);
-                const wasPosted = ((_g = existing[0]) === null || _g === void 0 ? void 0 : _g.status) === 'POSTED';
+                const [existing] = yield conn.query('SELECT id, status, createdBy, posShiftId FROM invoices WHERE id = ?', [inv.id]);
+                const wasPosted = ((_h = existing[0]) === null || _h === void 0 ? void 0 : _h.status) === 'POSTED';
                 const isNowPosted = inv.status === 'POSTED';
+                if ((_j = existing[0]) === null || _j === void 0 ? void 0 : _j.posShiftId) {
+                    posShiftId = existing[0].posShiftId;
+                }
                 if (existing.length > 0) {
                     // Update
                     yield conn.query(`UPDATE invoices SET 
@@ -798,10 +904,10 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                 posted=?, notes=?, dueDate=?, taxAmount=?, whtAmount=?, shippingFee=?, globalDiscount=?, globalDiscountType=?, globalDiscountValue=?, warehouseId=?, costCenterId=?, paidAmount=?,
                 bankAccountId=?, bankName=?, paymentBreakdown=?, bankTransfers=?, createdBy=?, salesmanId=?, relatedInvoiceIds=?,
                 currencyCode=?, exchangeRate=?, foreignTotal=?, priceListId=?, bankTransferReference=?,
-                referenceInvoiceId=?
+                referenceInvoiceId=?, branchId=?, posShiftId=?, paymentSources=?, voucherCategory=?
                WHERE id=?`, [
-                        toMySQLDateTime(inv.date), inv.type, inv.partnerId, inv.partnerName, inv.total, inv.status, inv.paymentMethod,
-                        inv.posted, inv.notes, toMySQLDateTime(inv.dueDate), inv.taxAmount, inv.whtAmount, inv.shippingFee, inv.globalDiscount || inv.discount || 0,
+                        (0, dateEngine_1.toMySQLDateTime)(inv.date), inv.type, inv.partnerId, inv.partnerName, inv.total, inv.status, inv.paymentMethod,
+                        inv.posted, inv.notes, (0, dateEngine_1.toMySQLDateTime)(inv.dueDate), inv.taxAmount, inv.whtAmount, inv.shippingFee, inv.globalDiscount || inv.discount || 0,
                         inv.globalDiscountType || 'FIXED', inv.globalDiscountValue || inv.globalDiscount || inv.discount || 0,
                         inv.warehouseId ? sanitizeId(inv.warehouseId) : null, inv.costCenterId ? sanitizeId(inv.costCenterId) : null,
                         // CASH FIX: For CASH invoices that are POSTED, paidAmount must equal total
@@ -811,11 +917,15 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         inv.bankAccountId || null, inv.bankName || null,
                         inv.paymentBreakdown ? JSON.stringify(inv.paymentBreakdown) : null,
                         inv.bankTransfers ? JSON.stringify(inv.bankTransfers) : null,
-                        ((_h = existing[0]) === null || _h === void 0 ? void 0 : _h.createdBy) || inv.createdBy || currentUser, // PRESERVE original creator on edits
+                        ((_k = existing[0]) === null || _k === void 0 ? void 0 : _k.createdBy) || inv.createdBy || currentUser, // PRESERVE original creator on edits
                         resolvedSalesmanId,
                         inv.relatedInvoiceIds ? JSON.stringify(inv.relatedInvoiceIds) : null,
                         inv.currencyCode || 'EGP', inv.exchangeRate || 1, inv.foreignTotal || null, inv.priceListId || null, inv.bankTransferReference || null,
                         inv.referenceInvoiceId || null,
+                        (0, branchFilter_1.resolveBranchIdForWrite)(req, inv.branchId),
+                        posShiftId,
+                        inv.paymentSources ? (typeof inv.paymentSources === 'string' ? inv.paymentSources : JSON.stringify(inv.paymentSources)) : null,
+                        inv.voucherCategory || null,
                         inv.id
                     ]);
                     // Delete lines and re-insert (only if lines are provided)
@@ -823,7 +933,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     if (inv.lines !== undefined && inv.lines !== null) {
                         // Warn if trying to set lines to empty array for existing invoice
                         if (inv.lines.length === 0) {
-                            // PERF: console.warn(`âš ï¸ Warning: Attempting to clear all lines for existing invoice ${inv.id}. This will delete all products!`);
+                            // PERF: console.warn(`âš ï¸  Warning: Attempting to clear all lines for existing invoice ${inv.id}. This will delete all products!`);
                         }
                         // Fetch old lines before deletion for stock delta calculation
                         let oldLines = [];
@@ -842,8 +952,6 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                 const disc = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.discount));
                                 const total = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.total));
                                 const conversionFactor = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.conversionFactor), 5) || 1;
-                                // DECIMAL-SAFE: Removed intermediate rawX + toFixed() chain
-                                // D() handles NaN/null/undefined safely, toNum() rounds to correct dp
                                 const baseQuantity = line.baseQuantity ? (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.baseQuantity), 5) : (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(qty).mul((0, decimalUtils_1.D)(conversionFactor)), 5);
                                 return [
                                     inv.id, line.productId, line.productName, qty, price, cost, disc, total,
@@ -853,17 +961,20 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                     line.discountType || 'FIXED',
                                     (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.discountValue)),
                                     line.priceListId || null,
-                                    line.variantId || null
+                                    line.variantId || null,
+                                    line.hasWarranty ? 1 : 0,
+                                    line.inBranchInstallation ? 1 : 0,
+                                    line.warrantyMonths || 0
                                 ];
                             });
                             console.log('VARIANT_DEBUG_INSERT:', JSON.stringify(inv.lines.map((l) => ({ pid: l.productId, vid: l.variantId }))));
                             try {
-                                yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, bonusQty, discountType, discountValue, priceListId, variantId) VALUES ?`, [values]);
+                                yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, bonusQty, discountType, discountValue, priceListId, variantId, hasWarranty, inBranchInstallation, warrantyMonths) VALUES ?`, [values]);
                             }
                             catch (ilErr) {
                                 console.warn('VARIANT_FALLBACK_TRIGGERED:', ilErr.message);
                                 // Fallback: insert without new columns if they don't exist on client
-                                // PERF: console.warn('âš ï¸ Fallback invoice_lines insert (missing columns):', ilErr.message);
+                                // PERF: console.warn('⚠️ Fallback invoice_lines insert (missing columns):', ilErr.message);
                                 const basicValues = inv.lines.map((line) => [
                                     inv.id, line.productId, line.productName,
                                     (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.quantity), 5), (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.price)),
@@ -879,8 +990,9 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             yield applyPurchaseCostUpdate(conn, inv, systemConfig);
                     }
                     else {
-                        // PERF: console.log(`â„¹ï¸  Skipping line update for invoice ${inv.id} - lines not provided in update`);
+                        // PERF: console.log(`ℹ️ Skipping line update for invoice ${inv.id} - lines not provided in update`);
                     }
+                    yield syncInvoiceCashMovement(conn, inv, posShiftId);
                 }
                 else {
                     // === DUPLICATE DETECTION FOR SALE/PURCHASE INVOICES ===
@@ -891,10 +1003,10 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     if (invTypesForDedup.includes(inv.type) && inv.total > 0) {
                         const [dupInv] = yield conn.query(`SELECT id, number FROM invoices 
                              WHERE type = ? AND partnerId = ? AND ABS(total - ?) < 0.01 AND DATE(date) = DATE(?)
-                             LIMIT 1`, [inv.type, inv.partnerId, inv.total, toMySQLDateTime(inv.date)]);
+                             LIMIT 1`, [inv.type, inv.partnerId, inv.total, (0, dateEngine_1.toMySQLDateTime)(inv.date)]);
                         if (dupInv.length > 0) {
                             const existingInv = dupInv[0];
-                            // PERF: console.log(`â ­ï¸  [SYNC] SKIP: Duplicate ${inv.type} detected â€” existing: ${existingInv.number || existingInv.id} (same partner + total + date)`);
+                            // PERF: console.log(`⭷ [SYNC] SKIP: Duplicate ${inv.type} detected — existing: ${existingInv.number || existingInv.id} (same partner + total + date)`);
                             skippedInvoiceIds.add(inv.id);
                             continue;
                         }
@@ -915,7 +1027,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                 (partnerId = ? AND ABS(total - ?) < 0.01 AND date >= DATE_SUB(NOW(), INTERVAL 5 MINUTE))
                                 OR (partnerId = ? AND ABS(total - ?) < 0.01 AND DATE(date) = DATE(?))
                         `;
-                        const invDate = toMySQLDateTime(inv.date);
+                        const invDate = (0, dateEngine_1.toMySQLDateTime)(inv.date);
                         const queryParams = [inv.type, inv.id, inv.partnerId, inv.total, inv.partnerId, inv.total, invDate];
                         // If this receipt/payment is linked to an invoice, check if a doc with SAME AMOUNT handles that invoice
                         // This allows multiple partial payments, but blocks exact duplicates of the initial payment
@@ -927,9 +1039,9 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         const [duplicateCheck] = yield conn.query(duplicateQuery, queryParams);
                         if (duplicateCheck.length > 0) {
                             const existingDoc = duplicateCheck[0];
-                            // PERF: console.log(`âš ï¸  SKIP: Duplicate ${inv.type} detected - existing: ${existingDoc.number} for invoice ${inv.referenceInvoiceId || 'N/A'}`);
+                            // PERF: console.log(`⚠️ SKIP: Duplicate ${inv.type} detected - existing: ${existingDoc.number} for invoice ${inv.referenceInvoiceId || 'N/A'}`);
                             skippedInvoiceIds.add(inv.id); // Track skipped ID to prevent journal creation
-                            console.log(`[syncController] DEDUP-BLOCK: ${inv.type} duplicate blocked. existing=${existingDoc.number} incoming=${(_j = inv.id) === null || _j === void 0 ? void 0 : _j.substring(0, 8)} partner=${(inv.partnerId || '').substring(0, 8)} amount=${inv.total}`);
+                            console.log(`[syncController] DEDUP-BLOCK: ${inv.type} duplicate blocked. existing=${existingDoc.number} incoming=${(_l = inv.id) === null || _l === void 0 ? void 0 : _l.substring(0, 8)} partner=${(inv.partnerId || '').substring(0, 8)} amount=${inv.total}`);
                             continue; // Skip this invoice, don't insert duplicate
                         }
                     }
@@ -944,20 +1056,23 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     const invoiceNumber = ((inv.referenceNumber && inv.referenceNumber.length !== 36 && !inv.referenceNumber.startsWith('OFF-')) ? inv.referenceNumber : null) ||
                         ((inv.number && inv.number.length !== 36 && !inv.number.startsWith('OFF-')) ? inv.number : null);
                     if (invoiceNumber) {
-                        const [existingByNumber] = yield conn.query('SELECT id, status, createdBy FROM invoices WHERE number = ? LIMIT 1', [invoiceNumber]);
+                        const [existingByNumber] = yield conn.query('SELECT id, status, createdBy, posShiftId FROM invoices WHERE number = ? LIMIT 1', [invoiceNumber]);
                         if (existingByNumber.length > 0) {
                             const existingRecord = existingByNumber[0];
-                            // PERF: console.log(`ðŸ”„ [SYNC] Invoice with number ${invoiceNumber} already exists (id: ${existingRecord.id}). Updating instead of inserting.`);
+                            // PERF: 🔄 [SYNC] Invoice with number ${invoiceNumber} already exists (id: ${existingRecord.id}). Updating instead of inserting.
+                            if (existingRecord.posShiftId) {
+                                posShiftId = existingRecord.posShiftId;
+                            }
                             // Update the existing record instead of inserting a new one
                             yield conn.query(`UPDATE invoices SET 
                                     date=?, type=?, partnerId=?, partnerName=?, total=?, status=?, paymentMethod=?, 
                                     posted=?, notes=?, dueDate=?, taxAmount=?, whtAmount=?, shippingFee=?, globalDiscount=?, globalDiscountType=?, globalDiscountValue=?, warehouseId=?, costCenterId=?, paidAmount=?,
                                     bankAccountId=?, bankName=?, paymentBreakdown=?, bankTransfers=?, createdBy=?, salesmanId=?, relatedInvoiceIds=?,
                                     currencyCode=?, exchangeRate=?, foreignTotal=?, priceListId=?, bankTransferReference=?,
-                                    referenceInvoiceId=?
+                                    referenceInvoiceId=?, branchId=?, posShiftId=?
                                 WHERE id=?`, [
-                                toMySQLDateTime(inv.date), inv.type, syncPartnerId, inv.partnerName, inv.total, inv.status, inv.paymentMethod,
-                                inv.posted, inv.notes || (invVoucherCategory ? `${invVoucherCategory}|${inv.partnerId || ''}` : null), toMySQLDateTime(inv.dueDate), inv.taxAmount, inv.whtAmount, inv.shippingFee, inv.globalDiscount || inv.discount || 0,
+                                (0, dateEngine_1.toMySQLDateTime)(inv.date), inv.type, syncPartnerId, inv.partnerName, inv.total, inv.status, inv.paymentMethod,
+                                inv.posted, inv.notes || (invVoucherCategory ? `${invVoucherCategory}|${inv.partnerId || ''}` : null), (0, dateEngine_1.toMySQLDateTime)(inv.dueDate), inv.taxAmount, inv.whtAmount, inv.shippingFee, inv.globalDiscount || inv.discount || 0,
                                 inv.globalDiscountType || 'FIXED', inv.globalDiscountValue || inv.globalDiscount || inv.discount || 0,
                                 inv.warehouseId ? sanitizeId(inv.warehouseId) : null, inv.costCenterId ? sanitizeId(inv.costCenterId) : null,
                                 (inv.paymentMethod === 'CASH' && inv.status === 'POSTED' && !['RECEIPT', 'PAYMENT'].includes(inv.type))
@@ -971,6 +1086,8 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                 inv.relatedInvoiceIds ? JSON.stringify(inv.relatedInvoiceIds) : null,
                                 inv.currencyCode || 'EGP', inv.exchangeRate || 1, inv.foreignTotal || null, inv.priceListId || null, inv.bankTransferReference || null,
                                 inv.referenceInvoiceId || null,
+                                (0, branchFilter_1.resolveBranchIdForWrite)(req, inv.branchId),
+                                posShiftId,
                                 existingRecord.id
                             ]);
                             // Fetch old lines before deletion for stock delta calculation
@@ -997,11 +1114,14 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                         line.discountType || 'FIXED',
                                         (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.discountValue)),
                                         line.priceListId || null,
-                                        line.variantId || null
+                                        line.variantId || null,
+                                        line.hasWarranty ? 1 : 0,
+                                        line.inBranchInstallation ? 1 : 0,
+                                        line.warrantyMonths || 0
                                     ];
                                 });
                                 try {
-                                    yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, bonusQty, discountType, discountValue, priceListId, variantId) VALUES ?`, [values]);
+                                    yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, bonusQty, discountType, discountValue, priceListId, variantId, hasWarranty, inBranchInstallation, warrantyMonths) VALUES ?`, [values]);
                                 }
                                 catch (ilErr) {
                                     const basicValues = inv.lines.map((line) => [
@@ -1019,6 +1139,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                 if (isNowPosted)
                                     yield applyPurchaseCostUpdate(conn, inv, systemConfig);
                             }
+                            yield syncInvoiceCashMovement(conn, inv, posShiftId);
                             continue; // Skip the normal INSERT path
                         }
                     }
@@ -1035,14 +1156,34 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         }[inv.type] || 'TRX-'));
                     // SERIAL FIX: For PAYMENT/RECEIPT, id === number (single identity)
                     if (['RECEIPT', 'PAYMENT'].includes(inv.type)) {
+                        const originalUUID = inv.id;
                         inv.id = inv.number;
+                        // Track UUID→sequential mapping so downstream journal dedup works
+                        if (originalUUID !== inv.id) {
+                            originalIdToNewId.set(originalUUID, inv.id);
+                            // Rewrite the frontend journal's referenceId from UUID to the new
+                            // sequential ID so all dedup checks (hasProvidedJournal, existingJournal
+                            // query, safety net) compare against a single canonical ID.
+                            const providedJournals = req.body.journals || (req.body.journal ? [req.body.journal] : []);
+                            for (const j of providedJournals) {
+                                if (j.referenceId === originalUUID) {
+                                    j.referenceId = inv.id;
+                                    // Also fix the description: replace UUID with sequential number
+                                    // Frontend generates: "سند صرف #<UUID> - Ahmed"
+                                    // We want:            "سند صرف #PAY-00026 - Ahmed"
+                                    if (j.description && j.description.includes(originalUUID)) {
+                                        j.description = j.description.replace(originalUUID, inv.id);
+                                    }
+                                }
+                            }
+                        }
                     }
-                    yield conn.query(`INSERT INTO invoices (id, number, date, type, partnerId, partnerName, total, status, paymentMethod, posted, notes, dueDate, taxAmount, whtAmount, shippingFee, globalDiscount, globalDiscountType, globalDiscountValue, warehouseId, costCenterId, paidAmount, bankAccountId, bankName, paymentBreakdown, bankTransfers, createdBy, salesmanId, relatedInvoiceIds, currencyCode, exchangeRate, foreignTotal, priceListId, bankTransferReference, referenceInvoiceId, branchId) 
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                    yield conn.query(`INSERT INTO invoices (id, number, date, type, partnerId, partnerName, total, status, paymentMethod, posted, notes, dueDate, taxAmount, whtAmount, shippingFee, globalDiscount, globalDiscountType, globalDiscountValue, warehouseId, costCenterId, paidAmount, bankAccountId, bankName, paymentBreakdown, bankTransfers, createdBy, salesmanId, relatedInvoiceIds, currencyCode, exchangeRate, foreignTotal, priceListId, bankTransferReference, referenceInvoiceId, branchId, posShiftId, paymentSources, voucherCategory) 
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                         inv.id,
                         inv.number,
-                        toMySQLDateTime(inv.date), inv.type, syncPartnerId, inv.partnerName, inv.total, inv.status, inv.paymentMethod,
-                        inv.posted, inv.notes || (invVoucherCategory ? `${invVoucherCategory}|${inv.partnerId || ''}` : null), toMySQLDateTime(inv.dueDate), inv.taxAmount, inv.whtAmount, inv.shippingFee, inv.globalDiscount || inv.discount || 0,
+                        (0, dateEngine_1.toMySQLDateTime)(inv.date), inv.type, syncPartnerId, inv.partnerName, inv.total, inv.status, inv.paymentMethod,
+                        inv.posted, inv.notes || (invVoucherCategory ? `${invVoucherCategory}|${inv.partnerId || ''}` : null), (0, dateEngine_1.toMySQLDateTime)(inv.dueDate), inv.taxAmount, inv.whtAmount, inv.shippingFee, inv.globalDiscount || inv.discount || 0,
                         inv.globalDiscountType || 'FIXED', inv.globalDiscountValue || inv.globalDiscount || inv.discount || 0,
                         inv.warehouseId ? sanitizeId(inv.warehouseId) : null, inv.costCenterId ? sanitizeId(inv.costCenterId) : null,
                         // CASH FIX: For CASH invoices that are POSTED, paidAmount must equal total
@@ -1057,7 +1198,10 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         inv.relatedInvoiceIds ? JSON.stringify(inv.relatedInvoiceIds) : null,
                         inv.currencyCode || 'EGP', inv.exchangeRate || 1, inv.foreignTotal || null, inv.priceListId || null, inv.bankTransferReference || null,
                         inv.referenceInvoiceId || null,
-                        (0, branchFilter_1.resolveBranchIdForWrite)(req)
+                        (0, branchFilter_1.resolveBranchIdForWrite)(req, inv.branchId),
+                        posShiftId,
+                        inv.paymentSources ? (typeof inv.paymentSources === 'string' ? inv.paymentSources : JSON.stringify(inv.paymentSources)) : null,
+                        inv.voucherCategory || invVoucherCategory || null
                     ]);
                     // Insert Lines using batch insert for better performance - includes multi-unit fields
                     if (inv.lines && inv.lines.length > 0) {
@@ -1069,7 +1213,6 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             const disc = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.discount));
                             const total = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.total));
                             const conversionFactor = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.conversionFactor), 5) || 1;
-                            // DECIMAL-SAFE: Removed intermediate rawX + toFixed() chain
                             const baseQuantity = line.baseQuantity ? (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.baseQuantity), 5) : (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(qty).mul((0, decimalUtils_1.D)(conversionFactor)), 5);
                             return [
                                 inv.id, line.productId, line.productName, qty, price, cost, disc, total,
@@ -1079,11 +1222,14 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                 line.discountType || 'FIXED',
                                 (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(line.discountValue)),
                                 line.priceListId || null,
-                                line.variantId || null
+                                line.variantId || null,
+                                line.hasWarranty ? 1 : 0,
+                                line.inBranchInstallation ? 1 : 0,
+                                line.warrantyMonths || 0
                             ];
                         });
                         try {
-                            yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, bonusQty, discountType, discountValue, priceListId, variantId) VALUES ?`, [values]);
+                            yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, bonusQty, discountType, discountValue, priceListId, variantId, hasWarranty, inBranchInstallation, warrantyMonths) VALUES ?`, [values]);
                         }
                         catch (ilErr) {
                             // Fallback: insert without new columns if they don't exist on client
@@ -1103,6 +1249,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         // === PURCHASE COST UPDATE (متوسط التكلفة) ===
                         yield applyPurchaseCostUpdate(conn, inv, systemConfig);
                     }
+                    yield syncInvoiceCashMovement(conn, inv, posShiftId);
                 }
             }
         }
@@ -1163,7 +1310,12 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     const cashTag = isCashInv ? ' نقدي' : '';
                     if (isSaleType && revenueAcc && receivablesAcc) {
                         // For CASH invoices, use the cash account instead of receivables
-                        const cashAcc = glAccountCache.cash;
+                        let cashAcc = glAccountCache.cash;
+                        if (inv.bankAccountId) {
+                            const resolved = yield resolveSyncCashBankAccount(conn, inv.bankAccountId);
+                            if (resolved)
+                                cashAcc = resolved;
+                        }
                         const partnerAcc = (isCashInv && cashAcc) ? cashAcc : receivablesAcc;
                         const descPrefix = isReturn ? 'مرتجع مبيعات' : 'فاتورة بيع';
                         yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)`, [revJournalId, inv.date, `${descPrefix}${cashTag} #${invNumber} - ${partnerName}`, inv.id, inv.createdBy || currentUser]);
@@ -1191,7 +1343,12 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     }
                     else if (!isSaleType && inventoryAcc && payablesAcc) {
                         // For CASH purchases, use the cash account instead of payables
-                        const cashAcc = glAccountCache.cash;
+                        let cashAcc = glAccountCache.cash;
+                        if (inv.bankAccountId) {
+                            const resolved = yield resolveSyncCashBankAccount(conn, inv.bankAccountId);
+                            if (resolved)
+                                cashAcc = resolved;
+                        }
                         const supplierAcc = (isCashInv && cashAcc) ? cashAcc : payablesAcc;
                         const descPrefix = isReturn ? 'مرتجع مشتريات' : 'فاتورة شراء';
                         yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)`, [revJournalId, inv.date, `${descPrefix}${cashTag} #${invNumber} - ${partnerName}`, inv.id, inv.createdBy || currentUser]);
@@ -1270,12 +1427,12 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
             const isCashInvoice = inv.paymentMethod === 'CASH';
             const docType = isSaleInvoice ? 'RECEIPT' : 'PAYMENT';
             const docLabel = isSaleInvoice ? 'سند قبض' : 'سند صرف';
-            console.log(`[syncController] TREASURY-CHECK inv=${(_k = inv.id) === null || _k === void 0 ? void 0 : _k.substring(0, 8)} num=${inv.number || 'NEW'} type=${inv.type} paymentMethod=${inv.paymentMethod} paidAmount=${paidAmount} paymentCollected=${inv.paymentCollected} total=${inv.total} isCash=${isCashInvoice} partnerId=${inv.partnerId ? inv.partnerId.substring(0, 8) : 'NONE'}`);
+            console.log(`[syncController] TREASURY-CHECK inv=${(_m = inv.id) === null || _m === void 0 ? void 0 : _m.substring(0, 8)} num=${inv.number || 'NEW'} type=${inv.type} paymentMethod=${inv.paymentMethod} paidAmount=${paidAmount} paymentCollected=${inv.paymentCollected} total=${inv.total} isCash=${isCashInvoice} partnerId=${inv.partnerId ? inv.partnerId.substring(0, 8) : 'NONE'}`);
             if (paidAmount > 0 && inv.partnerId && !isCashInvoice) {
                 try { // === CHECK 0: Did the client already send a standalone PAYMENT/RECEIPT for this partner+amount? ===
                     // If the client created a payment voucher directly AND also sent the purchase invoice,
                     // we must NOT auto-create another treasury doc - that would cause duplicate entries.
-                    const invDateForCheck = toMySQLDateTime(inv.date);
+                    const invDateForCheck = (0, dateEngine_1.toMySQLDateTime)(inv.date);
                     const [clientCreatedDoc] = yield conn.query(`SELECT id, number FROM invoices 
                          WHERE type = ? AND partnerId = ? AND ABS(total - ?) < 0.01 
                          AND DATE(date) >= DATE_SUB(DATE(?), INTERVAL 7 DAY) 
@@ -1362,7 +1519,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     // === CREATE NEW DOC (no existing found) ===
                     const docNumber = yield (0, invoiceNumberGenerator_1.generateNextSequentialNumber)(conn, isSaleInvoice ? 'REC-' : 'PAY-');
                     const docId = docNumber; // SERIAL FIX: id === number for all PAY/REC
-                    console.log(`[syncController] CREATE TREASURY DOC: ${docNumber} type=${docType} amount=${paidAmount} for inv=${(_l = inv.id) === null || _l === void 0 ? void 0 : _l.substring(0, 8)} (${inv.number})`);
+                    console.log(`[syncController] CREATE TREASURY DOC: ${docNumber} type=${docType} amount=${paidAmount} for inv=${(_o = inv.id) === null || _o === void 0 ? void 0 : _o.substring(0, 8)} (${inv.number})`);
                     // Create treasury doc
                     const derivedPaymentMethod = inv.partialPaymentMethod || (inv.paymentMethod === 'CREDIT' ? 'CASH' : inv.paymentMethod) || 'CASH';
                     const derivedBankId = inv.partialPaymentBankId || inv.bankAccountId || null;
@@ -1372,7 +1529,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             VALUES (?, ?, ?, ?, ?, ?, ?, 'POSTED', ?, ?, ?, ?, ?, ?, ?, ?)`, [
                         docId,
                         docNumber,
-                        toMySQLDateTime(inv.date),
+                        (0, dateEngine_1.toMySQLDateTime)(inv.date),
                         docType,
                         inv.partnerId,
                         inv.partnerName,
@@ -1384,7 +1541,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         inv.id,
                         inv.createdBy || currentUser,
                         yield resolveSalesmanId(conn, inv.salesmanId, salesmanCache),
-                        (0, branchFilter_1.resolveBranchIdForWrite)(req)
+                        (0, branchFilter_1.resolveBranchIdForWrite)(req, inv.branchId)
                     ]);
                     // Update partner balance
                     yield conn.query('UPDATE partners SET balance = COALESCE(balance, 0) + ? WHERE id = ?', [isSaleInvoice ? -paidAmount : paidAmount, inv.partnerId]);
@@ -1395,11 +1552,12 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         const partialMethod = inv.partialPaymentMethod || (inv.paymentMethod === 'CREDIT' ? 'CASH' : inv.paymentMethod) || 'CASH';
                         let cashAccountId = null;
                         let cashAccountName = 'الخزينة';
-                        if (partialMethod === 'BANK' && inv.partialPaymentBankId) {
-                            const [bankRows] = yield conn.query(`SELECT b.accountId, a.name FROM banks b LEFT JOIN accounts a ON a.id = b.accountId WHERE b.id = ? LIMIT 1`, [inv.partialPaymentBankId]);
-                            if ((_m = bankRows[0]) === null || _m === void 0 ? void 0 : _m.accountId) {
-                                cashAccountId = bankRows[0].accountId;
-                                cashAccountName = bankRows[0].name || 'البنك';
+                        const targetBankId = inv.partialPaymentBankId || inv.bankAccountId;
+                        if (targetBankId) {
+                            const resolved = yield resolveSyncCashBankAccount(conn, targetBankId);
+                            if (resolved) {
+                                cashAccountId = resolved.id;
+                                cashAccountName = resolved.name;
                             }
                         }
                         if (!cashAccountId && glAccountCache.cash) {
@@ -1414,8 +1572,8 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             }
                         }
                         // Get Partner account
-                        let partnerAccountId = isSaleInvoice ? (((_o = glAccountCache.receivables) === null || _o === void 0 ? void 0 : _o.id) || null) : (((_p = glAccountCache.payables) === null || _p === void 0 ? void 0 : _p.id) || null);
-                        let partnerAccountName = isSaleInvoice ? (((_q = glAccountCache.receivables) === null || _q === void 0 ? void 0 : _q.name) || 'العملاء') : (((_r = glAccountCache.payables) === null || _r === void 0 ? void 0 : _r.name) || 'الموردين');
+                        let partnerAccountId = isSaleInvoice ? (((_p = glAccountCache.receivables) === null || _p === void 0 ? void 0 : _p.id) || null) : (((_q = glAccountCache.payables) === null || _q === void 0 ? void 0 : _q.id) || null);
+                        let partnerAccountName = isSaleInvoice ? (((_r = glAccountCache.receivables) === null || _r === void 0 ? void 0 : _r.name) || 'العملاء') : (((_s = glAccountCache.payables) === null || _s === void 0 ? void 0 : _s.name) || 'الموردين');
                         if (!partnerAccountId) {
                             const [fallbackARQuery] = yield conn.query(`SELECT id, name FROM accounts WHERE type IN (?, ?) ORDER BY created_at ASC LIMIT 1`, isSaleInvoice ? ['ASSET', 'RECEIVABLE'] : ['LIABILITY', 'PAYABLE']);
                             if (fallbackARQuery.length > 0) {
@@ -1436,7 +1594,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             yield conn.query('DELETE FROM journal_entries WHERE referenceId = ?', [docId]);
                             yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, denominations) VALUES (?, ?, ?, ?, ?, ?)`, [
                                 docJournalId,
-                                toMySQLDateTime(inv.date),
+                                (0, dateEngine_1.toMySQLDateTime)(inv.date),
                                 `${docLabel} #${docNumber} - ${inv.partnerName}${inv.paymentMethod === 'CASH' ? ' (نقدي)' : ` - دفعة مع الفاتورة ${invNumber}`}`,
                                 docId,
                                 inv.createdBy || currentUser,
@@ -1459,12 +1617,12 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         }
                     }
                     catch (docJournalErr) {
-                        console.error(`[syncController] CRITICAL: Treasury journal creation FAILED for inv=${(_s = inv.id) === null || _s === void 0 ? void 0 : _s.substring(0, 8)}:`, docJournalErr.message);
+                        console.error(`[syncController] CRITICAL: Treasury journal creation FAILED for inv=${(_t = inv.id) === null || _t === void 0 ? void 0 : _t.substring(0, 8)}:`, docJournalErr.message);
                         throw docJournalErr; // RE-THROW: Treasury journal MUST succeed - rollback entire transaction
                     }
                 }
                 catch (docError) {
-                    console.error(`[syncController] CRITICAL: Treasury doc creation FAILED for inv=${(_t = inv.id) === null || _t === void 0 ? void 0 : _t.substring(0, 8)} type=${docType}:`, (docError === null || docError === void 0 ? void 0 : docError.message) || docError);
+                    console.error(`[syncController] CRITICAL: Treasury doc creation FAILED for inv=${(_u = inv.id) === null || _u === void 0 ? void 0 : _u.substring(0, 8)} type=${docType}:`, (docError === null || docError === void 0 ? void 0 : docError.message) || docError);
                     throw docError; // RE-THROW: Treasury doc is NOT optional - rollback entire transaction
                 }
             }
@@ -1516,17 +1674,14 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         // Determine cash/bank account based on payment method
                         let cashBankAccountId = null;
                         let cashBankAccountName = 'الخزينة';
-                        if (inv.paymentMethod === 'BANK' && inv.bankAccountId) {
-                            // BANK: Get the bank's GL account
-                            // PERF: console.log(`ðŸ ¦ ${inv.type} is bank transfer. Bank ID: ${inv.bankAccountId}`);
-                            const [bankAccounts] = yield conn.query(`SELECT b.accountId, b.name FROM banks b WHERE b.id = ? OR b.accountId = ? LIMIT 1`, [inv.bankAccountId, inv.bankAccountId]);
-                            if ((_u = bankAccounts[0]) === null || _u === void 0 ? void 0 : _u.accountId) {
-                                cashBankAccountId = bankAccounts[0].accountId;
-                                cashBankAccountName = inv.bankName || bankAccounts[0].name || 'البنك';
-                                // PERF: console.log(`ðŸ ¦ Using bank GL account: ${cashBankAccountId} (${cashBankAccountName})`);
+                        if (inv.bankAccountId) {
+                            const resolved = yield resolveSyncCashBankAccount(conn, inv.bankAccountId);
+                            if (resolved) {
+                                cashBankAccountId = resolved.id;
+                                cashBankAccountName = resolved.name;
                             }
                         }
-                        // Fallback to cash/treasury if not a bank payment or bank not found â€” PERF: Use GL cache
+                        // Fallback to cash/treasury if not a bank payment or bank not found — PERF: Use GL cache
                         if (!cashBankAccountId) {
                             if (glAccountCache.cash) {
                                 cashBankAccountId = glAccountCache.cash.id;
@@ -1628,20 +1783,41 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             shouldUpdatePartnerBalance = true; // Assume partner for fallback
                         }
                         if (cashBankAccountId && partnerAccountId) {
-                            yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)`, [journalId, toMySQLDateTime(inv.date), `${voucherLabel} - ${inv.partnerName}${inv.paymentMethod === 'BANK' ? ' - تحويل بنكي' : ''}`, inv.id, inv.createdBy || currentUser]);
-                            const isEffectivelyReceipt = (isReceipt && inv.total >= 0) || (!isReceipt && inv.total < 0);
-                            const absTotal = Math.abs(inv.total);
-                            // PERF: Batch insert both journal lines in one query
-                            const jlValues = isEffectivelyReceipt
-                                ? [
-                                    [journalId, cashBankAccountId, cashBankAccountName, absTotal, 0],
-                                    [journalId, partnerAccountId, partnerAccountName, 0, absTotal]
-                                ]
-                                : [
-                                    [journalId, partnerAccountId, partnerAccountName, absTotal, 0],
-                                    [journalId, cashBankAccountId, cashBankAccountName, 0, absTotal]
-                                ];
-                            yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES ?`, [jlValues]);
+                            const paymentSources = inv.paymentSources
+                                ? (typeof inv.paymentSources === 'string' ? JSON.parse(inv.paymentSources) : inv.paymentSources)
+                                : [];
+                            const mockReq = {
+                                body: {
+                                    paymentSources: paymentSources,
+                                    applyFee: inv.applyFee || false,
+                                    fee: inv.fee || 0,
+                                    feeTax: inv.feeTax || 0,
+                                    feeTotal: inv.feeTotal || 0,
+                                    feeChargedTo: inv.feeChargedTo || 'CLIENT',
+                                    sourceBankName: inv.bankName || 'البنك'
+                                },
+                                user: req.user,
+                                branchContext: req.branchContext
+                            };
+                            yield (0, paymentGeneration_1.createPaymentJournal)({
+                                conn,
+                                journalId,
+                                date: (0, dateEngine_1.toMySQLDateTime)(inv.date),
+                                description: `${voucherLabel} - ${inv.partnerName}${inv.paymentMethod === 'BANK' ? ' - تحويل بنكي' : ''}`,
+                                referenceId: inv.id,
+                                createdBy: inv.createdBy || currentUser,
+                                amount: inv.total,
+                                paymentType: isReceipt ? 'RECEIPT' : 'PAYMENT',
+                                paymentMethod: inv.paymentMethod || 'CASH',
+                                bankAccountId: inv.bankAccountId || cashBankAccountId,
+                                currencyCode: inv.currencyCode || 'EGP',
+                                exchangeRate: inv.exchangeRate || 1,
+                                denominations: inv.denominations,
+                                branchId: inv.branchId,
+                                req: mockReq,
+                                partnerId: inv.partnerId,
+                                explicitAccountId: partnerAccountId
+                            });
                             // Update partner balance ONLY for real partner categories
                             // (not for expenses, employee advances, or salaries)
                             if (shouldUpdatePartnerBalance && inv.partnerId) {
@@ -1650,15 +1826,14 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             }
                             // CRITICAL FIX (Bug #8): Update GL account balances after auto-journal creation
                             // Without this, accounts.balance drifts permanently out of sync
-                            // with the actual journal_lines aggregation.
-                            const autoJournalAcctIds = [cashBankAccountId, partnerAccountId].filter(Boolean);
+                            const [lines] = yield conn.query('SELECT DISTINCT accountId FROM journal_lines WHERE journalId = ?', [journalId]);
+                            const autoJournalAcctIds = lines.map(l => l.accountId).filter(Boolean);
                             if (autoJournalAcctIds.length > 0) {
                                 yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, autoJournalAcctIds);
                             }
-                            // PERF: console.log(`ðŸ“— Auto-journal created for ${inv.type} [${autoVoucherCat || 'default'}]: ${journalId} - ${inv.total} â†’ ${partnerAccountName} (${inv.paymentMethod === 'BANK' ? 'BANK' : 'CASH'})`);
                         }
                         else {
-                            // PERF: console.warn(`âš ï¸  Could not find cash/bank or partner accounts for ${inv.type} journal entry`);
+                            console.warn(`[syncController] Could not find accounts for ${inv.type} ${inv.id} journal. cashBank=${cashBankAccountId}, partner=${partnerAccountId}`);
                         }
                     }
                 }
@@ -1725,11 +1900,11 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         const newTotalPaid = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(adv.totalPaid).plus((0, decimalUtils_1.D)(canApply)));
                         const newRemaining = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(adv.remainingAmount).minus((0, decimalUtils_1.D)(canApply)));
                         yield conn.query(`UPDATE employee_advances SET totalPaid = ?, remainingAmount = ?, status = ? WHERE id = ?`, [newTotalPaid, newRemaining, newRemaining <= 0 ? 'COMPLETED' : 'ACTIVE', adv.id]);
-                        // PERF: console.log(`ðŸ’° [HR-SYNC] Advance ${adv.id}: repaid ${canApply}, remaining: ${newRemaining}`);
+                        // PERF: console.log(`💰 [HR-SYNC] Advance ${adv.id}: repaid ${canApply}, remaining: ${newRemaining}`);
                         remaining -= canApply;
                     }
                     if (remaining > 0) {
-                        // PERF: console.warn(`âš ï¸  [HR-SYNC] Employee ${syncEmployeeId} repaid ${syncTotal} but only ${syncTotal - remaining} allocated to active advances`);
+                        // PERF: console.warn(`⚠️ [HR-SYNC] Employee ${syncEmployeeId} repaid ${syncTotal} but only ${syncTotal - remaining} allocated to active advances`);
                     }
                 }
                 catch (repayErr) {
@@ -1752,11 +1927,8 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
         const processedJournals = [];
         // Get denomination data from invoice if available (for denomination report)
         const invoiceDenominations = (_15 = req.body.invoice) === null || _15 === void 0 ? void 0 : _15.denominations;
-        const denomJson = invoiceDenominations && Object.values(invoiceDenominations).some((v) => Number(v) > 0)
+        const invoiceDenomJson = invoiceDenominations && Object.values(invoiceDenominations).some((v) => Number(v) > 0)
             ? JSON.stringify(invoiceDenominations) : null;
-        if (denomJson) {
-            // PERF: console.log(`ðŸ’Ž [syncController] Denomination data found on invoice:`, denomJson);
-        }
         if (journals.length > 0) {
             // RETRY WRAPPER: MariaDB MVCC can throw "Record has changed since last read"
             // when concurrent syncs modify the same journal_lines rows. Retry up to 3 times.
@@ -1775,6 +1947,11 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             // PERF: console.warn(`âš ï¸  Skipping journal ${j.id} - no lines`);
                             continue;
                         }
+                        // Get denomination data from journal or fallback to invoice
+                        const journalDenominations = j.denominations;
+                        const denomJson = (journalDenominations && Object.values(journalDenominations).some((v) => Number(v) > 0))
+                            ? (typeof journalDenominations === 'string' ? journalDenominations : JSON.stringify(journalDenominations))
+                            : invoiceDenomJson;
                         // CONCURRENCY FIX: Use FOR UPDATE to lock the row before modifying.
                         // This prevents "Record has changed since last read" from concurrent syncs.
                         const [existingJ] = yield conn.query('SELECT id, referenceId FROM journal_entries WHERE id = ? FOR UPDATE', [j.id]);
@@ -1793,7 +1970,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         }
                         if (existingJ.length > 0) {
                             console.log(`[syncController] UPDATE journal ${(_16 = j.id) === null || _16 === void 0 ? void 0 : _16.substring(0, 8)} ref=${(_17 = j.referenceId) === null || _17 === void 0 ? void 0 : _17.substring(0, 8)} desc="${(_18 = j.description) === null || _18 === void 0 ? void 0 : _18.substring(0, 60)}"`);
-                            yield conn.query('UPDATE journal_entries SET date=?, description=?, notes=COALESCE(?, notes), referenceId=?, createdBy=?, currencyCode=?, exchangeRate=?, denominations=COALESCE(?, denominations) WHERE id=?', [toMySQLDateTime(j.date), j.description, j.notes || null, finalReferenceId, j.createdBy || currentUser, j.currencyCode || 'EGP', j.exchangeRate || 1, denomJson, j.id]);
+                            yield conn.query('UPDATE journal_entries SET date=?, description=?, notes=COALESCE(?, notes), referenceId=?, createdBy=?, currencyCode=?, exchangeRate=?, denominations=COALESCE(?, denominations) WHERE id=?', [(0, dateEngine_1.toMySQLDateTime)(j.date), j.description, j.notes || null, finalReferenceId, j.createdBy || currentUser, j.currencyCode || 'EGP', j.exchangeRate || 1, denomJson, j.id]);
                             // Lock journal_lines rows too before deleting to prevent MVCC conflict
                             yield conn.query('SELECT id FROM journal_lines WHERE journalId = ? FOR UPDATE', [j.id]);
                             yield conn.query('DELETE FROM journal_lines WHERE journalId = ?', [j.id]);
@@ -1826,19 +2003,41 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                                 }
                             }
                             console.log(`[syncController] INSERT journal ${(_19 = j.id) === null || _19 === void 0 ? void 0 : _19.substring(0, 8)} ref=${finalReferenceId === null || finalReferenceId === void 0 ? void 0 : finalReferenceId.substring(0, 12)} desc="${(_20 = j.description) === null || _20 === void 0 ? void 0 : _20.substring(0, 60)}"`);
-                            yield conn.query('INSERT INTO journal_entries (id, date, description, notes, referenceId, createdBy, currencyCode, exchangeRate, denominations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [j.id, toMySQLDateTime(j.date), j.description, j.notes || null, finalReferenceId, j.createdBy || currentUser, j.currencyCode || 'EGP', j.exchangeRate || 1, denomJson]);
+                            yield conn.query('INSERT INTO journal_entries (id, date, description, notes, referenceId, createdBy, currencyCode, exchangeRate, denominations) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [j.id, (0, dateEngine_1.toMySQLDateTime)(j.date), j.description, j.notes || null, finalReferenceId, j.createdBy || currentUser, j.currencyCode || 'EGP', j.exchangeRate || 1, denomJson]);
                         }
                         // Validate all lines have accountId
-                        const validLines = j.lines.filter((line) => {
-                            if (!line.accountId) {
-                                // PERF: console.warn(`âš ï¸ Skipping journal line without accountId in entry ${j.id}`);
-                                return false;
-                            }
-                            return true;
-                        });
+                        const validLines = j.lines.filter((line) => !!line.accountId);
                         if (validLines.length === 0) {
-                            // PERF: console.warn(`âš ï¸ No valid lines for journal ${j.id} after filtering`);
                             continue;
+                        }
+                        // Server-side fallback/correction for CASH/BANK treasury mapping.
+                        // If the journal is linked to an invoice (referenceId), check if that invoice has a specific treasury (bankAccountId).
+                        // If it does, make sure the cash/bank ledger line points to the correct GL account.
+                        if (finalReferenceId) {
+                            try {
+                                const [invRows] = yield conn.query('SELECT id, paymentMethod, bankAccountId FROM invoices WHERE id = ? LIMIT 1', [finalReferenceId]);
+                                if (invRows.length > 0) {
+                                    const linkedInv = invRows[0];
+                                    if (linkedInv.bankAccountId) {
+                                        const resolvedAcc = yield resolveSyncCashBankAccount(conn, linkedInv.bankAccountId);
+                                        if (resolvedAcc) {
+                                            const [defaultCashAcc] = yield conn.query("SELECT id FROM accounts WHERE code = '101' LIMIT 1");
+                                            const defaultCashId = (_21 = defaultCashAcc[0]) === null || _21 === void 0 ? void 0 : _21.id;
+                                            for (const line of validLines) {
+                                                const isDefaultCash = line.accountId === defaultCashId || line.accountId === '101' || line.accountId === '1e93a16a-3148-4d35-b4ad-4d046ce28cfc';
+                                                if (isDefaultCash && resolvedAcc.id !== defaultCashId) {
+                                                    console.log(`[syncController] Intercepted cached/old client journal line: rewriting cash account from default 101 to resolved treasury: ${resolvedAcc.name} (${resolvedAcc.id})`);
+                                                    line.accountId = resolvedAcc.id;
+                                                    line.accountName = resolvedAcc.name;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            catch (e) {
+                                console.error('[syncController] Failed to auto-correct treasury mapping for journal:', e.message);
+                            }
                         }
                         // ===== BALANCE VALIDATION =====
                         // Ensure total debits = total credits before saving
@@ -1851,7 +2050,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         }
                         // DIAGNOSTIC: Log journal lines being saved to trace Cash/Bank account usage
                         for (const line of validLines) {
-                            console.log(`[syncController]   LINE j=${(_21 = j.id) === null || _21 === void 0 ? void 0 : _21.substring(0, 8)}: acct=${(_22 = (line.accountName || 'unknown')) === null || _22 === void 0 ? void 0 : _22.substring(0, 15)} Dr=${line.debit || 0} Cr=${line.credit || 0}`);
+                            console.log(`[syncController]   LINE j=${(_22 = j.id) === null || _22 === void 0 ? void 0 : _22.substring(0, 8)}: acct=${(_23 = (line.accountName || 'unknown')) === null || _23 === void 0 ? void 0 : _23.substring(0, 15)} Dr=${line.debit || 0} Cr=${line.credit || 0}`);
                         }
                         const values = validLines.map((line) => [
                             j.id || null,
@@ -1902,13 +2101,13 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             const vLabel = vIsReceipt ? 'سند قبض' : 'سند صرف';
                             const safetyJournalId = (0, crypto_1.randomUUID)();
                             // Determine cash/bank account
-                            let sCashId = ((_23 = glAccountCache === null || glAccountCache === void 0 ? void 0 : glAccountCache.cash) === null || _23 === void 0 ? void 0 : _23.id) || null;
-                            let sCashName = ((_24 = glAccountCache === null || glAccountCache === void 0 ? void 0 : glAccountCache.cash) === null || _24 === void 0 ? void 0 : _24.name) || 'الخزينة';
-                            if (vInv.paymentMethod === 'BANK' && vInv.bankAccountId) {
-                                const [bAccs] = yield conn.query('SELECT b.accountId, b.name FROM banks b WHERE b.id = ? OR b.accountId = ? LIMIT 1', [vInv.bankAccountId, vInv.bankAccountId]);
-                                if ((_25 = bAccs[0]) === null || _25 === void 0 ? void 0 : _25.accountId) {
-                                    sCashId = bAccs[0].accountId;
-                                    sCashName = vInv.bankName || bAccs[0].name || 'البنك';
+                            let sCashId = ((_24 = glAccountCache === null || glAccountCache === void 0 ? void 0 : glAccountCache.cash) === null || _24 === void 0 ? void 0 : _24.id) || null;
+                            let sCashName = ((_25 = glAccountCache === null || glAccountCache === void 0 ? void 0 : glAccountCache.cash) === null || _25 === void 0 ? void 0 : _25.name) || 'الخزينة';
+                            if (vInv.bankAccountId) {
+                                const resolved = yield resolveSyncCashBankAccount(conn, vInv.bankAccountId);
+                                if (resolved) {
+                                    sCashId = resolved.id;
+                                    sCashName = resolved.name;
                                 }
                             }
                             if (!sCashId) {
@@ -1971,7 +2170,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             if (sCashId && sPartId) {
                                 const absTotal = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(vInv.total).abs());
                                 const isEffReceipt = (vIsReceipt && vInv.total >= 0) || (!vIsReceipt && vInv.total < 0);
-                                yield conn.query('INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)', [safetyJournalId, toMySQLDateTime(vInv.date),
+                                yield conn.query('INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)', [safetyJournalId, (0, dateEngine_1.toMySQLDateTime)(vInv.date),
                                     `${vLabel} - ${vInv.partnerName || ''}${vInv.paymentMethod === 'BANK' ? ' - تحويل بنكي' : ''}`,
                                     vInv.id, vInv.createdBy || currentUser]);
                                 const sjlValues = isEffReceipt
@@ -2163,8 +2362,8 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                         partnerId = ?, partnerName = ?, description = ?, createdDate = ?, 
                         bankAccountId = ?, bounceReason = ?, transactionId = ?, createdBy = ?
                         WHERE id = ?`, [
-                        c.number, c.bankName, c.amount, toMySQLDateTime(c.dueDate), c.status, c.type,
-                        c.partnerId, c.partnerName, c.description, toMySQLDateTime(c.createdDate),
+                        c.number, c.bankName, c.amount, (0, dateEngine_1.toMySQLDateTime)(c.dueDate), c.status, c.type,
+                        c.partnerId, c.partnerName, c.description, (0, dateEngine_1.toMySQLDateTime)(c.createdDate),
                         c.bankAccountId, c.bounceReason, c.transactionId, c.createdBy || currentUser,
                         c.id
                     ]);
@@ -2172,8 +2371,8 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                 else {
                     yield conn.query(`INSERT INTO cheques (id, number, bankName, amount, dueDate, status, type, partnerId, partnerName, description, createdDate, bankAccountId, bounceReason, transactionId, createdBy)
                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-                        c.id, c.number, c.bankName, c.amount, toMySQLDateTime(c.dueDate), c.status, c.type,
-                        c.partnerId, c.partnerName, c.description, toMySQLDateTime(c.createdDate),
+                        c.id, c.number, c.bankName, c.amount, (0, dateEngine_1.toMySQLDateTime)(c.dueDate), c.status, c.type,
+                        c.partnerId, c.partnerName, c.description, (0, dateEngine_1.toMySQLDateTime)(c.createdDate),
                         c.bankAccountId, c.bounceReason, c.transactionId, c.createdBy || currentUser
                     ]);
                 }
@@ -2248,18 +2447,18 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                             assetAccountId=?, accumulatedDepreciationAccountId=?, expenseAccountId=?, 
                             status=?, lastDepreciationDate=?
                             WHERE id=?`, [
-                            a.name, toMySQLDateTime(a.purchaseDate), a.purchaseCost, a.salvageValue, a.lifeYears,
+                            a.name, (0, dateEngine_1.toMySQLDateTime)(a.purchaseDate), a.purchaseCost, a.salvageValue, a.lifeYears,
                             a.assetAccountId, a.accumulatedDepreciationAccountId, a.expenseAccountId,
-                            a.status, toMySQLDateTime(a.lastDepreciationDate),
+                            a.status, (0, dateEngine_1.toMySQLDateTime)(a.lastDepreciationDate),
                             a.id
                         ]);
                     }
                     else {
                         yield (0, db_1.safePoolQuery)(`INSERT INTO fixed_assets (id, name, purchaseDate, purchaseCost, salvageValue, lifeYears, assetAccountId, accumulatedDepreciationAccountId, expenseAccountId, status, lastDepreciationDate)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-                            a.id, a.name, toMySQLDateTime(a.purchaseDate), a.purchaseCost, a.salvageValue, a.lifeYears,
+                            a.id, a.name, (0, dateEngine_1.toMySQLDateTime)(a.purchaseDate), a.purchaseCost, a.salvageValue, a.lifeYears,
                             a.assetAccountId, a.accumulatedDepreciationAccountId, a.expenseAccountId,
-                            a.status || 'ACTIVE', toMySQLDateTime(a.lastDepreciationDate)
+                            a.status || 'ACTIVE', (0, dateEngine_1.toMySQLDateTime)(a.lastDepreciationDate)
                         ]);
                     }
                 }
@@ -2339,20 +2538,20 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
         if (invoicesToProcess.length > 0 || deletedInvoiceId) {
             eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: currentUser });
             (0, index_1.invalidateKPICache)();
-            if (cheques && cheques.length > 0) {
-                eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'cheques', updatedBy: currentUser });
-            }
-            if (processedJournals.length > 0 || deletedJournalId) {
-                eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'journal', updatedBy: currentUser });
-                (0, index_1.invalidateKPICache)();
-            }
-            if ((accounts && accounts.length > 0) || processedJournals.length > 0) {
-                eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'accounts', updatedBy: currentUser });
-            }
-            if (partners && partners.length > 0) {
-                eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'partner', updatedBy: currentUser });
-                (0, index_1.invalidateKPICache)();
-            }
+        }
+        if (cheques && cheques.length > 0) {
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'cheques', updatedBy: currentUser });
+        }
+        if (processedJournals.length > 0 || deletedJournalId) {
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'journal', updatedBy: currentUser });
+            (0, index_1.invalidateKPICache)();
+        }
+        if ((accounts && accounts.length > 0) || processedJournals.length > 0) {
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'accounts', updatedBy: currentUser });
+        }
+        if (partners && partners.length > 0) {
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'partner', updatedBy: currentUser });
+            (0, index_1.invalidateKPICache)();
         }
         res.json({
             success: true,
@@ -2390,7 +2589,7 @@ exports.syncTransaction = syncTransaction;
 // POST /api/sync/repair-orphaned-vouchers
 // =====================================================
 const repairOrphanedVouchers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v, _w;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r, _s, _t, _u, _v;
     const conn = yield (0, db_1.getConnection)();
     try {
         const authReq = req;
@@ -2400,7 +2599,8 @@ const repairOrphanedVouchers = (req, res) => __awaiter(void 0, void 0, void 0, f
         const [orphanedRows] = yield conn.query(`
             SELECT i.id, i.number, i.date, i.type, i.partnerId, i.partnerName, 
                    i.total, i.paymentMethod, i.bankAccountId, i.bankName,
-                   i.notes, i.createdBy
+                   i.notes, i.createdBy, i.currencyCode, i.exchangeRate, i.branchId,
+                   i.paymentSources, i.applyFee, i.fee, i.feeTax, i.feeTotal, i.feeChargedTo
             FROM invoices i
             LEFT JOIN journal_entries je ON je.referenceId = i.id OR je.referenceId = i.number
             WHERE i.type IN ('PAYMENT', 'RECEIPT')
@@ -2437,18 +2637,18 @@ const repairOrphanedVouchers = (req, res) => __awaiter(void 0, void 0, void 0, f
                 // Determine cash/bank account
                 let cashBankAccountId = null;
                 let cashBankAccountName = 'الخزينة';
-                if (inv.paymentMethod === 'BANK' && inv.bankAccountId) {
-                    const [bankAccounts] = yield conn.query(`SELECT b.accountId, b.name FROM banks b WHERE b.id = ? OR b.accountId = ? LIMIT 1`, [inv.bankAccountId, inv.bankAccountId]);
-                    if ((_c = bankAccounts[0]) === null || _c === void 0 ? void 0 : _c.accountId) {
-                        cashBankAccountId = bankAccounts[0].accountId;
-                        cashBankAccountName = inv.bankName || bankAccounts[0].name || 'البنك';
+                if (inv.bankAccountId) {
+                    const resolved = yield resolveSyncCashBankAccount(conn, inv.bankAccountId);
+                    if (resolved) {
+                        cashBankAccountId = resolved.id;
+                        cashBankAccountName = resolved.name;
                     }
                 }
                 // Fallback to cash/treasury
                 if (!cashBankAccountId) {
                     const [cashAccounts] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%خزينة%' OR name LIKE '%نقدية%' OR name LIKE '%صندوق%' OR code LIKE '101%' LIMIT 1`);
-                    cashBankAccountId = (_d = cashAccounts[0]) === null || _d === void 0 ? void 0 : _d.id;
-                    cashBankAccountName = ((_e = cashAccounts[0]) === null || _e === void 0 ? void 0 : _e.name) || 'الخزينة';
+                    cashBankAccountId = (_c = cashAccounts[0]) === null || _c === void 0 ? void 0 : _c.id;
+                    cashBankAccountName = ((_d = cashAccounts[0]) === null || _d === void 0 ? void 0 : _d.name) || 'الخزينة';
                 }
                 if (!cashBankAccountId) {
                     // PERF: console.warn(`âš ï¸ [REPAIR] Skipping ${inv.id} â€” no cash/bank account found`);
@@ -2470,49 +2670,49 @@ const repairOrphanedVouchers = (req, res) => __awaiter(void 0, void 0, void 0, f
                     // === PAYMENT CATEGORIES ===
                     if (vCat === 'expenses') {
                         const [expAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [inv.partnerId]);
-                        partnerAccountId = (_f = expAccs[0]) === null || _f === void 0 ? void 0 : _f.id;
-                        partnerAccountName = ((_g = expAccs[0]) === null || _g === void 0 ? void 0 : _g.name) || 'مصروفات';
+                        partnerAccountId = (_e = expAccs[0]) === null || _e === void 0 ? void 0 : _e.id;
+                        partnerAccountName = ((_f = expAccs[0]) === null || _f === void 0 ? void 0 : _f.name) || 'مصروفات';
                     }
                     else if (vCat === 'employee_advance') {
                         const [advAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%سلف%' OR name LIKE '%عهد%' OR code = '109' LIMIT 1`);
-                        partnerAccountId = (_h = advAccs[0]) === null || _h === void 0 ? void 0 : _h.id;
-                        partnerAccountName = ((_j = advAccs[0]) === null || _j === void 0 ? void 0 : _j.name) || 'سلف موظفين';
+                        partnerAccountId = (_g = advAccs[0]) === null || _g === void 0 ? void 0 : _g.id;
+                        partnerAccountName = ((_h = advAccs[0]) === null || _h === void 0 ? void 0 : _h.name) || 'سلف موظفين';
                     }
                     else if (vCat === 'salary') {
                         const [salAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%رواتب%' OR name LIKE '%أجور%' OR code = '204' LIMIT 1`);
-                        partnerAccountId = (_k = salAccs[0]) === null || _k === void 0 ? void 0 : _k.id;
-                        partnerAccountName = ((_l = salAccs[0]) === null || _l === void 0 ? void 0 : _l.name) || 'رواتب';
+                        partnerAccountId = (_j = salAccs[0]) === null || _j === void 0 ? void 0 : _j.id;
+                        partnerAccountName = ((_k = salAccs[0]) === null || _k === void 0 ? void 0 : _k.name) || 'رواتب';
                     }
                     else if (vCat === 'labour') {
                         // Customer payment via labour: debit AR
                         const [arAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%عملاء%' OR name LIKE '%مدينون%' OR code LIKE '104%' LIMIT 1`);
-                        partnerAccountId = (_m = arAccs[0]) === null || _m === void 0 ? void 0 : _m.id;
-                        partnerAccountName = ((_o = arAccs[0]) === null || _o === void 0 ? void 0 : _o.name) || 'العملاء';
+                        partnerAccountId = (_l = arAccs[0]) === null || _l === void 0 ? void 0 : _l.id;
+                        partnerAccountName = ((_m = arAccs[0]) === null || _m === void 0 ? void 0 : _m.name) || 'العملاء';
                     }
                     else {
                         // Default: Supplier â†’ AP
                         const [apAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%موردين%' OR name LIKE '%دائنون%' OR code LIKE '201%' LIMIT 1`);
-                        partnerAccountId = (_p = apAccs[0]) === null || _p === void 0 ? void 0 : _p.id;
-                        partnerAccountName = ((_q = apAccs[0]) === null || _q === void 0 ? void 0 : _q.name) || 'الموردين';
+                        partnerAccountId = (_o = apAccs[0]) === null || _o === void 0 ? void 0 : _o.id;
+                        partnerAccountName = ((_p = apAccs[0]) === null || _p === void 0 ? void 0 : _p.name) || 'الموردين';
                     }
                 }
                 else {
                     // === RECEIPT CATEGORIES ===
                     if (vCat === 'employee_repay') {
                         const [advAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%سلف%' OR name LIKE '%عهد%' OR code = '109' LIMIT 1`);
-                        partnerAccountId = (_r = advAccs[0]) === null || _r === void 0 ? void 0 : _r.id;
-                        partnerAccountName = ((_s = advAccs[0]) === null || _s === void 0 ? void 0 : _s.name) || 'سلف موظفين';
+                        partnerAccountId = (_q = advAccs[0]) === null || _q === void 0 ? void 0 : _q.id;
+                        partnerAccountName = ((_r = advAccs[0]) === null || _r === void 0 ? void 0 : _r.name) || 'سلف موظفين';
                     }
                     else if (vCat === 'supplier_refund') {
                         const [apAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%موردين%' OR name LIKE '%دائنون%' OR code LIKE '201%' LIMIT 1`);
-                        partnerAccountId = (_t = apAccs[0]) === null || _t === void 0 ? void 0 : _t.id;
-                        partnerAccountName = ((_u = apAccs[0]) === null || _u === void 0 ? void 0 : _u.name) || 'الموردين';
+                        partnerAccountId = (_s = apAccs[0]) === null || _s === void 0 ? void 0 : _s.id;
+                        partnerAccountName = ((_t = apAccs[0]) === null || _t === void 0 ? void 0 : _t.name) || 'الموردين';
                     }
                     else {
                         // Default: Customer â†’ AR
                         const [arAccs] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%عملاء%' OR name LIKE '%مدينون%' OR code LIKE '104%' LIMIT 1`);
-                        partnerAccountId = (_v = arAccs[0]) === null || _v === void 0 ? void 0 : _v.id;
-                        partnerAccountName = ((_w = arAccs[0]) === null || _w === void 0 ? void 0 : _w.name) || 'العملاء';
+                        partnerAccountId = (_u = arAccs[0]) === null || _u === void 0 ? void 0 : _u.id;
+                        partnerAccountName = ((_v = arAccs[0]) === null || _v === void 0 ? void 0 : _v.name) || 'العملاء';
                     }
                 }
                 if (!partnerAccountId) {
@@ -2520,20 +2720,40 @@ const repairOrphanedVouchers = (req, res) => __awaiter(void 0, void 0, void 0, f
                     continue;
                 }
                 const invTotal = (0, decimalUtils_1.toNum)((0, decimalUtils_1.D)(inv.total));
-                // Create journal entry header
-                yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)`, [journalId, inv.date, `${voucherLabel} - ${inv.partnerName || ''}${inv.paymentMethod === 'BANK' ? ' - تحويل بنكي' : ''} [إصلاح]`, inv.id, currentUser]);
-                const isEffectivelyReceipt = (isReceipt && invTotal >= 0) || (!isReceipt && invTotal < 0);
-                const absTotal = Math.abs(invTotal);
-                if (isEffectivelyReceipt) {
-                    // RECEIPT: Debit Cash/Bank, Credit Receivables/Partner
-                    yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES (?, ?, ?, ?, ?)`, [journalId, cashBankAccountId, cashBankAccountName, absTotal, 0]);
-                    yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES (?, ?, ?, ?, ?)`, [journalId, partnerAccountId, partnerAccountName, 0, absTotal]);
-                }
-                else {
-                    // PAYMENT: Debit Payables/Expense, Credit Cash/Bank
-                    yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES (?, ?, ?, ?, ?)`, [journalId, partnerAccountId, partnerAccountName, absTotal, 0]);
-                    yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES (?, ?, ?, ?, ?)`, [journalId, cashBankAccountId, cashBankAccountName, 0, absTotal]);
-                }
+                const paymentSources = inv.paymentSources
+                    ? (typeof inv.paymentSources === 'string' ? JSON.parse(inv.paymentSources) : inv.paymentSources)
+                    : [];
+                const mockReq = {
+                    body: {
+                        paymentSources: paymentSources,
+                        applyFee: inv.applyFee || false,
+                        fee: inv.fee || 0,
+                        feeTax: inv.feeTax || 0,
+                        feeTotal: inv.feeTotal || 0,
+                        feeChargedTo: inv.feeChargedTo || 'CLIENT',
+                        sourceBankName: inv.bankName || 'البنك'
+                    },
+                    user: req.user,
+                    branchContext: req.branchContext
+                };
+                yield (0, paymentGeneration_1.createPaymentJournal)({
+                    conn,
+                    journalId,
+                    date: inv.date,
+                    description: `${voucherLabel} - ${inv.partnerName || ''}${inv.paymentMethod === 'BANK' ? ' - تحويل بنكي' : ''} [إصلاح]`,
+                    referenceId: inv.id,
+                    createdBy: inv.createdBy || currentUser,
+                    amount: invTotal,
+                    paymentType: isReceipt ? 'RECEIPT' : 'PAYMENT',
+                    paymentMethod: inv.paymentMethod || 'CASH',
+                    bankAccountId: inv.bankAccountId || cashBankAccountId,
+                    currencyCode: inv.currencyCode || 'EGP',
+                    exchangeRate: inv.exchangeRate || 1,
+                    branchId: inv.branchId,
+                    req: mockReq,
+                    partnerId: inv.partnerId,
+                    explicitAccountId: partnerAccountId
+                });
                 repairedCount++;
                 repaired.push({
                     id: inv.id,

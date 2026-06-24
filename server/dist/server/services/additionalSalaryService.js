@@ -19,11 +19,13 @@ const getAdditionalSalaryEntries = (params) => __awaiter(void 0, void 0, void 0,
     let query = `
         SELECT ase.*, e.fullName as employeeName, e.department,
                sc.name as componentName, sc.code as componentCode,
-               pc.month as cycleMonth, pc.year as cycleYear
+               pc.month as cycleMonth, pc.year as cycleYear,
+               sr.name as ruleName
         FROM additional_salary_entries ase
         JOIN employees e ON ase.employeeId = e.id
         LEFT JOIN salary_components sc ON ase.componentId = sc.id
         LEFT JOIN payroll_cycles pc ON ase.payrollCycleId = pc.id
+        LEFT JOIN hr_salary_rules sr ON ase.ruleId = sr.id
         WHERE 1=1
     `;
     const queryParams = [];
@@ -50,17 +52,43 @@ const getAdditionalSalaryEntries = (params) => __awaiter(void 0, void 0, void 0,
 exports.getAdditionalSalaryEntries = getAdditionalSalaryEntries;
 const createAdditionalSalary = (data) => __awaiter(void 0, void 0, void 0, function* () {
     const id = (0, crypto_1.randomUUID)();
+    let ruleId = data.ruleId || null;
+    let amount = data.amount;
+    let componentId = data.componentId || null;
+    let name = data.name;
+    let type = data.type;
+    let source = data.source || 'MANUAL';
+    if (data.ruleId) {
+        const [rules] = yield db_1.pool.query('SELECT * FROM hr_salary_rules WHERE id = ?', [data.ruleId]);
+        if (rules.length > 0) {
+            const rule = rules[0];
+            componentId = rule.componentId || componentId;
+            name = rule.name || name;
+            type = rule.type || type;
+            source = rule.type === 'EARNING' ? 'BONUS' : 'PENALTY';
+            if (rule.calculationType === 'PERCENTAGE') {
+                const [empRows] = yield db_1.pool.query('SELECT baseSalary FROM employees WHERE id = ?', [data.employeeId]);
+                if (empRows.length > 0) {
+                    const baseSalary = Number(empRows[0].baseSalary || 0);
+                    amount = (baseSalary * Number(rule.amount)) / 100;
+                }
+            }
+            else {
+                amount = Number(rule.amount);
+            }
+        }
+    }
     yield db_1.pool.query(`
         INSERT INTO additional_salary_entries 
         (id, employeeId, componentId, name, amount, type, payrollCycleId, reason, notes,
-         isRecurring, recurringFrom, recurringTo, source, createdBy, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT')
+         isRecurring, recurringFrom, recurringTo, source, createdBy, status, ruleId)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?)
     `, [
-        id, data.employeeId, data.componentId || null,
-        data.name, data.amount, data.type,
+        id, data.employeeId, componentId,
+        name, amount, type,
         data.payrollCycleId || null, data.reason || null, data.notes || null,
         data.isRecurring || false, data.recurringFrom || null, data.recurringTo || null,
-        data.source || 'MANUAL', data.createdBy || null
+        source, data.createdBy || null, ruleId
     ]);
     return id;
 });
@@ -138,9 +166,11 @@ const getApprovedForPayroll = (employeeId, payrollCycleId, month, year) => __awa
     const periodStart = `${year}-${String(month).padStart(2, '0')}-01`;
     const periodEnd = `${year}-${String(month).padStart(2, '0')}-${new Date(year, month, 0).getDate()}`;
     const [rows] = yield db_1.pool.query(`
-        SELECT ase.*, sc.name as componentName, sc.code as componentCode
+        SELECT ase.*, sc.name as componentName, sc.code as componentCode,
+               sr.name as ruleName
         FROM additional_salary_entries ase
         LEFT JOIN salary_components sc ON ase.componentId = sc.id
+        LEFT JOIN hr_salary_rules sr ON ase.ruleId = sr.id
         WHERE ase.employeeId = ? 
           AND ase.status = 'APPROVED'
           AND (

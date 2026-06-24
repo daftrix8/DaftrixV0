@@ -41,4 +41,5 @@ exports.INITIAL_ACCOUNTS = [
     { id: '508', code: '508', name: 'صيانة وتشغيل', type: 'EXPENSE', balance: 0, openingBalance: 0 },
     { id: '509', code: '509', name: 'مصروف إهلاك', type: 'EXPENSE', balance: 0, openingBalance: 0 },
     { id: '510', code: '510', name: 'عجز نقدية', type: 'EXPENSE', balance: 0, openingBalance: 0 },
+    { id: '511', code: '511', name: 'فروق التقريب', type: 'EXPENSE', balance: 0, openingBalance: 0 },
 ];

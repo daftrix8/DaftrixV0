@@ -139,7 +139,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     const paymentType = (type === 'INVOICE_SALE' || type === 'RETURN_PURCHASE') ? 'RECEIPT' : 'PAYMENT';
                     const paymentPrefix = paymentType === 'RECEIPT' ? 'REC-' : 'PAY-';
                     const [maxResult] = yield conn.query(`SELECT MAX(CAST(SUBSTRING(number, ?) AS UNSIGNED)) as maxNum 
-                         FROM invoices WHERE number LIKE ? AND number REGEXP ?`, [paymentPrefix.length + 1, `${paymentPrefix}%`, `^${paymentPrefix.replace('-', '\\\\-')}[0-9]+$`]);
+                         FROM invoices WHERE number LIKE ? AND number COLLATE utf8mb4_unicode_ci REGEXP ?`, [paymentPrefix.length + 1, `${paymentPrefix}%`, `^${paymentPrefix.replace('-', '\\\\-')}[0-9]+$`]);
                     const maxNum = ((_a = maxResult[0]) === null || _a === void 0 ? void 0 : _a.maxNum) || 0;
                     const paymentNumber = `${paymentPrefix}${String(maxNum + 1).padStart(5, '0')}`;
                     const paymentId = (0, crypto_1.randomUUID)();

@@ -17,12 +17,21 @@ const errorHandler_1 = require("../utils/errorHandler");
 const eventBus_1 = require("../utils/eventBus");
 const policyEnforcement_1 = require("../utils/policyEnforcement");
 const branchFilter_1 = require("../utils/branchFilter");
+const normalizeArabicStr = (text) => {
+    if (!text)
+        return '';
+    return text.toLowerCase()
+        .replace(/[أإآ]/g, 'ا')
+        .replace(/ة/g, 'ه')
+        .replace(/[ىئ]/g, 'ي')
+        .replace(/ؤ/g, 'و');
+};
 /**
  * Create a treasury receipt from mobile app
  * POST /api/treasury/receipts
  */
 const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e, _f, _g;
     console.log('📱💰 Treasury Receipt Request Received:', JSON.stringify(req.body, null, 2));
     const connection = yield (0, db_1.getConnection)();
     try {
@@ -31,16 +40,38 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const user = req.user;
         if (!partnerId || !amount || amount <= 0) {
             connection.release();
-            return res.status(400).json({ error: 'Partner ID and amount are required' });
+            return res.status(400).json({ error: 'Partner ID and a positive, non-zero amount are required' });
         }
         const receiptDate = date ? new Date(date).toISOString().split('T')[0] : new Date().toISOString().split('T')[0];
+        // === IDEMPOTENCY CHECK ===
+        const idempotencyKey = ((_a = req.headers) === null || _a === void 0 ? void 0 : _a['idempotency-key']) || ((_b = req.body) === null || _b === void 0 ? void 0 : _b.offlineId) || ((_c = req.body) === null || _c === void 0 ? void 0 : _c.idempotencyKey);
+        if (idempotencyKey) {
+            const [existing] = yield connection.query('SELECT id, number, total FROM invoices WHERE offlineId = ? OR notes LIKE ? LIMIT 1', [idempotencyKey, `%Idempotency:${idempotencyKey}%`]);
+            if (existing.length > 0) {
+                yield connection.rollback();
+                connection.release();
+                console.log(`♻️ Duplicate Treasury Transaction detected for key: ${idempotencyKey}. Returning existing.`);
+                return res.status(200).json({
+                    id: existing[0].id,
+                    number: existing[0].number,
+                    amount: existing[0].total,
+                    success: true,
+                    duplicate: true
+                });
+            }
+        }
+        // Get partner type (CUSTOMER vs SUPPLIER) to handle accounting directions correctly
+        const [partnerRows] = yield connection.query('SELECT type, name FROM partners WHERE id = ? LIMIT 1', [partnerId]);
+        const partner = partnerRows[0];
+        const isSupplier = (partner === null || partner === void 0 ? void 0 : partner.type) === 'SUPPLIER';
+        const transactionType = isSupplier ? 'PAYMENT' : 'RECEIPT';
         // === SYSTEM POLICY VALIDATION (PRE-TRANSACTION) ===
         const authReq = req;
         const currentUserRole = authReq.user ? authReq.user.role : undefined;
         const systemConfig = authReq.systemConfig;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
             const context = {
-                type: 'RECEIPT',
+                type: transactionType,
                 date: receiptDate,
                 total: amount,
                 partnerId: partnerId,
@@ -50,7 +81,6 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 currentUserRole
             };
             // Note: Use connection to pass to validation, wait for result.
-            // For policies requiring DB lookups like Credit Limit, passing conn is helpful
             const validationResult = yield (0, policyEnforcement_1.validateTransactionFull)(context, systemConfig, connection);
             if (!validationResult.valid) {
                 yield connection.rollback();
@@ -59,9 +89,10 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             }
         }
         const receiptId = (0, crypto_1.randomUUID)();
-        const receiptNumber = `RCV-${Date.now().toString(36).toUpperCase()}`;
+        const numberPrefix = isSupplier ? 'PAY' : 'RCV';
+        const receiptNumber = `${numberPrefix}-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
         const paymentMethod = method === 'BANK' ? 'BANK' : 'CASH';
-        console.log(`💰 Creating treasury receipt: ${receiptNumber} for ${amount} (${paymentMethod})`);
+        console.log(`💰 Creating treasury ${transactionType.toLowerCase()}: ${receiptNumber} for ${amount} (${paymentMethod})`);
         // Get bank's GL account ID if bank payment
         let bankGLAccountId = null;
         let bankName = null;
@@ -72,33 +103,58 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 bankName = bankRows[0].name;
                 console.log(`🏦 Found bank: ${bankName}, GL Account: ${bankGLAccountId}`);
             }
+            else {
+                // Check if it is a valid GL account ID directly
+                const [accRows] = yield connection.query(`SELECT name FROM accounts WHERE id = ? LIMIT 1`, [bankAccountId]);
+                if (accRows[0]) {
+                    bankGLAccountId = bankAccountId;
+                    bankName = accRows[0].name;
+                }
+            }
+            if (!bankGLAccountId) {
+                yield connection.rollback();
+                connection.release();
+                return res.status(400).json({ error: 'Invalid Bank or Account ID' });
+            }
         }
-        // 1. Create receipt invoice
-        // If it's a foreign currency, 'amount' is in EGP (the base currency value). 
-        // We'll calculate the foreignTotal by dividing amount / exchangeRate.
-        const foreignTotal = currencyCode !== 'EGP' ? amount / exchangeRate : null;
+        // === CURRENCY CONVERSION ===
+        // If currencyCode !== 'EGP', the amount passed is the foreign currency amount (e.g. $100).
+        // We calculate baseAmount (EGP) by multiplying: amount * exchangeRate.
+        const isForeign = currencyCode !== 'EGP';
+        const baseAmount = isForeign ? amount * exchangeRate : amount;
+        const foreignTotal = isForeign ? amount : null;
+        const originalNotes = notes || (reference ? `رقم المرجع: ${reference}` : (isSupplier ? 'صرف من التطبيق' : 'تحصيل من التطبيق'));
+        const annotatedNotes = idempotencyKey ? `${originalNotes} (Idempotency:${idempotencyKey})` : originalNotes;
         const branchId = (0, branchFilter_1.resolveBranchIdForWrite)(req);
         yield connection.query(`
             INSERT INTO invoices (
                 id, number, date, type, partnerId, partnerName,
                 total, paidAmount, status, paymentMethod, posted,
                 notes, salesmanId, createdBy, bankAccountId,
-                currencyCode, exchangeRate, foreignTotal, branchId
-            ) VALUES (?, ?, ?, 'RECEIPT', ?, ?, ?, ?, 'POSTED', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+                currencyCode, exchangeRate, foreignTotal, branchId, offlineId
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'POSTED', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
-            receiptId, receiptNumber, receiptDate, partnerId, partnerName || 'عميل',
-            amount, amount,
+            receiptId, receiptNumber, receiptDate, transactionType, partnerId, partnerName || (partner === null || partner === void 0 ? void 0 : partner.name) || (isSupplier ? 'مورد' : 'عميل'),
+            baseAmount, baseAmount,
             paymentMethod,
-            notes || (reference ? `رقم المرجع: ${reference}` : 'تحصيل من التطبيق'),
+            annotatedNotes,
             salesmanId || null,
             (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'Mobile App',
             paymentMethod === 'BANK' ? (bankGLAccountId || bankAccountId) : null,
-            currencyCode, exchangeRate, foreignTotal, branchId
+            currencyCode, exchangeRate, foreignTotal, branchId,
+            idempotencyKey || null
         ]);
-        // 2. Update partner balance (decrease debt)
-        yield connection.query(`
-            UPDATE partners SET balance = COALESCE(balance, 0) - ? WHERE id = ?
-        `, [amount, partnerId]);
+        // 2. Update partner balance (decrease customer debt or decrease supplier payable)
+        if (isSupplier) {
+            yield connection.query(`
+                UPDATE partners SET balance = COALESCE(balance, 0) + ? WHERE id = ?
+            `, [baseAmount, partnerId]);
+        }
+        else {
+            yield connection.query(`
+                UPDATE partners SET balance = COALESCE(balance, 0) - ? WHERE id = ?
+            `, [baseAmount, partnerId]);
+        }
         // 3. Get treasury account for journal entry
         let treasuryAccountId = null;
         if (paymentMethod === 'BANK' && bankGLAccountId) {
@@ -110,60 +166,85 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 const [branchBank] = yield connection.query(`SELECT b.accountId FROM banks b
                      JOIN branches br ON br.defaultBankId = b.id
                      WHERE br.id = ? AND b.accountId IS NOT NULL LIMIT 1`, [branchId]);
-                treasuryAccountId = ((_a = branchBank[0]) === null || _a === void 0 ? void 0 : _a.accountId) || null;
+                treasuryAccountId = ((_d = branchBank[0]) === null || _d === void 0 ? void 0 : _d.accountId) || null;
             }
             if (!treasuryAccountId) {
                 // Fallback: first cash-type account (legacy behavior)
                 const [cashAccounts] = yield connection.query(`SELECT id FROM accounts WHERE code LIKE '101%' OR name LIKE '%نقدي%' OR name LIKE '%صندوق%' LIMIT 1`);
-                treasuryAccountId = (_b = cashAccounts[0]) === null || _b === void 0 ? void 0 : _b.id;
+                treasuryAccountId = (_e = cashAccounts[0]) === null || _e === void 0 ? void 0 : _e.id;
             }
         }
         // 4. Create journal entry
         if (treasuryAccountId) {
             const journalId = (0, crypto_1.randomUUID)();
+            const journalDesc = isSupplier
+                ? `صرف إلى ${partnerName || (partner === null || partner === void 0 ? void 0 : partner.name) || 'مورد'} - ${receiptNumber} - ${paymentMethod === 'BANK' ? bankName || 'تحويل بنكي' : 'نقدي'}`
+                : `تحصيل من ${partnerName || (partner === null || partner === void 0 ? void 0 : partner.name) || 'عميل'} - ${receiptNumber} - ${paymentMethod === 'BANK' ? bankName || 'تحويل بنكي' : 'نقدي'}`;
             yield connection.query(`
                 INSERT INTO journal_entries (id, date, description, referenceId, currencyCode, exchangeRate, branchId)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
             `, [
                 journalId,
                 receiptDate,
-                `تحصيل من ${partnerName || 'عميل'} - ${receiptNumber} - ${paymentMethod === 'BANK' ? bankName || 'تحويل بنكي' : 'نقدي'}`,
+                journalDesc,
                 receiptId,
                 currencyCode,
                 exchangeRate,
                 branchId
             ]);
-            // Get receivables account
-            const [receivablesAccounts] = yield connection.query(`
-                SELECT id FROM accounts WHERE code LIKE '112%' OR name LIKE '%عملاء%' OR name LIKE '%ذمم%' LIMIT 1
-            `);
-            const receivablesAccountId = (_c = receivablesAccounts[0]) === null || _c === void 0 ? void 0 : _c.id;
-            // Debit: Treasury/Bank, Credit: Receivables
-            yield connection.query(`
-                INSERT INTO journal_lines (journalId, accountId, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit)
-                VALUES (?, ?, ?, 0, ?, ?, ?, 0)
-            `, [journalId, treasuryAccountId, amount, currencyCode, exchangeRate, foreignTotal !== null ? foreignTotal : amount]);
-            if (receivablesAccountId) {
-                yield connection.query(`
-                    INSERT INTO journal_lines (journalId, accountId, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit)
-                    VALUES (?, ?, 0, ?, ?, ?, 0, ?)
-                `, [journalId, receivablesAccountId, amount, currencyCode, exchangeRate, foreignTotal !== null ? foreignTotal : amount]);
-                // Update account balances
-                yield connection.query(`UPDATE accounts SET balance = COALESCE(balance, 0) + ? WHERE id = ?`, [amount, treasuryAccountId]);
-                yield connection.query(`UPDATE accounts SET balance = COALESCE(balance, 0) - ? WHERE id = ?`, [amount, receivablesAccountId]);
+            if (isSupplier) {
+                // Get payables account (code pattern 201% or موردين / دائن)
+                const [payablesAccounts] = yield connection.query(`
+                    SELECT id FROM accounts WHERE code LIKE '201%' OR name LIKE '%موردين%' OR name LIKE '%دائن%' LIMIT 1
+                `);
+                const payablesAccountId = (_f = payablesAccounts[0]) === null || _f === void 0 ? void 0 : _f.id;
+                if (payablesAccountId) {
+                    // Debit: Payables, Credit: Treasury/Bank
+                    yield connection.query(`
+                        INSERT INTO journal_lines (journalId, accountId, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit)
+                        VALUES (?, ?, ?, 0, ?, ?, ?, 0)
+                    `, [journalId, payablesAccountId, baseAmount, currencyCode, exchangeRate, foreignTotal !== null ? foreignTotal : baseAmount]);
+                    yield connection.query(`
+                        INSERT INTO journal_lines (journalId, accountId, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit)
+                        VALUES (?, ?, 0, ?, ?, ?, 0, ?)
+                    `, [journalId, treasuryAccountId, baseAmount, currencyCode, exchangeRate, foreignTotal !== null ? foreignTotal : baseAmount]);
+                    // Update account balances
+                    const { updateAccountBalancesFromJournal } = require('../utils/accountBalanceUtils');
+                    yield updateAccountBalancesFromJournal(connection, [payablesAccountId, treasuryAccountId]);
+                }
+            }
+            else {
+                // Get receivables account (code pattern 112% or عملاء / ذمم)
+                const [receivablesAccounts] = yield connection.query(`
+                    SELECT id FROM accounts WHERE code LIKE '112%' OR name LIKE '%عملاء%' OR name LIKE '%ذمم%' LIMIT 1
+                `);
+                const receivablesAccountId = (_g = receivablesAccounts[0]) === null || _g === void 0 ? void 0 : _g.id;
+                if (receivablesAccountId) {
+                    // Debit: Treasury/Bank, Credit: Receivables
+                    yield connection.query(`
+                        INSERT INTO journal_lines (journalId, accountId, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit)
+                        VALUES (?, ?, ?, 0, ?, ?, ?, 0)
+                    `, [journalId, treasuryAccountId, baseAmount, currencyCode, exchangeRate, foreignTotal !== null ? foreignTotal : baseAmount]);
+                    yield connection.query(`
+                        INSERT INTO journal_lines (journalId, accountId, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit)
+                        VALUES (?, ?, 0, ?, ?, ?, 0, ?)
+                    `, [journalId, receivablesAccountId, baseAmount, currencyCode, exchangeRate, foreignTotal !== null ? foreignTotal : baseAmount]);
+                    // Update account balances
+                    const { updateAccountBalancesFromJournal } = require('../utils/accountBalanceUtils');
+                    yield updateAccountBalancesFromJournal(connection, [treasuryAccountId, receivablesAccountId]);
+                }
             }
             console.log(`📝 Created journal entry: ${journalId}`);
         }
-        // 5. Update bank balance for BANK method (separate from GL account)
-        // REMOVED: Banks balance is now calculated live from GL/journal lines
-        // to prevent drift and ensure single source of truth.
         yield connection.commit();
         // Log audit trail
-        yield (0, auditController_1.logAction)((user === null || user === void 0 ? void 0 : user.name) || 'Mobile', 'RECEIPT', 'CREATE', `تحصيل من ${partnerName || 'عميل'}`, `المبلغ: ${amount}`);
+        const actionType = isSupplier ? 'PAYMENT' : 'RECEIPT';
+        const actionDesc = isSupplier ? `صرف إلى ${partnerName || (partner === null || partner === void 0 ? void 0 : partner.name) || 'مورد'}` : `تحصيل من ${partnerName || (partner === null || partner === void 0 ? void 0 : partner.name) || 'عميل'}`;
+        yield (0, auditController_1.logAction)((user === null || user === void 0 ? void 0 : user.name) || 'Mobile', actionType, 'CREATE', actionDesc, `المبلغ: ${baseAmount} (${currencyCode})`);
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoices', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'Mobile' });
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'partners', updatedBy: (user === null || user === void 0 ? void 0 : user.name) || 'Mobile' });
-        console.log(`✅ Receipt created: ${receiptNumber}`);
+        console.log(`✅ ${transactionType} created: ${receiptNumber}`);
         res.status(201).json({ id: receiptId, number: receiptNumber, amount, success: true });
     }
     catch (error) {
@@ -177,13 +258,10 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 });
 exports.createReceipt = createReceipt;
 const getBanks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a;
     try {
-        // Branch isolation: non-admin users see only their branch's banks + shared (branchId IS NULL)
         const authReq = req;
-        const branchId = ((_a = authReq.branchContext) === null || _a === void 0 ? void 0 : _a.branchId) || null;
-        const userRole = (((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.role) || '').toUpperCase();
-        const isPrivileged = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN', 'MANAGER'].includes(userRole);
+        const { branchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(authReq);
         let banks;
         if (branchId && !isPrivileged) {
             // Branch-locked user: own branch + shared banks
@@ -191,7 +269,7 @@ const getBanks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
                 const [rows] = yield db_1.pool.query('SELECT * FROM banks WHERE branchId = ? OR branchId IS NULL', [branchId]);
                 banks = rows;
             }
-            catch (_c) {
+            catch (_b) {
                 // branchId column may not exist yet — fall through to unfiltered
                 const [rows] = yield db_1.pool.query('SELECT * FROM banks');
                 banks = rows;
@@ -202,43 +280,77 @@ const getBanks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             const [rows] = yield db_1.pool.query('SELECT * FROM banks');
             banks = rows;
         }
+        // --- VIRTUAL TREASURIES ---
+        // Include '101%' cash accounts that are not already explicitly linked in the banks table
+        const linkedAccountIds = banks.filter((b) => b.accountId).map((b) => b.accountId);
+        let cashFilterStr = linkedAccountIds.length > 0 ? 'AND id NOT IN (?)' : '';
+        const queryParams = linkedAccountIds.length > 0 ? [linkedAccountIds] : [];
+        const [virtualCashAccounts] = yield db_1.pool.query(`SELECT id, name, code as accountNumber, currencyCode as currency, COALESCE(balance, 0) as balance, COALESCE(openingBalance, 0) as openingBalance
+             FROM accounts 
+             WHERE code LIKE '101%' ${cashFilterStr}`, queryParams);
+        const virtualTreasuries = virtualCashAccounts.map((a) => ({
+            id: a.id, // Use accountId as bankId since it has no banks table entry
+            name: a.name,
+            accountNumber: a.accountNumber,
+            currency: a.currency || 'EGP',
+            accountId: a.id,
+            bankType: 'TREASURY',
+            isActive: 1,
+            isPrimary: 0,
+            isVirtual: true,
+            openingBalance: Number(a.openingBalance) || 0,
+            balance: Number(a.balance) || 0,
+            feeEnabled: 0
+        }));
+        banks = [...banks, ...virtualTreasuries];
+        // --------------------------
+        // Apply treasury visibility restriction based on defaultTreasuryId
+        const defaultTreasuryId = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.defaultTreasuryId) || null;
+        if (!isPrivileged && defaultTreasuryId) {
+            // If user has a specific treasury assigned, ONLY show that one (and all banks)
+            banks = banks.filter(b => b.bankType !== 'TREASURY' || String(b.id) === String(defaultTreasuryId));
+        }
         // Get all bank account IDs for batch journal query
         const accountIds = banks.filter((b) => b.accountId).map((b) => b.accountId);
         if (accountIds.length > 0) {
             // Batch: get opening balances and journal totals in 2 queries
             const [accounts] = yield db_1.pool.query('SELECT id, COALESCE(openingBalance, 0) as openingBalance FROM accounts WHERE id IN (?)', [accountIds]);
             const accountMap = new Map(accounts.map((a) => [a.id, Number(a.openingBalance) || 0]));
-            // Branch-scoped balance: for non-privileged users, only sum journal movements
-            // from their branch (+ shared/null-branch entries) so Branch A's cashier
-            // doesn't see Branch B's treasury balance.
-            let journalTotals;
-            if (branchId && !isPrivileged) {
-                [journalTotals] = yield db_1.pool.query(`SELECT jl.accountId, 
-                            COALESCE(SUM(jl.debit), 0) as totalDebit, 
-                            COALESCE(SUM(jl.credit), 0) as totalCredit
-                     FROM journal_lines jl
-                     JOIN journal_entries je ON jl.journalId = je.id
-                     WHERE jl.accountId IN (?)
-                       AND (je.branchId = ? OR je.branchId IS NULL)
-                     GROUP BY jl.accountId`, [accountIds, branchId]);
+            // Bank/treasury balances are physical and branch-aware. We sum all journal lines
+            // for the linked accounts joining with journal_entries to group by branchId.
+            const [journalTotals] = yield db_1.pool.query(`SELECT jl.accountId, je.branchId,
+                        COALESCE(SUM(jl.debit), 0) as totalDebit, 
+                        COALESCE(SUM(jl.credit), 0) as totalCredit
+                 FROM journal_lines jl
+                 JOIN journal_entries je ON jl.journalId = je.id
+                 WHERE jl.accountId IN (?)
+                 GROUP BY jl.accountId, je.branchId`, [accountIds]);
+            // Map accountId -> list of movements by branch
+            const journalMap = new Map();
+            for (const j of journalTotals) {
+                const list = journalMap.get(j.accountId) || [];
+                list.push({ branchId: j.branchId, d: Number(j.totalDebit), c: Number(j.totalCredit) });
+                journalMap.set(j.accountId, list);
             }
-            else {
-                [journalTotals] = yield db_1.pool.query(`SELECT accountId, 
-                            COALESCE(SUM(debit), 0) as totalDebit, 
-                            COALESCE(SUM(credit), 0) as totalCredit
-                     FROM journal_lines WHERE accountId IN (?)
-                     GROUP BY accountId`, [accountIds]);
-            }
-            const journalMap = new Map(journalTotals.map((j) => [j.accountId, { d: Number(j.totalDebit), c: Number(j.totalCredit) }]));
             for (const bank of banks) {
                 if (bank.accountId) {
                     const opening = accountMap.get(bank.accountId) || 0;
-                    const jl = journalMap.get(bank.accountId) || { d: 0, c: 0 };
+                    const movements = journalMap.get(bank.accountId) || [];
+                    let debits = 0;
+                    let credits = 0;
+                    for (const mov of movements) {
+                        // If the bank belongs to a specific branch, only sum that branch's transactions or shared ones
+                        // If the bank has no branchId (global), sum all transactions
+                        if (!bank.branchId || mov.branchId === bank.branchId || mov.branchId === null) {
+                            debits += mov.d;
+                            credits += mov.c;
+                        }
+                    }
                     // Expose openingBalance (raw) separately from balance (computed live)
                     // The frontend must send openingBalance back on edit — NOT balance —
                     // to avoid conflating journal movements with the opening balance.
                     bank.openingBalance = opening;
-                    bank.balance = opening + jl.d - jl.c;
+                    bank.balance = Math.round((opening + debits - credits) * 100) / 100;
                 }
             }
         }
@@ -261,18 +373,6 @@ const createBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         const authReq = req;
         const bankBranchId = bank.branchId || ((_a = authReq.branchContext) === null || _a === void 0 ? void 0 : _a.branchId) || null;
         const openingBalance = Number((_b = bank.openingBalance) !== null && _b !== void 0 ? _b : bank.balance) || 0;
-        // Validate currencyExchangeRate — must be a positive number if provided
-        if (bank.currencyExchangeRate !== undefined && bank.currencyExchangeRate !== null && bank.currencyExchangeRate !== '') {
-            const rate = Number(bank.currencyExchangeRate);
-            if (isNaN(rate) || rate <= 0) {
-                yield connection.rollback();
-                connection.release();
-                return res.status(400).json({
-                    code: 'INVALID_EXCHANGE_RATE',
-                    message: '\u0633\u0639\u0631 \u0627\u0644\u0635\u0631\u0641 \u064a\u062c\u0628 \u0623\u0646 \u064a\u0643\u0648\u0646 \u0631\u0642\u0645\u0627\u064b \u0645\u0648\u062c\u0628\u0627\u064b \u0623\u0643\u0628\u0631 \u0645\u0646 \u0627\u0644\u0635\u0641\u0631'
-                });
-            }
-        }
         // Strict Uniqueness Checks
         if (bank.name) {
             const [dupName] = yield connection.query('SELECT id FROM banks WHERE name = ? AND id != ? LIMIT 1', [bank.name, id]);
@@ -298,20 +398,22 @@ const createBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             const subType = bankType === 'TREASURY' ? 'TREASURY' : 'BANK';
             const accName = bankType === 'TREASURY' ? `الخزينة: ${bank.name}` : `Bank: ${bank.name}`;
             // Generate unique code atomically inside the transaction
-            const [maxRows] = yield connection.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code REGEXP '^[0-9]+$' AND code LIKE ?", [`${basePrefix}%`]);
-            const maxCode = Number((_c = maxRows[0]) === null || _c === void 0 ? void 0 : _c.maxCode) || defaultStart;
+            const [maxRows] = yield connection.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code COLLATE utf8mb4_unicode_ci REGEXP '^[0-9]+$' AND code LIKE ?", [`${basePrefix}%`]);
+            const dbMax = Number((_c = maxRows[0]) === null || _c === void 0 ? void 0 : _c.maxCode);
+            const maxCode = (!isNaN(dbMax) && dbMax >= defaultStart) ? dbMax : defaultStart;
             const newCode = (maxCode + 1).toString();
             accountId = (0, crypto_1.randomUUID)();
             yield connection.query('INSERT INTO accounts (id, code, name, type, subType, openingBalance, balance, currencyCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [accountId, newCode, accName, 'ASSET', subType, openingBalance, openingBalance, bank.currency || 'EGP']);
             console.log(`✓ Auto-created GL Account: ${newCode} - ${accName} (opening: ${openingBalance})`);
         }
         else {
-            // Existing account — sync opening balance if it's currently zero (first-time link)
-            if (openingBalance > 0) {
-                const [existingAccounts] = yield connection.query('SELECT openingBalance FROM accounts WHERE id = ?', [accountId]);
-                const existingAccount = existingAccounts[0];
-                if (existingAccount && Number(existingAccount.openingBalance) === 0) {
-                    yield connection.query('UPDATE accounts SET openingBalance = ?, balance = ? WHERE id = ?', [openingBalance, openingBalance, accountId]);
+            // Existing account — sync opening balance
+            const [glAccounts] = yield connection.query('SELECT openingBalance FROM accounts WHERE id = ?', [accountId]);
+            if (glAccounts[0]) {
+                const currentGLOpeningBalance = Number(glAccounts[0].openingBalance) || 0;
+                const diff = openingBalance - currentGLOpeningBalance;
+                if (diff !== 0) {
+                    yield connection.query('UPDATE accounts SET openingBalance = ?, balance = balance + ? WHERE id = ?', [openingBalance, diff, accountId]);
                 }
             }
             // Sync Currency + subType to GL Account
@@ -419,7 +521,7 @@ const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         // so the frontend can send openingBalance back correctly.
         const intendedOpeningBalance = bank.openingBalance !== undefined
             ? Number(bank.openingBalance)
-            : Number(bank.balance) || 0;
+            : (oldBank.openingBalance !== undefined ? Number(oldBank.openingBalance) : Number(oldBank.balance) || 0);
         if (bank.accountId && bank.accountId === oldBank.accountId) {
             // Same GL account — compare new opening balance against the GL's own openingBalance
             const [glAccounts] = yield connection.query('SELECT openingBalance FROM accounts WHERE id = ?', [bank.accountId]);
@@ -451,7 +553,8 @@ const updateBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         }
         // 3.5. Sync Currency + subType to GL Account (Crucial for Multi-Currency + classification)
         if (bank.accountId) {
-            yield connection.query('UPDATE accounts SET currencyCode = ?, subType = COALESCE(subType, ?) WHERE id = ?', [bank.currency || 'EGP', 'BANK', bank.accountId]);
+            const subType = bank.bankType || oldBank.bankType || 'BANK';
+            yield connection.query('UPDATE accounts SET currencyCode = ?, subType = ? WHERE id = ?', [bank.currency || oldBank.currency || 'EGP', subType, bank.accountId]);
         }
         // 4. CASCADE: Update bank name in all related cheques
         // This ensures name changes are reflected everywhere in the system
@@ -562,7 +665,7 @@ const resyncBankGL = (req, res) => __awaiter(void 0, void 0, void 0, function* (
 });
 exports.resyncBankGL = resyncBankGL;
 const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j;
     const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
@@ -586,7 +689,7 @@ const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 dependencies.push(`${invoiceCount[0].cnt} فاتورة/سند مرتبط`);
             }
         }
-        catch ( /* table might not exist */_j) { /* table might not exist */ }
+        catch ( /* table might not exist */_k) { /* table might not exist */ }
         // Check cheques referencing this bank
         try {
             const [chequeCount] = yield connection.query('SELECT COUNT(*) as cnt FROM cheques WHERE bankId = ?', [id]);
@@ -594,7 +697,7 @@ const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 dependencies.push(`${chequeCount[0].cnt} شيك مرتبط`);
             }
         }
-        catch ( /* table might not exist */_k) { /* table might not exist */ }
+        catch ( /* table might not exist */_l) { /* table might not exist */ }
         // Check journal lines referencing the bank's GL account
         if (bank.accountId) {
             try {
@@ -603,7 +706,7 @@ const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                     dependencies.push(`${journalCount[0].cnt} قيد محاسبي مرتبط`);
                 }
             }
-            catch ( /* table might not exist */_l) { /* table might not exist */ }
+            catch ( /* table might not exist */_m) { /* table might not exist */ }
         }
         // Check bank_transactions table
         try {
@@ -612,7 +715,7 @@ const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 dependencies.push(`${btCount[0].cnt} حركة بنكية`);
             }
         }
-        catch ( /* table might not exist */_m) { /* table might not exist */ }
+        catch ( /* table might not exist */_o) { /* table might not exist */ }
         // If dependencies found, block deletion
         if (dependencies.length > 0) {
             yield connection.rollback();
@@ -633,16 +736,23 @@ const deleteBank = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             });
         }
         // 3. Reverse the opening balance from linked GL account (handles negative/overdraft too)
-        const bankBal = Number(bank.balance) || 0;
-        if (bank.accountId && bankBal !== 0) {
-            yield connection.query('UPDATE accounts SET openingBalance = openingBalance - ?, balance = balance - ? WHERE id = ?', [bankBal, bankBal, bank.accountId]);
-            console.log(`📊 Reversed ${bankBal} from account ${bank.accountId}`);
+        let openingBal = 0;
+        if (bank.accountId) {
+            const [accRows] = yield connection.query('SELECT openingBalance FROM accounts WHERE id = ? LIMIT 1', [bank.accountId]);
+            openingBal = Number((_f = accRows[0]) === null || _f === void 0 ? void 0 : _f.openingBalance) || 0;
+        }
+        else {
+            openingBal = Number(bank.balance) || 0;
+        }
+        if (bank.accountId && openingBal !== 0) {
+            yield connection.query('UPDATE accounts SET openingBalance = openingBalance - ?, balance = balance - ? WHERE id = ?', [openingBal, openingBal, bank.accountId]);
+            console.log(`📊 Reversed raw opening balance ${openingBal} from account ${bank.accountId}`);
         }
         // 4. Delete the bank
         yield connection.query('DELETE FROM banks WHERE id = ?', [id]);
         yield connection.commit();
         // Log audit trail
-        const user = ((_f = req.user) === null || _f === void 0 ? void 0 : _f.name) || ((_g = req.user) === null || _g === void 0 ? void 0 : _g.username) || (((_h = req.body) === null || _h === void 0 ? void 0 : _h.user) || req.query.user) || 'System';
+        const user = ((_g = req.user) === null || _g === void 0 ? void 0 : _g.name) || ((_h = req.user) === null || _h === void 0 ? void 0 : _h.username) || (((_j = req.body) === null || _j === void 0 ? void 0 : _j.user) || req.query.user) || 'System';
         yield (0, auditController_1.logAction)(user, 'BANK', 'DELETE', `حذف بنك - ${bank.name}`, `تم حذف البنك | رقم المرجع: ${id}${bank.accountId ? ` | تم عكس الرصيد: ${bank.balance}` : ''}`);
         // Broadcast real-time deletion
         eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'banks', entityId: id, deletedBy: user });
@@ -713,11 +823,11 @@ const getCheques = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
             const tokens = search.trim().split(/\s+/).filter(Boolean);
             if (tokens.length > 0) {
                 const tokenConditions = tokens.map(() => {
-                    return `( ${arabicNorm('COALESCE(chequeNumber, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(partnerName, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(bankName, "")')} LIKE ${arabicNorm('?')} )`;
+                    return `( ${arabicNorm('COALESCE(chequeNumber, "")')} LIKE ? OR ${arabicNorm('COALESCE(partnerName, "")')} LIKE ? OR ${arabicNorm('COALESCE(bankName, "")')} LIKE ? )`;
                 });
                 whereConditions.push(`(${tokenConditions.join(' AND ')})`);
                 tokens.forEach(token => {
-                    const tokenParam = `%${token}%`;
+                    const tokenParam = `%${normalizeArabicStr(token)}%`;
                     params.push(tokenParam, tokenParam, tokenParam);
                 });
             }
@@ -786,6 +896,7 @@ const recalculateBankBalances = (req, res) => __awaiter(void 0, void 0, void 0, 
         // 1. Get all banks with their linked GL accounts
         const [banks] = yield connection.query(`SELECT b.id, b.name, b.balance as currentBalance, b.accountId,
                     COALESCE(a.openingBalance, 0) as openingBalance,
+                    COALESCE(a.balance, 0) as glBalance,
                     a.name as glAccountName
              FROM banks b
              LEFT JOIN accounts a ON b.accountId = a.id`);
@@ -816,20 +927,20 @@ const recalculateBankBalances = (req, res) => __awaiter(void 0, void 0, void 0, 
             const openingBalance = Number(bank.openingBalance) || 0;
             // Bank balance = openingBalance + debits - credits
             const calculatedBalance = openingBalance + totals.totalDebit - totals.totalCredit;
-            const oldBalance = Number(bank.currentBalance) || 0;
-            const diff = calculatedBalance - oldBalance;
-            console.log(`${bank.name}: opening=${openingBalance}, debit=${totals.totalDebit}, credit=${totals.totalCredit}, calculated=${calculatedBalance}, old=${oldBalance}`);
+            const currentGLBalance = Number(bank.glBalance) || 0;
+            const diff = calculatedBalance - currentGLBalance;
+            console.log(`${bank.name}: opening=${openingBalance}, debit=${totals.totalDebit}, credit=${totals.totalCredit}, calculated=${calculatedBalance}, glBalance=${currentGLBalance}`);
             if (Math.abs(diff) > 0.01) {
-                // REMOVED: Banks balance is now calculated live from GL/journal lines
-                // We no longer physically write the balance to banks table
+                // Correct accounts.balance to match the live calculation
+                yield connection.query('UPDATE accounts SET balance = ? WHERE id = ?', [calculatedBalance, bank.accountId]);
                 results.push({
                     bankId: bank.id,
                     name: bank.name,
-                    oldBalance,
+                    oldBalance: currentGLBalance,
                     newBalance: calculatedBalance,
                     diff
                 });
-                console.log(`✅ ${bank.name}: Updated ${oldBalance} → ${calculatedBalance}`);
+                console.log(`✅ ${bank.name}: Updated GL balance ${currentGLBalance} → ${calculatedBalance}`);
             }
         }
         yield connection.commit();
@@ -861,7 +972,7 @@ exports.recalculateBankBalances = recalculateBankBalances;
  * POST /api/treasury/cleanup-accounts
  */
 const cleanupDuplicateBankAccounts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c;
+    var _a, _b;
     const connection = yield (0, db_1.getConnection)();
     try {
         yield connection.beginTransaction();
@@ -873,18 +984,23 @@ const cleanupDuplicateBankAccounts = (req, res) => __awaiter(void 0, void 0, voi
               AND a.id NOT IN (SELECT COALESCE(accountId, '') FROM banks)
         `);
         const deleted = [];
-        for (const acc of orphaned) {
-            // Only delete if no journal entries exist
-            const [journalCheck] = yield connection.query('SELECT COUNT(*) as cnt FROM journal_lines WHERE accountId = ?', [acc.id]);
-            if (Number((_a = journalCheck[0]) === null || _a === void 0 ? void 0 : _a.cnt) === 0) {
-                yield connection.query('DELETE FROM accounts WHERE id = ?', [acc.id]);
-                deleted.push({ id: acc.id, code: acc.code, name: acc.name, balance: Number(acc.balance) });
+        const orphanedIds = orphaned.map((acc) => acc.id);
+        if (orphanedIds.length > 0) {
+            const [withJournals] = yield connection.query('SELECT DISTINCT accountId FROM journal_lines WHERE accountId IN (?)', [orphanedIds]);
+            const withJournalsSet = new Set(withJournals.map((jl) => jl.accountId));
+            const deletableOrphans = orphaned.filter((acc) => !withJournalsSet.has(acc.id));
+            if (deletableOrphans.length > 0) {
+                const deletableIds = deletableOrphans.map((acc) => acc.id);
+                yield connection.query('DELETE FROM accounts WHERE id IN (?)', [deletableIds]);
+                for (const acc of deletableOrphans) {
+                    deleted.push({ id: acc.id, code: acc.code, name: acc.name, balance: Number(acc.balance) });
+                }
             }
         }
         // 2. Fix duplicate codes
         const [dupCodes] = yield connection.query(`
             SELECT code, COUNT(*) as cnt FROM accounts 
-            WHERE code REGEXP '^[0-9]+$'
+            WHERE code COLLATE utf8mb4_unicode_ci REGEXP '^[0-9]+$'
             GROUP BY code HAVING cnt > 1
         `);
         const recoded = [];
@@ -892,14 +1008,14 @@ const cleanupDuplicateBankAccounts = (req, res) => __awaiter(void 0, void 0, voi
             const [dupes] = yield connection.query('SELECT id, code, name, openingBalance FROM accounts WHERE code = ? ORDER BY openingBalance DESC, id', [dup.code]);
             // Keep the first (highest balance), recode the rest
             for (let i = 1; i < dupes.length; i++) {
-                const [maxRows] = yield connection.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code REGEXP '^[0-9]+$' AND code LIKE '1%'");
-                const newCode = (Number(((_b = maxRows[0]) === null || _b === void 0 ? void 0 : _b.maxCode) || 10200) + 1).toString();
+                const [maxRows] = yield connection.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code COLLATE utf8mb4_unicode_ci REGEXP '^[0-9]+$' AND code LIKE '1%'");
+                const newCode = (Number(((_a = maxRows[0]) === null || _a === void 0 ? void 0 : _a.maxCode) || 10200) + 1).toString();
                 yield connection.query('UPDATE accounts SET code = ? WHERE id = ?', [newCode, dupes[i].id]);
                 recoded.push({ id: dupes[i].id, oldCode: dup.code, newCode, name: dupes[i].name });
             }
         }
         yield connection.commit();
-        const user = ((_c = req.user) === null || _c === void 0 ? void 0 : _c.name) || 'System';
+        const user = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
         yield (0, auditController_1.logAction)(user, 'BANK', 'CLEANUP', `تنظيف حسابات مكررة - حذف ${deleted.length}، إعادة ترقيم ${recoded.length}`, JSON.stringify({ deleted: deleted.length, recoded: recoded.length }));
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'accounts', updatedBy: user });
         res.json({

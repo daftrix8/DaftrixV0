@@ -1,0 +1,14 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const purchaseReceiptController_1 = require("../controllers/purchaseReceiptController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const router = (0, express_1.Router)();
+router.get('/', (0, authMiddleware_1.requirePermission)('operations.view'), purchaseReceiptController_1.getPurchaseReceipts);
+router.get('/:id', (0, authMiddleware_1.requirePermission)('operations.view'), purchaseReceiptController_1.getPurchaseReceipt);
+router.post('/', (0, authMiddleware_1.requirePermission)('operations.manage'), purchaseReceiptController_1.createPurchaseReceipt);
+router.post('/from-invoice/:invoiceId', (0, authMiddleware_1.requirePermission)('operations.manage'), purchaseReceiptController_1.createFromPurchaseInvoice);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('operations.manage'), purchaseReceiptController_1.updatePurchaseReceipt);
+router.put('/:id/status', (0, authMiddleware_1.requirePermission)('operations.manage'), purchaseReceiptController_1.updateReceiptStatus);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('operations.manage'), purchaseReceiptController_1.deletePurchaseReceipt);
+exports.default = router;

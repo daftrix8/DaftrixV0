@@ -19,7 +19,7 @@ class MembershipRenewals {
     /**
      * Renews an existing membership. Can be called if active or expired.
      */
-    static renewMembership(id, packageId, joinDate, userId, providedConn) {
+    static renewMembership(id, packageId, joinDate, userId, providedConn, salesmanId, branchId) {
         return __awaiter(this, void 0, void 0, function* () {
             var _a;
             const conn = providedConn || (yield (0, db_1.getConnection)());
@@ -28,7 +28,7 @@ class MembershipRenewals {
             try {
                 const oldMembership = yield lifecycle_1.MembershipLifecycle.getMembership(id, conn);
                 // Fetch package
-                const [packages] = yield conn.query('SELECT id, name, durationDays, includedVisits, price FROM membership_packages WHERE id = ?', [packageId]);
+                const [packages] = yield conn.query('SELECT id, name, durationDays, includedVisits, price, commissionType, commissionValue FROM membership_packages WHERE id = ?', [packageId]);
                 if (packages.length === 0)
                     throw new Error('Package not found');
                 const pkg = packages[0];
@@ -43,13 +43,28 @@ class MembershipRenewals {
                 const [customers] = yield conn.query('SELECT name FROM partners WHERE id = ?', [oldMembership.customerId]);
                 const customerName = (_a = customers[0]) === null || _a === void 0 ? void 0 : _a.name;
                 // Generate invoice first
-                const billingRes = yield billing_1.MembershipBilling.generateInvoice(newMembershipId, oldMembership.customerId, customerName || 'Unknown', packageId, userId, conn);
+                const billingRes = yield billing_1.MembershipBilling.generateInvoice(newMembershipId, oldMembership.customerId, customerName || 'Unknown', packageId, userId, conn, false, undefined, salesmanId, branchId);
+                // Calculate commission amount at the time of renewal
+                let commissionAmount = 0.00;
+                if (salesmanId) {
+                    const [salesmen] = yield conn.query('SELECT commissionRate FROM salesmen WHERE id = ?', [salesmanId]);
+                    const salesmanRate = salesmen.length > 0 ? (salesmen[0].commissionRate || 0) : 0;
+                    const val = pkg.commissionValue || 0;
+                    if (pkg.commissionType === 'FIXED') {
+                        commissionAmount = val;
+                    }
+                    else {
+                        const pct = val > 0 ? val : salesmanRate;
+                        commissionAmount = pkg.price * (pct / 100);
+                    }
+                    commissionAmount = Math.round(commissionAmount * 100) / 100;
+                }
                 // Insert new membership
                 yield conn.query(`
                 INSERT INTO memberships (
                     id, customerId, packageId, description, joinDate, endDate, 
-                    status, invoiceId, includedVisits, remainingVisits
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, invoiceId, includedVisits, remainingVisits, salesmanId, commissionAmount
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `, [
                     newMembershipId,
                     oldMembership.customerId,
@@ -60,7 +75,9 @@ class MembershipRenewals {
                     'PENDING_PAYMENT',
                     billingRes.invoiceId,
                     pkg.includedVisits,
-                    pkg.includedVisits
+                    pkg.includedVisits,
+                    salesmanId || null,
+                    commissionAmount
                 ]);
                 // Add Log
                 yield lifecycle_1.MembershipLifecycle.addLog(newMembershipId, 'Created', 'Membership renewed from previous cycle', userId, null, conn);

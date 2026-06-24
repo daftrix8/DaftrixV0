@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const campaignController_1 = require("../controllers/campaignController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const router = (0, express_1.Router)();
+router.get('/stats', (0, authMiddleware_1.requirePermission)('crm.view'), campaignController_1.getCampaignStats);
+router.get('/', (0, authMiddleware_1.requirePermission)('crm.view'), campaignController_1.getCampaigns);
+router.get('/:id', (0, authMiddleware_1.requirePermission)('crm.view'), campaignController_1.getCampaign);
+router.post('/', (0, authMiddleware_1.requirePermission)('crm.manage'), campaignController_1.createCampaign);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('crm.manage'), campaignController_1.updateCampaign);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('crm.manage'), campaignController_1.deleteCampaign);
+exports.default = router;

@@ -16,7 +16,9 @@ const errorHandler_1 = require("../utils/errorHandler");
 const getProductStocks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const conn = yield (0, db_1.getConnection)();
-        // Use product_stocks for warehouse balances
+        // Use product_stocks for warehouse balances (excluding variant parent products)
+        // UNION with product_variant_stocks SUM for variant parents
+        // UNION with individual variant stock levels (product_variant_stocks)
         // UNION with vehicle_inventory for car/mobile stocks
         // FILTER: Only show entries with valid warehouseId (hide 'Unknown' entries)
         const [rows] = yield conn.query(`
@@ -25,10 +27,39 @@ const getProductStocks = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 ps.productId, 
                 ps.warehouseId, 
                 ps.stock, 
-                w.name as warehouseName 
+                w.name as warehouseName,
+                NULL as variantId
             FROM product_stocks ps
             INNER JOIN warehouses w ON ps.warehouseId = w.id
             WHERE ps.warehouseId IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = ps.productId)
+            
+            UNION ALL
+            
+            SELECT 
+                CONCAT('VAR-', pvs.productId, '-', pvs.warehouseId) as id,
+                pvs.productId,
+                pvs.warehouseId,
+                SUM(pvs.stock) as stock,
+                w.name as warehouseName,
+                NULL as variantId
+            FROM product_variant_stocks pvs
+            INNER JOIN warehouses w ON pvs.warehouseId = w.id
+            WHERE pvs.warehouseId IS NOT NULL
+            GROUP BY pvs.productId, pvs.warehouseId
+            
+            UNION ALL
+            
+            SELECT 
+                CONCAT('VARDET-', pvs.variantId, '-', pvs.warehouseId) as id,
+                pvs.productId,
+                pvs.warehouseId,
+                pvs.stock,
+                w.name as warehouseName,
+                pvs.variantId
+            FROM product_variant_stocks pvs
+            INNER JOIN warehouses w ON pvs.warehouseId = w.id
+            WHERE pvs.warehouseId IS NOT NULL
             
             UNION ALL
             
@@ -37,7 +68,8 @@ const getProductStocks = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 vi.productId,
                 CONCAT('VEH-', vi.vehicleId) as warehouseId,
                 vi.quantity as stock,
-                COALESCE(CONCAT('سيارة: ', v.plateNumber), v.name, CONCAT('سيارة #', vi.vehicleId)) as warehouseName
+                COALESCE(CONCAT('سيارة: ', v.plateNumber), v.name, CONCAT('سيارة #', vi.vehicleId)) as warehouseName,
+                NULL as variantId
             FROM vehicle_inventory vi
             LEFT JOIN vehicles v ON vi.vehicleId = v.id
             WHERE vi.quantity != 0
@@ -54,13 +86,32 @@ const getProductStocksByProduct = (req, res) => __awaiter(void 0, void 0, void 0
     try {
         const { productId } = req.params;
         const conn = yield (0, db_1.getConnection)();
-        // Only show entries with valid warehouseId (hide 'Unknown' entries)
-        const [rows] = yield conn.query(`
-            SELECT ps.*, w.name as warehouseName 
-            FROM product_stocks ps
-            INNER JOIN warehouses w ON ps.warehouseId = w.id
-            WHERE ps.productId = ? AND ps.warehouseId IS NOT NULL
-        `, [productId]);
+        // Check if the product has variants
+        const [variants] = yield conn.query('SELECT 1 FROM product_variants WHERE productId = ? LIMIT 1', [productId]);
+        const hasVariants = variants.length > 0;
+        let rows;
+        if (hasVariants) {
+            [rows] = yield conn.query(`
+                SELECT 
+                    CONCAT('VAR-', pvs.productId, '-', pvs.warehouseId) as id,
+                    pvs.productId, 
+                    pvs.warehouseId, 
+                    SUM(pvs.stock) as stock, 
+                    w.name as warehouseName 
+                FROM product_variant_stocks pvs
+                INNER JOIN warehouses w ON pvs.warehouseId = w.id
+                WHERE pvs.productId = ? AND pvs.warehouseId IS NOT NULL
+                GROUP BY pvs.productId, pvs.warehouseId
+            `, [productId]);
+        }
+        else {
+            [rows] = yield conn.query(`
+                SELECT ps.*, w.name as warehouseName 
+                FROM product_stocks ps
+                INNER JOIN warehouses w ON ps.warehouseId = w.id
+                WHERE ps.productId = ? AND ps.warehouseId IS NOT NULL
+            `, [productId]);
+        }
         conn.release();
         res.json(rows);
     }
@@ -73,7 +124,30 @@ const getProductStocksByWarehouse = (req, res) => __awaiter(void 0, void 0, void
     try {
         const { warehouseId } = req.params;
         const conn = yield (0, db_1.getConnection)();
-        const [rows] = yield conn.query('SELECT * FROM product_stocks WHERE warehouseId = ?', [warehouseId]);
+        const [rows] = yield conn.query(`
+            SELECT 
+                ps.id, ps.productId, ps.warehouseId, ps.stock, NULL as variantId
+            FROM product_stocks ps
+            WHERE ps.warehouseId = ?
+              AND NOT EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = ps.productId)
+            
+            UNION ALL
+            
+            SELECT 
+                CONCAT('VAR-', pvs.productId, '-', pvs.warehouseId) as id,
+                pvs.productId, pvs.warehouseId, SUM(pvs.stock) as stock, NULL as variantId
+            FROM product_variant_stocks pvs
+            WHERE pvs.warehouseId = ?
+            GROUP BY pvs.productId, pvs.warehouseId
+            
+            UNION ALL
+            
+            SELECT 
+                CONCAT('VARDET-', pvs.variantId, '-', pvs.warehouseId) as id,
+                pvs.productId, pvs.warehouseId, pvs.stock, pvs.variantId
+            FROM product_variant_stocks pvs
+            WHERE pvs.warehouseId = ?
+        `, [warehouseId, warehouseId, warehouseId]);
         conn.release();
         res.json(rows);
     }

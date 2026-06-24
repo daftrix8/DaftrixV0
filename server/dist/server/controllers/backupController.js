@@ -43,6 +43,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.createBackup = createBackup;
+exports.getBackupJobStatus = getBackupJobStatus;
 exports.listBackups = listBackups;
 exports.downloadBackup = downloadBackup;
 exports.restoreBackup = restoreBackup;
@@ -66,6 +67,18 @@ const nodemailer = __importStar(require("nodemailer"));
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
 const fsSync = __importStar(require("fs"));
+const crypto_1 = require("crypto");
+const backupJobs = new Map();
+// Auto-cleanup completed/failed jobs after 10 minutes
+const BACKUP_JOB_TTL_MS = 10 * 60 * 1000;
+function scheduleJobCleanup(backupId) {
+    setTimeout(() => backupJobs.delete(backupId), BACKUP_JOB_TTL_MS);
+}
+// Tables to skip during backup (redundant snapshots that bloat the dump)
+const TABLES_TO_SKIP = new Set([
+    'journal_entries_backup',
+    'journal_lines_backup',
+]);
 const execAsync = (0, util_1.promisify)(child_process_1.exec);
 const execFileAsync = (0, util_1.promisify)(child_process_1.execFile);
 // Validate filename to prevent path traversal (H9 security fix)
@@ -234,36 +247,74 @@ function escapeSQLValue(val, columnType) {
         .replace(/\x1a/g, '\\Z')}'`;
 }
 const BATCH_SIZE = 1000; // Rows per SELECT batch
+// Helper: write to stream with backpressure support
+function writeWithDrain(stream, data) {
+    return new Promise((resolve, reject) => {
+        const canContinue = stream.write(data);
+        if (canContinue) {
+            resolve();
+        }
+        else {
+            const onDrain = () => {
+                stream.removeListener('error', onError);
+                resolve();
+            };
+            const onError = (err) => {
+                stream.removeListener('drain', onDrain);
+                reject(err);
+            };
+            stream.once('drain', onDrain);
+            stream.once('error', onError);
+        }
+    });
+}
 // Generate a complete SQL dump using only the MySQL connection pool
-function generatePureJSDump(sqlFilePath) {
+function generatePureJSDump(sqlFilePath, backupId) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c;
         const conn = yield (0, db_1.getConnection)();
         const writeStream = fsSync.createWriteStream(sqlFilePath, { encoding: 'utf8' });
-        const writeLine = (line) => {
-            writeStream.write(line + '\n');
-        };
+        const writeLine = (line) => __awaiter(this, void 0, void 0, function* () {
+            yield writeWithDrain(writeStream, line + '\n');
+        });
         try {
             // Header
-            writeLine('-- Cloud ERP Pure-JS Database Backup');
-            writeLine(`-- Generated: ${new Date().toISOString()}`);
-            writeLine(`-- Database: ${DB_NAME}`);
-            writeLine('');
-            writeLine('SET NAMES utf8mb4;');
-            writeLine('SET FOREIGN_KEY_CHECKS = 0;');
-            writeLine('SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";');
-            writeLine('SET AUTOCOMMIT = 0;');
-            writeLine('START TRANSACTION;');
-            writeLine('');
-            writeLine(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
-            writeLine(`USE \`${DB_NAME}\`;`);
-            writeLine('');
-            // Get all tables
+            yield writeLine('-- Cloud ERP Pure-JS Database Backup');
+            yield writeLine(`-- Generated: ${new Date().toISOString()}`);
+            yield writeLine(`-- Database: ${DB_NAME}`);
+            yield writeLine('');
+            yield writeLine('SET NAMES utf8mb4;');
+            yield writeLine('SET FOREIGN_KEY_CHECKS = 0;');
+            yield writeLine('SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";');
+            yield writeLine('SET AUTOCOMMIT = 0;');
+            yield writeLine('START TRANSACTION;');
+            yield writeLine('');
+            yield writeLine(`CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;`);
+            yield writeLine(`USE \`${DB_NAME}\`;`);
+            yield writeLine('');
+            // Get all tables (excluding skipped ones)
             const [tableRows] = yield conn.query('SHOW TABLES');
-            const tables = tableRows.map(row => Object.values(row)[0]);
-            console.log(`📦 Pure-JS backup: ${tables.length} tables to dump`);
-            for (const tableName of tables) {
+            const allTables = tableRows.map(row => Object.values(row)[0]);
+            const tables = allTables.filter(t => !TABLES_TO_SKIP.has(t));
+            const skippedCount = allTables.length - tables.length;
+            console.log(`📦 Pure-JS backup: ${tables.length} tables to dump (${skippedCount} skipped)`);
+            // Update progress tracker
+            if (backupId) {
+                const progress = backupJobs.get(backupId);
+                if (progress)
+                    progress.tablesTotal = tables.length;
+            }
+            for (let tableIndex = 0; tableIndex < tables.length; tableIndex++) {
+                const tableName = tables[tableIndex];
                 console.log(`  📄 Dumping: ${tableName}`);
+                // Update progress
+                if (backupId) {
+                    const progress = backupJobs.get(backupId);
+                    if (progress) {
+                        progress.currentTable = tableName;
+                        progress.tablesDone = tableIndex;
+                    }
+                }
                 // Get CREATE TABLE statement
                 const [createRows] = yield conn.query(`SHOW CREATE TABLE \`${tableName}\``);
                 const createStatement = ((_a = createRows[0]) === null || _a === void 0 ? void 0 : _a['Create Table'])
@@ -271,17 +322,18 @@ function generatePureJSDump(sqlFilePath) {
                 if (!createStatement)
                     continue;
                 const isView = !!((_c = createRows[0]) === null || _c === void 0 ? void 0 : _c['Create View']);
-                writeLine('-- -------------------------------------------');
-                writeLine(`-- Table: ${tableName}`);
-                writeLine('-- -------------------------------------------');
-                writeLine('');
+                yield writeLine('-- -------------------------------------------');
+                yield writeLine(`-- Table: ${tableName}`);
+                yield writeLine('-- -------------------------------------------');
+                yield writeLine('');
                 if (isView) {
-                    writeLine(`DROP VIEW IF EXISTS \`${tableName}\`;`);
-                    writeLine(`${createStatement};`);
+                    // Views: only dump CREATE VIEW, no data
+                    yield writeLine(`DROP VIEW IF EXISTS \`${tableName}\`;`);
+                    yield writeLine(`${createStatement};`);
                 }
                 else {
-                    writeLine(`DROP TABLE IF EXISTS \`${tableName}\`;`);
-                    writeLine(`${createStatement};`);
+                    yield writeLine(`DROP TABLE IF EXISTS \`${tableName}\`;`);
+                    yield writeLine(`${createStatement};`);
                     // Get column info for type-aware escaping
                     const [colRows] = yield conn.query(`SHOW COLUMNS FROM \`${tableName}\``);
                     const columns = colRows.map(c => ({
@@ -305,21 +357,27 @@ function generatePureJSDump(sqlFilePath) {
                             const values = columns.map(col => escapeSQLValue(row[col.name], col.type));
                             valueSets.push(`(${values.join(', ')})`);
                         }
-                        writeLine(`INSERT INTO \`${tableName}\` (${columnNames}) VALUES`);
-                        writeLine(valueSets.join(',\n') + ';');
+                        yield writeLine(`INSERT INTO \`${tableName}\` (${columnNames}) VALUES`);
+                        yield writeLine(valueSets.join(',\n') + ';');
                         offset += BATCH_SIZE;
                         if (dataRows.length < BATCH_SIZE) {
                             hasData = false;
                         }
                     }
                 }
-                writeLine('');
+                yield writeLine('');
+            }
+            // Mark final table count
+            if (backupId) {
+                const progress = backupJobs.get(backupId);
+                if (progress)
+                    progress.tablesDone = tables.length;
             }
             // Footer
-            writeLine('COMMIT;');
-            writeLine('SET FOREIGN_KEY_CHECKS = 1;');
-            writeLine('');
-            writeLine('-- End of backup');
+            yield writeLine('COMMIT;');
+            yield writeLine('SET FOREIGN_KEY_CHECKS = 1;');
+            yield writeLine('');
+            yield writeLine('-- End of backup');
             // Close the write stream
             yield new Promise((resolve, reject) => {
                 writeStream.end(() => resolve());
@@ -434,15 +492,43 @@ function splitSQLStatements(sql) {
     }
     return statements;
 }
-// Create backup (mysqldump with automatic pure-JS fallback)
+// Create backup (async background job — returns immediately with backupId)
 function createBackup(req, res) {
     return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const backupId = (0, crypto_1.randomUUID)();
+            // Initialize progress tracker
+            backupJobs.set(backupId, {
+                status: 'running',
+                tablesTotal: 0,
+                tablesDone: 0,
+                currentTable: '',
+                startedAt: Date.now(),
+            });
+            // Respond immediately — client will poll /backup/status/:backupId
+            res.json({ success: true, backupId, status: 'started' });
+            // Run backup in background (not awaited in request lifecycle)
+            runBackupJob(backupId).catch(err => {
+                console.error(`❌ Background backup ${backupId} crashed:`, err);
+            });
+        }
+        catch (error) {
+            console.error('Backup creation failed:', error);
+            return (0, errorHandler_1.handleControllerError)(res, error, 'createBackup');
+        }
+    });
+}
+// Background backup job — runs independently of the HTTP request
+function runBackupJob(backupId) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const progress = backupJobs.get(backupId);
+        if (!progress)
+            return;
         try {
             const backupDir = yield ensureBackupDir();
             const filename = getBackupFilename();
             const sqlFile = path.join(backupDir, filename.replace('.gz', ''));
             const gzFile = path.join(backupDir, filename);
-            // Try mysqldump first, fall back to pure-JS if unavailable
             const hasMysqlDump = isMySQLDumpAvailable();
             if (hasMysqlDump) {
                 console.log('📦 Using mysqldump for backup');
@@ -466,8 +552,11 @@ function createBackup(req, res) {
             }
             else {
                 console.log('📦 mysqldump not found — using pure-JS backup');
-                yield generatePureJSDump(sqlFile);
+                yield generatePureJSDump(sqlFile, backupId);
             }
+            // Update progress: compressing
+            progress.status = 'compressing';
+            progress.currentTable = 'ضغط الملف...';
             // Compress the SQL file (level 9 = max compression)
             yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)({ level: 9 }), (0, fs_1.createWriteStream)(gzFile));
             // Delete uncompressed SQL file
@@ -481,18 +570,51 @@ function createBackup(req, res) {
             if (settings.emailEnabled) {
                 yield sendBackupEmail(true, filename);
             }
-            res.json({
-                success: true,
-                filename,
-                size: stats.size,
-                created: stats.mtime,
-                method: hasMysqlDump ? 'mysqldump' : 'pure-js'
-            });
+            // Mark complete
+            progress.status = 'completed';
+            progress.filename = filename;
+            progress.size = stats.size;
+            progress.method = hasMysqlDump ? 'mysqldump' : 'pure-js';
+            progress.currentTable = '';
+            console.log(`✅ Background backup ${backupId} completed: ${filename} (${formatBytes(stats.size)})`);
+            scheduleJobCleanup(backupId);
         }
         catch (error) {
-            console.error('Backup creation failed:', error);
-            return (0, errorHandler_1.handleControllerError)(res, error, 'createBackup');
+            console.error(`❌ Background backup ${backupId} failed:`, error);
+            progress.status = 'failed';
+            progress.error = error.message || 'Unknown error';
+            scheduleJobCleanup(backupId);
+            // Send failure email
+            try {
+                const settings = yield getBackupSettings();
+                if (settings.emailEnabled) {
+                    yield sendBackupEmail(false, undefined, error.message);
+                }
+            }
+            catch ( /* ignore email errors */_a) { /* ignore email errors */ }
         }
+    });
+}
+// Get backup job status (polling endpoint)
+function getBackupJobStatus(req, res) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const { backupId } = req.params;
+        const progress = backupJobs.get(backupId);
+        if (!progress) {
+            return res.status(404).json({ success: false, error: 'Backup job not found or expired' });
+        }
+        const elapsedSeconds = Math.round((Date.now() - progress.startedAt) / 1000);
+        const percentDone = progress.tablesTotal > 0
+            ? Math.round((progress.tablesDone / progress.tablesTotal) * 100)
+            : 0;
+        res.json(Object.assign(Object.assign({ success: true, backupId, status: progress.status, tablesTotal: progress.tablesTotal, tablesDone: progress.tablesDone, currentTable: progress.currentTable, percentDone,
+            elapsedSeconds }, (progress.status === 'completed' && {
+            filename: progress.filename,
+            size: progress.size,
+            method: progress.method,
+        })), (progress.status === 'failed' && {
+            error: progress.error,
+        })));
     });
 }
 // List all backups
@@ -853,7 +975,7 @@ function createScheduledBackup() {
                 });
             }
             else {
-                yield generatePureJSDump(sqlFile);
+                yield generatePureJSDump(sqlFile, undefined);
             }
             yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)({ level: 9 }), (0, fs_1.createWriteStream)(gzFile));
             yield fs.unlink(sqlFile);
@@ -1256,7 +1378,7 @@ function createUserBackup(userId, customPath, email) {
                 });
             }
             else {
-                yield generatePureJSDump(sqlFile);
+                yield generatePureJSDump(sqlFile, undefined);
             }
             yield (0, promises_1.pipeline)((0, fs_1.createReadStream)(sqlFile), (0, zlib_1.createGzip)({ level: 9 }), (0, fs_1.createWriteStream)(gzFile));
             yield fs.unlink(sqlFile);

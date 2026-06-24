@@ -17,11 +17,12 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.recordLoyaltyClawback = exports.recordLoyaltyRedeem = exports.recordLoyaltyEarn = exports.getLoyaltyDashboard = exports.deleteLoyaltyRule = exports.updateLoyaltyRule = exports.createLoyaltyRule = exports.getLoyaltyRules = exports.updateLoyaltySettingsAPI = exports.getLoyaltySettingsAPI = exports.adjustLoyaltyPoints = exports.getLoyaltyHistory = exports.previewLoyalty = exports.getLoyaltyBalance = exports.getApplicableRules = exports.getLoyaltySettings = void 0;
+exports.dismissFraudAlert = exports.getFraudAlerts = exports.getReferralStatsAPI = exports.processReferralReward = exports.getCustomerTierAPI = exports.deriveCustomerTier = exports.recordLoyaltyClawback = exports.recordLoyaltyRedeem = exports.recordLoyaltyEarn = exports.getLoyaltyCustomers = exports.getLoyaltyDashboard = exports.deleteLoyaltyRule = exports.updateLoyaltyRule = exports.createLoyaltyRule = exports.getLoyaltyRules = exports.updateLoyaltySettingsAPI = exports.getLoyaltySettingsAPI = exports.adjustLoyaltyPoints = exports.getLoyaltyHistory = exports.previewLoyalty = exports.getLoyaltyBalance = exports.getApplicableRules = exports.getLoyaltySettings = void 0;
 exports.calculatePointsEarned = calculatePointsEarned;
 const uuid_1 = require("uuid");
 const db_1 = require("../db");
 const dateUtils_1 = require("../../utils/dateUtils");
+const fiscalYearUtils_1 = require("../utils/fiscalYearUtils");
 // ─── Helpers ────────────────────────────────────────────────────────────────
 /** Derives loyalty balance from transaction records. Never from a cached field. */
 const deriveBalance = (conn, customerId) => __awaiter(void 0, void 0, void 0, function* () {
@@ -49,14 +50,22 @@ const deriveBalance = (conn, customerId) => __awaiter(void 0, void 0, void 0, fu
 });
 const getLoyaltySettings = (conn) => __awaiter(void 0, void 0, void 0, function* () {
     const [rows] = yield conn.query(`SELECT * FROM loyalty_settings LIMIT 1`);
-    if (rows && rows.length > 0)
-        return rows[0];
-    return {
+    const defaultSettings = {
         balanceType: 'loyalty_points',
         minimumRedemptionPoints: 100,
         conversionRate: 1,
-        allowDecimals: false
+        allowDecimals: false,
+        tier_silver_min_spend: 2000.00,
+        tier_gold_min_spend: 5000.00,
+        tier_platinum_min_spend: 10000.00,
+        tier_silver_multiplier: 1.20,
+        tier_gold_multiplier: 1.50,
+        tier_platinum_multiplier: 2.00
     };
+    if (rows && rows.length > 0) {
+        return Object.assign(Object.assign({}, defaultSettings), rows[0]);
+    }
+    return defaultSettings;
 });
 exports.getLoyaltySettings = getLoyaltySettings;
 const getApplicableRules = (conn, orderTotal, customerClassification) => __awaiter(void 0, void 0, void 0, function* () {
@@ -218,11 +227,24 @@ function calculatePointsEarned(conn, rules, orderTotal, cartItems) {
                 const spendUnit = Number(rule.spend_unit) || 10;
                 // Filter eligible items
                 const eligibleTotal = cartItems.reduce((sum, item) => {
-                    if (rule.exclude_discounted_items && item.discount > 0)
+                    const itemDiscount = Number(item.discount) || 0;
+                    if (rule.exclude_discounted_items && itemDiscount > 0)
                         return sum;
-                    if (item.total < 0)
+                    // Safely resolve the line total (POS passes 'total', standard invoices pass 'subtotal' or we compute it)
+                    let lineTotal = Number(item.total);
+                    if (isNaN(lineTotal) || item.total === undefined) {
+                        lineTotal = Number(item.subtotal);
+                    }
+                    if (isNaN(lineTotal) || (item.subtotal === undefined && item.total === undefined)) {
+                        const price = Number(item.price) || 0;
+                        const qty = Number(item.quantity) || 1;
+                        lineTotal = (price - itemDiscount) * qty;
+                    }
+                    if (isNaN(lineTotal))
+                        lineTotal = 0;
+                    if (lineTotal < 0)
                         return sum; // exclude trade-ins
-                    return sum + item.total;
+                    return sum + lineTotal;
                 }, 0);
                 rulePoints = Math.floor(eligibleTotal / spendUnit) * ppu;
             }
@@ -313,6 +335,10 @@ const adjustLoyaltyPoints = (req, res) => __awaiter(void 0, void 0, void 0, func
             return res.status(400).json({ error: 'يجب إدخال سبب التعديل (3 أحرف على الأقل)' });
         }
         const now = (0, dateUtils_1.getEgyptianISOString)();
+        const fyCheck = yield (0, fiscalYearUtils_1.validateFiscalYearOpen)(now);
+        if (!fyCheck.allowed) {
+            return res.status(403).json({ error: fyCheck.error, errorCode: fyCheck.errorCode });
+        }
         const txId = (0, uuid_1.v4)();
         let type = 'ADJUST';
         let txPoints = points;
@@ -375,10 +401,21 @@ const getLoyaltySettingsAPI = (req, res) => __awaiter(void 0, void 0, void 0, fu
 });
 exports.getLoyaltySettingsAPI = getLoyaltySettingsAPI;
 const updateLoyaltySettingsAPI = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
         const updates = req.body;
-        const allowedFields = ['balanceType', 'minimumRedemptionPoints', 'conversionRate', 'allowDecimals'];
+        const allowedFields = [
+            'balanceType', 'minimumRedemptionPoints', 'conversionRate', 'allowDecimals',
+            'tier_silver_min_spend', 'tier_gold_min_spend', 'tier_platinum_min_spend',
+            'tier_silver_multiplier', 'tier_gold_multiplier', 'tier_platinum_multiplier'
+        ];
+        // Ensure at least one row exists to update
+        const [rows] = yield conn.query(`SELECT COUNT(*) as count FROM loyalty_settings`);
+        const count = ((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.count) || 0;
+        if (count === 0) {
+            yield conn.query(`INSERT INTO loyalty_settings (balanceType) VALUES ('loyalty_points')`);
+        }
         const setClauses = [];
         const params = [];
         for (const field of allowedFields) {
@@ -406,7 +443,29 @@ const getLoyaltyRules = (req, res) => __awaiter(void 0, void 0, void 0, function
     const conn = yield (0, db_1.getConnection)();
     try {
         const [rows] = yield conn.query(`SELECT * FROM loyalty_rules ORDER BY priority DESC, minimumSpend DESC, createdAt DESC`);
-        res.json({ rules: rows });
+        const rules = rows.map(rule => {
+            const parsed = Object.assign({}, rule);
+            try {
+                if (rule.days_of_week && typeof rule.days_of_week === 'string') {
+                    parsed.days_of_week = JSON.parse(rule.days_of_week);
+                }
+            }
+            catch (e) { }
+            try {
+                if (rule.category_ids && typeof rule.category_ids === 'string') {
+                    parsed.category_ids = JSON.parse(rule.category_ids);
+                }
+            }
+            catch (e) { }
+            try {
+                if (rule.product_ids && typeof rule.product_ids === 'string') {
+                    parsed.product_ids = JSON.parse(rule.product_ids);
+                }
+            }
+            catch (e) { }
+            return parsed;
+        });
+        res.json({ rules });
     }
     catch (error) {
         console.error('Error fetching loyalty rules:', error.message);
@@ -420,19 +479,22 @@ exports.getLoyaltyRules = getLoyaltyRules;
 const createLoyaltyRule = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { name, status = 'active', priority = 1, customerClassification = null, accumulationRate = 10, minimumSpend = null, expiryDays = null } = req.body;
+        const { name, status = 'active', priority = 1, customerClassification = null, accumulationRate = 10, minimumSpend = null, expiryDays = null, rule_type = 'SPEND_BASED', points_per_unit = 1.0, spend_unit = 10, multiplier = 1.0, category_ids = null, product_ids = null, valid_from = null, valid_to = null, days_of_week = null, exclude_discounted_items = 0 } = req.body;
         if (!name || name.trim().length < 2) {
             return res.status(400).json({ error: 'اسم القاعدة مطلوب' });
         }
-        if (accumulationRate <= 0) {
-            return res.status(400).json({ error: 'accumulationRate يجب أن يكون أكبر من صفر' });
-        }
         const id = (0, uuid_1.v4)();
         const now = (0, dateUtils_1.getEgyptianISOString)();
+        const daysOfWeekStr = Array.isArray(days_of_week) ? JSON.stringify(days_of_week) : days_of_week;
+        const categoryIdsStr = Array.isArray(category_ids) ? JSON.stringify(category_ids) : category_ids;
+        const productIdsStr = Array.isArray(product_ids) ? JSON.stringify(product_ids) : product_ids;
         yield conn.query(`INSERT INTO loyalty_rules 
-             (id, name, status, priority, customerClassification, accumulationRate, minimumSpend, expiryDays, createdAt)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [id, name.trim(), status, priority, customerClassification || null, accumulationRate,
-            minimumSpend || null, expiryDays || null, now]);
+             (id, name, status, priority, customerClassification, accumulationRate, minimumSpend, expiryDays,
+              rule_type, points_per_unit, spend_unit, multiplier, category_ids, product_ids, valid_from, valid_to, days_of_week, exclude_discounted_items, createdAt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+            id, name.trim(), status, priority, customerClassification || null, accumulationRate, minimumSpend || null, expiryDays || null,
+            rule_type, points_per_unit, spend_unit, multiplier, categoryIdsStr || null, productIdsStr || null, valid_from || null, valid_to || null, daysOfWeekStr || null, exclude_discounted_items ? 1 : 0, now
+        ]);
         console.log(`🎯 [Loyalty] Rule created: "${name}" (${id})`);
         res.json({ success: true, id });
     }
@@ -456,14 +518,24 @@ const updateLoyaltyRule = (req, res) => __awaiter(void 0, void 0, void 0, functi
         }
         const allowedFields = [
             'name', 'status', 'priority', 'customerClassification',
-            'accumulationRate', 'minimumSpend', 'expiryDays'
+            'accumulationRate', 'minimumSpend', 'expiryDays',
+            'rule_type', 'points_per_unit', 'spend_unit', 'multiplier',
+            'category_ids', 'product_ids', 'valid_from', 'valid_to',
+            'days_of_week', 'exclude_discounted_items'
         ];
         const setClauses = [];
         const params = [];
         for (const field of allowedFields) {
             if (updates[field] !== undefined) {
                 setClauses.push(`${field} = ?`);
-                params.push(updates[field] === '' ? null : updates[field]);
+                let value = updates[field];
+                if (value === '') {
+                    value = null;
+                }
+                else if (Array.isArray(value)) {
+                    value = JSON.stringify(value);
+                }
+                params.push(value);
             }
         }
         if (setClauses.length === 0) {
@@ -578,14 +650,152 @@ const getLoyaltyDashboard = (req, res) => __awaiter(void 0, void 0, void 0, func
     }
 });
 exports.getLoyaltyDashboard = getLoyaltyDashboard;
+const getLoyaltyCustomers = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const page = Math.max(Number(req.query.page) || 1, 1);
+        const limit = Math.min(Math.max(Number(req.query.limit) || 25, 1), 500);
+        const offset = (page - 1) * limit;
+        const search = req.query.search;
+        const classification = req.query.classification;
+        const hasPointsOnly = req.query.hasPointsOnly === 'true';
+        const sortBy = req.query.sortBy || 'balance';
+        const sortOrder = (req.query.sortOrder || 'desc').toLowerCase() === 'asc' ? 'ASC' : 'DESC';
+        const allowedSortFields = ['name', 'phone', 'balance', 'earned', 'lastActivity'];
+        const sortFieldMap = {
+            name: 'p.name',
+            phone: 'p.phone',
+            balance: 'balance',
+            earned: 'earned',
+            lastActivity: 'lastActivity'
+        };
+        const orderBy = allowedSortFields.includes(sortBy) ? sortFieldMap[sortBy] : 'balance';
+        let whereClauses = ['p.isCustomer = 1'];
+        const params = [];
+        if (search) {
+            whereClauses.push('(p.name LIKE ? OR p.phone LIKE ?)');
+            const searchPattern = `%${search}%`;
+            params.push(searchPattern, searchPattern);
+        }
+        if (classification) {
+            whereClauses.push('p.classification = ?');
+            params.push(classification);
+        }
+        // Build the base query
+        let query = `
+            SELECT
+                p.id AS customerId,
+                p.name AS customerName,
+                p.phone AS customerPhone,
+                p.classification AS customerClassification,
+                p.referral_code AS referral_code,
+                COALESCE((
+                    SELECT SUM(total)
+                    FROM invoices i
+                    WHERE i.partnerId = p.id
+                      AND i.type = 'INVOICE_SALE'
+                      AND i.status != 'VOID'
+                      AND i.date >= DATE_SUB(NOW(), INTERVAL 12 MONTH)
+                ), 0) AS totalSpend,
+                COALESCE(SUM(CASE WHEN t.type = 'EARN' THEN t.points ELSE 0 END), 0) AS earned,
+                COALESCE(SUM(CASE WHEN t.type = 'REDEEM' THEN ABS(t.points) ELSE 0 END), 0) AS redeemed,
+                COALESCE(SUM(CASE WHEN t.type = 'REFUND_CLAWBACK' THEN ABS(t.points) ELSE 0 END), 0) AS clawback,
+                COALESCE(SUM(CASE WHEN t.type = 'ADJUST' THEN t.points ELSE 0 END), 0) AS adjusted,
+                COALESCE(SUM(CASE WHEN t.type = 'EXPIRE' THEN ABS(t.points) ELSE 0 END), 0) AS expired,
+                COALESCE(
+                    SUM(CASE WHEN t.type = 'EARN' THEN t.points ELSE 0 END)
+                  - SUM(CASE WHEN t.type = 'REDEEM' THEN ABS(t.points) ELSE 0 END)
+                  - SUM(CASE WHEN t.type = 'REFUND_CLAWBACK' THEN ABS(t.points) ELSE 0 END)
+                  + SUM(CASE WHEN t.type = 'ADJUST' THEN t.points ELSE 0 END)
+                  - SUM(CASE WHEN t.type = 'EXPIRE' THEN ABS(t.points) ELSE 0 END)
+                , 0) AS balance,
+                MAX(t.createdAt) AS lastActivity
+            FROM partners p
+            LEFT JOIN loyalty_transactions t ON p.id = t.customerId
+            WHERE ${whereClauses.join(' AND ')}
+            GROUP BY p.id, p.name, p.phone, p.classification
+        `;
+        if (hasPointsOnly) {
+            query += ' HAVING balance > 0';
+        }
+        // To get total count, we wrap the query
+        const countQuery = `SELECT COUNT(*) AS total FROM (${query}) AS sub`;
+        const [countRows] = yield conn.query(countQuery, params);
+        const total = ((_a = countRows[0]) === null || _a === void 0 ? void 0 : _a.total) || 0;
+        // Add ORDER BY and LIMIT
+        query += ` ORDER BY ${orderBy} ${sortOrder} LIMIT ? OFFSET ?`;
+        const queryParams = [...params, limit, offset];
+        const [rows] = yield conn.query(query, queryParams);
+        // Fetch settings once to map tiers
+        const settings = yield (0, exports.getLoyaltySettings)(conn);
+        const silverSpend = Number(settings.tier_silver_min_spend) || 2000.00;
+        const goldSpend = Number(settings.tier_gold_min_spend) || 5000.00;
+        const platSpend = Number(settings.tier_platinum_min_spend) || 10000.00;
+        const silverMult = Number(settings.tier_silver_multiplier) || 1.20;
+        const goldMult = Number(settings.tier_gold_multiplier) || 1.50;
+        const platMult = Number(settings.tier_platinum_multiplier) || 2.00;
+        const enrichedCustomers = rows.map(c => {
+            const totalSpend = Number(c.totalSpend) || 0;
+            let tier = 'BRONZE';
+            let multiplier = 1.0;
+            let nextTierSpend = silverSpend;
+            if (totalSpend >= platSpend) {
+                tier = 'PLATINUM';
+                multiplier = platMult;
+                nextTierSpend = 0;
+            }
+            else if (totalSpend >= goldSpend) {
+                tier = 'GOLD';
+                multiplier = goldMult;
+                nextTierSpend = platSpend;
+            }
+            else if (totalSpend >= silverSpend) {
+                tier = 'SILVER';
+                multiplier = silverMult;
+                nextTierSpend = goldSpend;
+            }
+            else {
+                tier = 'BRONZE';
+                multiplier = 1.0;
+                nextTierSpend = silverSpend;
+            }
+            return Object.assign(Object.assign({}, c), { tierInfo: {
+                    tier,
+                    multiplier,
+                    totalSpend,
+                    nextTierSpend
+                } });
+        });
+        res.json({
+            customers: enrichedCustomers,
+            total,
+            page,
+            limit
+        });
+    }
+    catch (error) {
+        console.error('Error fetching loyalty customers:', error.message);
+        res.status(500).json({ error: 'خطأ في جلب عملاء الولاء' });
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.getLoyaltyCustomers = getLoyaltyCustomers;
 // ─── Transactional Helpers (called within existing DB transactions) ──────────
 /**
  * Records loyalty points EARNED after a successful POS sale.
  * Called from processPOSSale AFTER commit (non-fatal).
  */
 const recordLoyaltyEarn = (conn_1, customerId_1, orderId_1, orderTotal_1, userName_1, ...args_1) => __awaiter(void 0, [conn_1, customerId_1, orderId_1, orderTotal_1, userName_1, ...args_1], void 0, function* (conn, customerId, orderId, orderTotal, userName, cartItems = []) {
-    var _a;
+    var _a, _b;
     try {
+        const fyCheck = yield (0, fiscalYearUtils_1.validateFiscalYearOpen)((0, dateUtils_1.getEgyptianISOString)());
+        if (!fyCheck.allowed) {
+            console.warn(`⚠️ [Loyalty] Earning points blocked due to closed fiscal period: ${fyCheck.error}`);
+            return null;
+        }
         const [partnerRows] = yield conn.query(`SELECT classification FROM partners WHERE id = ?`, [customerId]);
         const classification = ((_a = partnerRows[0]) === null || _a === void 0 ? void 0 : _a.classification) || null;
         const rules = yield (0, exports.getApplicableRules)(conn, orderTotal, classification);
@@ -595,9 +805,21 @@ const recordLoyaltyEarn = (conn_1, customerId_1, orderId_1, orderTotal_1, userNa
         const pointsEarned = calc.pointsEarned;
         if (pointsEarned <= 0)
             return null;
+        // Apply dynamic Tier multiplier
+        const tierInfo = yield (0, exports.deriveCustomerTier)(conn, customerId);
+        const multiplier = tierInfo.multiplier;
+        const tierName = tierInfo.tier;
+        let finalPointsEarned = 0;
+        const finalBreakdown = calc.breakdown.map((b) => {
+            const scaledPoints = Math.floor(b.points * multiplier);
+            finalPointsEarned += scaledPoints;
+            return Object.assign(Object.assign({}, b), { points: scaledPoints });
+        });
+        if (finalPointsEarned <= 0)
+            return null;
         const now = (0, dateUtils_1.getEgyptianISOString)();
         // Use the first applied rule for expiry and primary tracking
-        const primaryRule = rules.find(r => calc.breakdown.some((b) => b.ruleId === r.id));
+        const primaryRule = rules.find(r => finalBreakdown.some((b) => b.ruleId === r.id));
         if (!primaryRule)
             return null;
         let expiresAt = null;
@@ -608,13 +830,43 @@ const recordLoyaltyEarn = (conn_1, customerId_1, orderId_1, orderTotal_1, userNa
         }
         const txId = (0, uuid_1.v4)();
         // Create detailed description from breakdown
-        const descStr = calc.breakdown.map((b) => `${b.ruleName} (+${b.points})`).join(' | ');
+        const descStr = finalBreakdown.map((b) => `${b.ruleName} (+${b.points})`).join(' | ');
+        const tierSuffix = multiplier > 1.0 ? ` (مضاعف الفئة ${tierName} x${multiplier.toFixed(2)})` : '';
         yield conn.query(`INSERT INTO loyalty_transactions (id, ruleId, customerId, orderId, type, points, monetaryValue, description, createdBy, createdAt, expiresAt)
-             VALUES (?, ?, ?, ?, 'EARN', ?, ?, ?, ?, ?, ?)`, [txId, primaryRule.id, customerId, orderId, pointsEarned, orderTotal,
-            `كسب نقاط: ${descStr}`, userName, now, expiresAt]);
+             VALUES (?, ?, ?, ?, 'EARN', ?, ?, ?, ?, ?, ?)`, [txId, primaryRule.id, customerId, orderId, finalPointsEarned, orderTotal,
+            `كسب نقاط: ${descStr}${tierSuffix}`, userName, now, expiresAt]);
         const balance = yield deriveBalance(conn, customerId);
-        console.log(`🎯 [Loyalty] +${pointsEarned} points for customer ${customerId} (order ${orderId})`);
-        return { pointsEarned, newBalance: balance.currentBalance, breakdown: calc.breakdown };
+        // === FRAUD SENTRY: Dormant Account Check ===
+        if (finalPointsEarned > 100) {
+            try {
+                const [lastInvoiceRows] = yield conn.query(`SELECT date FROM invoices 
+                     WHERE partnerId = ? AND type = 'INVOICE_SALE' AND status != 'VOID' AND id != ?
+                     ORDER BY date DESC LIMIT 1`, [customerId, orderId]);
+                if (lastInvoiceRows.length > 0) {
+                    const lastDate = new Date(lastInvoiceRows[0].date);
+                    const daysDiff = (new Date().getTime() - lastDate.getTime()) / (1000 * 3600 * 24);
+                    if (daysDiff > 90) {
+                        const alertId = (0, uuid_1.v4)();
+                        const customerName = ((_b = partnerRows[0]) === null || _b === void 0 ? void 0 : _b.name) || customerId;
+                        yield conn.query(`INSERT INTO pos_fraud_alerts (id, alert_type, severity, description, details, cashier_id, cashier_name, customer_id)
+                             VALUES (?, 'DORMANT_RAPID_ACCUMULATION', 'WARNING', ?, ?, ?, ?, ?)`, [
+                            alertId,
+                            `تراكم نقاط سريع (${finalPointsEarned} نقطة) على حساب راكد للعميل (${customerName}) لم يقم بالشراء منذ ${Math.floor(daysDiff)} يوم.`,
+                            JSON.stringify({ earnedPoints: finalPointsEarned, daysDormant: Math.floor(daysDiff) }),
+                            'system',
+                            userName || 'System',
+                            customerId
+                        ]);
+                        console.log(`⚠️ [FRAUD] Alert DORMANT_RAPID_ACCUMULATION created for customer ${customerName}`);
+                    }
+                }
+            }
+            catch (fraudErr) {
+                console.error('Non-fatal dormant fraud check error:', fraudErr.message);
+            }
+        }
+        console.log(`🎯 [Loyalty] +${finalPointsEarned} points for customer ${customerId} (order ${orderId})`);
+        return { pointsEarned: finalPointsEarned, newBalance: balance.currentBalance, breakdown: finalBreakdown };
     }
     catch (err) {
         console.error(`⚠️ [Loyalty] Earn recording failed (non-fatal):`, err.message);
@@ -629,6 +881,11 @@ exports.recordLoyaltyEarn = recordLoyaltyEarn;
 const recordLoyaltyRedeem = (conn, customerId, orderId, pointsToRedeem, discountAmount, userName) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
+        const fyCheck = yield (0, fiscalYearUtils_1.validateFiscalYearOpen)((0, dateUtils_1.getEgyptianISOString)());
+        if (!fyCheck.allowed) {
+            console.warn(`⚠️ [Loyalty] Redeeming points blocked due to closed fiscal period: ${fyCheck.error}`);
+            return false;
+        }
         // Validate balance with FOR UPDATE lock to prevent double-spend
         const [balRows] = yield conn.query(`SELECT 
                 COALESCE(SUM(CASE WHEN type = 'EARN' THEN points ELSE 0 END), 0) -
@@ -666,6 +923,11 @@ exports.recordLoyaltyRedeem = recordLoyaltyRedeem;
 const recordLoyaltyClawback = (conn, customerId, originalOrderId, refundTotal, userName) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b, _c;
     try {
+        const fyCheck = yield (0, fiscalYearUtils_1.validateFiscalYearOpen)((0, dateUtils_1.getEgyptianISOString)());
+        if (!fyCheck.allowed) {
+            console.warn(`⚠️ [Loyalty] Clawback points blocked due to closed fiscal period: ${fyCheck.error}`);
+            return 0;
+        }
         // Find how many points were earned on the original order
         const [earnRows] = yield conn.query(`SELECT COALESCE(SUM(points), 0) as earnedPoints 
              FROM loyalty_transactions 
@@ -703,3 +965,217 @@ const recordLoyaltyClawback = (conn, customerId, originalOrderId, refundTotal, u
     }
 });
 exports.recordLoyaltyClawback = recordLoyaltyClawback;
+/**
+ * Derives the dynamic loyalty tier and point multiplier for a customer
+ * based on their rolling 12-month spend in invoices.
+ */
+const deriveCustomerTier = (conn, customerId) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const settings = yield (0, exports.getLoyaltySettings)(conn);
+    // Sum rolling 12-month POS/Standard sales invoices
+    const [spendRows] = yield conn.query(`SELECT COALESCE(SUM(total), 0) AS totalSpend 
+         FROM invoices 
+         WHERE partnerId = ? 
+           AND type = 'INVOICE_SALE' 
+           AND status != 'VOID'
+           AND date >= DATE_SUB(NOW(), INTERVAL 12 MONTH)`, [customerId]);
+    const totalSpend = Number((_a = spendRows[0]) === null || _a === void 0 ? void 0 : _a.totalSpend) || 0;
+    let tier = 'BRONZE';
+    let multiplier = 1.0;
+    const silverSpend = Number(settings.tier_silver_min_spend) || 2000.00;
+    const goldSpend = Number(settings.tier_gold_min_spend) || 5000.00;
+    const platSpend = Number(settings.tier_platinum_min_spend) || 10000.00;
+    let nextTierSpend = silverSpend;
+    if (totalSpend >= platSpend) {
+        tier = 'PLATINUM';
+        multiplier = Number(settings.tier_platinum_multiplier) || 2.00;
+        nextTierSpend = 0;
+    }
+    else if (totalSpend >= goldSpend) {
+        tier = 'GOLD';
+        multiplier = Number(settings.tier_gold_multiplier) || 1.50;
+        nextTierSpend = platSpend;
+    }
+    else if (totalSpend >= silverSpend) {
+        tier = 'SILVER';
+        multiplier = Number(settings.tier_silver_multiplier) || 1.20;
+        nextTierSpend = goldSpend;
+    }
+    else {
+        tier = 'BRONZE';
+        multiplier = 1.0;
+        nextTierSpend = silverSpend;
+    }
+    return {
+        tier,
+        multiplier,
+        totalSpend,
+        nextTierSpend
+    };
+});
+exports.deriveCustomerTier = deriveCustomerTier;
+/**
+ * API wrapper to fetch customer tier details.
+ */
+const getCustomerTierAPI = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const { customerId } = req.params;
+        if (!customerId) {
+            res.status(400).json({ error: 'معرف العميل مطلوب' });
+            return;
+        }
+        const tierInfo = yield (0, exports.deriveCustomerTier)(conn, customerId);
+        res.json(tierInfo);
+    }
+    catch (error) {
+        console.error('Error fetching customer tier:', error.message);
+        res.status(500).json({ error: 'خطأ في جلب بيانات مستوى العميل' });
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.getCustomerTierAPI = getCustomerTierAPI;
+/**
+ * Processes referral rewards when a customer completes checkout.
+ * If this is the customer's first purchase and they were referred,
+ * rewards the referrer with 50 loyalty points.
+ */
+const processReferralReward = (conn, refereeId, orderId, userName) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        // Find if this customer has a pending referral
+        const [refRows] = yield conn.query(`SELECT id, referrer_id, referral_code, coupon_code 
+             FROM loyalty_referrals 
+             WHERE referee_id = ? AND status = 'PENDING' 
+             LIMIT 1`, [refereeId]);
+        if (refRows.length === 0)
+            return;
+        const refRecord = refRows[0];
+        // Verify if this is indeed the referee's first purchase (type INVOICE_SALE, POSTED, id != current orderId)
+        const [salesRows] = yield conn.query(`SELECT COUNT(*) AS saleCount 
+             FROM invoices 
+             WHERE partnerId = ? 
+               AND type = 'INVOICE_SALE' 
+               AND status != 'VOID' 
+               AND id != ?`, [refereeId, orderId]);
+        const saleCount = Number((_a = salesRows[0]) === null || _a === void 0 ? void 0 : _a.saleCount) || 0;
+        if (saleCount > 0) {
+            // Not their first sale, void the referral log to prevent fraud/bugs
+            yield conn.query(`UPDATE loyalty_referrals SET status = 'VOID', completed_at = NOW() WHERE id = ?`, [refRecord.id]);
+            return;
+        }
+        // Fetch referee's name
+        const [refereeRows] = yield conn.query(`SELECT name FROM partners WHERE id = ? LIMIT 1`, [refereeId]);
+        const refereeName = ((_b = refereeRows[0]) === null || _b === void 0 ? void 0 : _b.name) || refereeId;
+        const now = (0, dateUtils_1.getEgyptianISOString)();
+        const txId = (0, uuid_1.v4)();
+        // 1. Set status to COMPLETED
+        yield conn.query(`UPDATE loyalty_referrals 
+             SET status = 'COMPLETED', completed_at = ? 
+             WHERE id = ?`, [now, refRecord.id]);
+        // 2. Award 50 points to the referrer
+        const rewardPoints = 50;
+        yield conn.query(`INSERT INTO loyalty_transactions (id, customerId, orderId, type, points, description, createdBy, createdAt)
+             VALUES (?, ?, ?, 'EARN', ?, ?, ?, ?)`, [
+            txId,
+            refRecord.referrer_id,
+            orderId,
+            rewardPoints,
+            `مكافأة إحالة عميل جديد: كسب نقاط لدعوة ${refereeName}`,
+            userName,
+            now
+        ]);
+        console.log(`🎯 [Referral] Referrer ${refRecord.referrer_id} rewarded 50 points for inviting ${refereeName}`);
+    }
+    catch (err) {
+        console.error('⚠️ [Referral] Reward processing failed:', err.message);
+    }
+});
+exports.processReferralReward = processReferralReward;
+/**
+ * API handler to retrieve referral stats for a customer.
+ */
+const getReferralStatsAPI = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const { customerId } = req.params;
+        if (!customerId) {
+            res.status(400).json({ error: 'معرف العميل مطلوب' });
+            return;
+        }
+        // Fetch partner's own referral code
+        const [partnerRows] = yield conn.query(`SELECT referral_code FROM partners WHERE id = ? LIMIT 1`, [customerId]);
+        const referralCode = ((_a = partnerRows[0]) === null || _a === void 0 ? void 0 : _a.referral_code) || null;
+        // Fetch referral list count and completed count
+        const [statsRows] = yield conn.query(`SELECT 
+                COUNT(*) AS totalReferred,
+                SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) AS pendingCount,
+                SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) AS completedCount,
+                SUM(CASE WHEN status = 'COMPLETED' THEN rewarded_points ELSE 0 END) AS totalPointsEarned
+             FROM loyalty_referrals 
+             WHERE referrer_id = ?`, [customerId]);
+        const stats = statsRows[0] || {};
+        // Fetch referred friends list (referee names and statuses)
+        const [friendRows] = yield conn.query(`SELECT lr.created_at, lr.status, p.name AS refereeName, p.phone AS refereePhone, lr.completed_at
+             FROM loyalty_referrals lr
+             JOIN partners p ON lr.referee_id = p.id
+             WHERE lr.referrer_id = ?
+             ORDER BY lr.created_at DESC`, [customerId]);
+        res.json({
+            referralCode,
+            totalReferred: Number(stats.totalReferred) || 0,
+            pendingCount: Number(stats.pendingCount) || 0,
+            completedCount: Number(stats.completedCount) || 0,
+            totalPointsEarned: Number(stats.totalPointsEarned) || 0,
+            friends: friendRows
+        });
+    }
+    catch (error) {
+        console.error('Error fetching referral stats:', error.message);
+        res.status(500).json({ error: 'خطأ في جلب بيانات الإحالات للعميل' });
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.getReferralStatsAPI = getReferralStatsAPI;
+/**
+ * Get active fraud alerts from pos_fraud_alerts table.
+ */
+const getFraudAlerts = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const [rows] = yield conn.query(`SELECT * FROM pos_fraud_alerts ORDER BY created_at DESC LIMIT 100`);
+        res.json({ alerts: rows });
+    }
+    catch (error) {
+        console.error('Error fetching fraud alerts:', error.message);
+        res.status(500).json({ error: 'خطأ في جلب التنبيهات الأمنية' });
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.getFraudAlerts = getFraudAlerts;
+/**
+ * Dismiss a specific fraud alert.
+ */
+const dismissFraudAlert = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const { id } = req.params;
+        yield conn.query(`DELETE FROM pos_fraud_alerts WHERE id = ?`, [id]);
+        res.json({ success: true });
+    }
+    catch (error) {
+        console.error('Error dismissing fraud alert:', error.message);
+        res.status(500).json({ error: 'خطأ في حذف التنبيه الأمني' });
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.dismissFraudAlert = dismissFraudAlert;

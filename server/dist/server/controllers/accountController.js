@@ -11,6 +11,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getProfitAnalysis = exports.getMonthlyProfit = exports.getAccountBalances = exports.getAccountsLedger = exports.getTreasuryOpeningBalance = exports.recalculateAccountBalances = exports.deleteAccount = exports.updateAccount = exports.createAccount = exports.getAccounts = void 0;
 const db_1 = require("../db");
+const branchFilter_1 = require("../utils/branchFilter");
 const crypto_1 = require("crypto");
 const auditController_1 = require("./auditController");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -42,16 +43,32 @@ const createAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 message: `نوع الحساب "${type}" غير صالح. القيم المقبولة: ${VALID_ACCOUNT_TYPES.join(', ')}`
             });
         }
+        // Validate code uniqueness
+        if (code) {
+            const [existingCode] = yield conn.query('SELECT id FROM accounts WHERE code = ?', [code]);
+            if (existingCode.length > 0) {
+                yield conn.rollback();
+                conn.release();
+                return res.status(400).json({
+                    code: 'DUPLICATE_CODE',
+                    message: `رمز الحساب "${code}" مستخدم بالفعل لحساب آخر.`
+                });
+            }
+        }
+        // Coerce string inputs to numbers
+        const parsedOpeningBalance = parseFloat(openingBalance) || 0;
+        const parsedBalance = balance !== undefined ? parseFloat(balance) : parsedOpeningBalance;
         // Use provided ID or generate new one
         const accountId = id || (0, crypto_1.randomUUID)();
-        yield conn.query('INSERT INTO accounts (id, code, name, type, subType, openingBalance, balance, currencyCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [accountId, code, name, type, subType || null, openingBalance || 0, balance || openingBalance || 0, currencyCode || 'EGP']);
+        yield conn.query('INSERT INTO accounts (id, code, name, type, subType, openingBalance, balance, currencyCode) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [accountId, code, name, type, subType || null, parsedOpeningBalance, parsedBalance, currencyCode || 'EGP']);
         yield conn.commit();
-        // Log audit trail
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
+        // Log audit trail using authenticated user session
+        const authReq = req;
+        const user = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.username) || 'System';
         yield (0, auditController_1.logAction)(user, 'ACCOUNT', 'CREATE', `إنشاء حساب - ${name}`, `الرمز: ${code}, النوع: ${type}, التصنيف: ${subType || 'بدون'}`);
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'accounts', updatedBy: user });
-        res.status(201).json({ id: accountId, code, name, type, subType: subType || null, openingBalance: openingBalance || 0, balance: balance || openingBalance || 0, currencyCode: currencyCode || 'EGP' });
+        res.status(201).json({ id: accountId, code, name, type, subType: subType || null, openingBalance: parsedOpeningBalance, balance: parsedBalance, currencyCode: currencyCode || 'EGP' });
     }
     catch (error) {
         yield conn.rollback();
@@ -78,10 +95,23 @@ const updateAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 message: `نوع الحساب "${type}" غير صالح. القيم المقبولة: ${VALID_ACCOUNT_TYPES.join(', ')}`
             });
         }
+        // Validate code uniqueness for other accounts
+        if (code) {
+            const [existingCode] = yield conn.query('SELECT id FROM accounts WHERE code = ? AND id != ?', [code, id]);
+            if (existingCode.length > 0) {
+                yield conn.rollback();
+                conn.release();
+                return res.status(400).json({
+                    code: 'DUPLICATE_CODE',
+                    message: `رمز الحساب "${code}" مستخدم بالفعل لحساب آخر.`
+                });
+            }
+        }
         yield conn.query('UPDATE accounts SET code = ?, name = ?, type = ?, subType = ?, currencyCode = ? WHERE id = ?', [code, name, type, subType || null, currencyCode, id]);
         yield conn.commit();
-        // Log audit trail
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
+        // Log audit trail using authenticated user session
+        const authReq = req;
+        const user = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.username) || 'System';
         yield (0, auditController_1.logAction)(user, 'ACCOUNT', 'UPDATE', `تحديث حساب - ${name}`, `الرمز: ${code}, النوع: ${type}, التصنيف: ${subType || 'بدون'}`);
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'accounts', updatedBy: user });
@@ -97,7 +127,7 @@ const updateAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
 });
 exports.updateAccount = updateAccount;
 const deleteAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g;
+    var _a, _b, _c;
     const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
@@ -117,6 +147,20 @@ const deleteAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (((_a = journalCount[0]) === null || _a === void 0 ? void 0 : _a.cnt) > 0) {
             dependencies.push(`${journalCount[0].cnt} قيد محاسبي مرتبط`);
         }
+        // Helper to check dependencies without swallowing actual DB errors
+        const checkTableDeps = (queryStr, params) => __awaiter(void 0, void 0, void 0, function* () {
+            var _a;
+            try {
+                const [res] = yield conn.query(queryStr, params);
+                return ((_a = res[0]) === null || _a === void 0 ? void 0 : _a.cnt) > 0;
+            }
+            catch (err) {
+                if (err.code === 'ER_NO_SUCH_TABLE') {
+                    return false;
+                }
+                throw err;
+            }
+        });
         // Check banks linked to this account
         try {
             const [banks] = yield conn.query('SELECT id, name FROM banks WHERE accountId = ?', [id]);
@@ -124,24 +168,15 @@ const deleteAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 const bankId = banks[0].id;
                 let bankHasDeps = false;
                 // Check if the bank itself has dependencies
-                try {
-                    const [invCnt] = yield conn.query('SELECT COUNT(*) as cnt FROM invoices WHERE bankAccountId = ?', [bankId]);
-                    if (((_b = invCnt[0]) === null || _b === void 0 ? void 0 : _b.cnt) > 0)
-                        bankHasDeps = true;
+                if (yield checkTableDeps('SELECT COUNT(*) as cnt FROM invoices WHERE bankAccountId = ?', [bankId])) {
+                    bankHasDeps = true;
                 }
-                catch (_h) { }
-                try {
-                    const [chqCnt] = yield conn.query('SELECT COUNT(*) as cnt FROM cheques WHERE bankId = ?', [bankId]);
-                    if (((_c = chqCnt[0]) === null || _c === void 0 ? void 0 : _c.cnt) > 0)
-                        bankHasDeps = true;
+                if (yield checkTableDeps('SELECT COUNT(*) as cnt FROM cheques WHERE bankId = ?', [bankId])) {
+                    bankHasDeps = true;
                 }
-                catch (_j) { }
-                try {
-                    const [btCnt] = yield conn.query('SELECT COUNT(*) as cnt FROM bank_transactions WHERE bankId = ?', [bankId]);
-                    if (((_d = btCnt[0]) === null || _d === void 0 ? void 0 : _d.cnt) > 0)
-                        bankHasDeps = true;
+                if (yield checkTableDeps('SELECT COUNT(*) as cnt FROM bank_transactions WHERE bankId = ?', [bankId])) {
+                    bankHasDeps = true;
                 }
-                catch (_k) { }
                 if (bankHasDeps) {
                     dependencies.push(`يوجد حساب بنكي/خزينة مرتبط به حركات (${banks[0].name})`);
                 }
@@ -151,7 +186,11 @@ const deleteAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 }
             }
         }
-        catch ( /* table might not exist */_l) { /* table might not exist */ }
+        catch (err) {
+            if (err.code !== 'ER_NO_SUCH_TABLE') {
+                throw err;
+            }
+        }
         if (dependencies.length > 0) {
             yield conn.rollback();
             conn.release();
@@ -162,8 +201,9 @@ const deleteAccount = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         yield conn.query('DELETE FROM accounts WHERE id = ?', [id]);
         yield conn.commit();
-        // Log audit trail
-        const user = ((_e = req.user) === null || _e === void 0 ? void 0 : _e.name) || ((_f = req.user) === null || _f === void 0 ? void 0 : _f.username) || (((_g = req.body) === null || _g === void 0 ? void 0 : _g.user) || req.query.user) || 'System';
+        // Log audit trail using authenticated user session
+        const authReq = req;
+        const user = ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.name) || ((_c = authReq.user) === null || _c === void 0 ? void 0 : _c.username) || 'System';
         yield (0, auditController_1.logAction)(user, 'ACCOUNT', 'DELETE', `حذف حساب - ${accountName}`, `تم حذف الحساب | رقم المرجع: ${id}`);
         // Broadcast real-time deletion
         eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'accounts', entityId: id, deletedBy: user });
@@ -189,9 +229,24 @@ const recalculateAccountBalances = (req, res) => __awaiter(void 0, void 0, void 
     var _a, _b, _c;
     const conn = yield (0, db_1.getConnection)();
     try {
+        const authReq = req;
+        const userObj = authReq.user;
+        const roleUpper = ((userObj === null || userObj === void 0 ? void 0 : userObj.role) || '').trim().toUpperCase();
+        const allowedRoles = ['MASTER_ADMIN', 'ADMIN', 'GENERAL_MANAGER', 'MANAGER', 'ACCOUNTANT', 'المدير', 'المدير العام', 'مسئول النظام'];
+        const isAllowed = userObj && (allowedRoles.includes(roleUpper) ||
+            ((_a = userObj.permissions) === null || _a === void 0 ? void 0 : _a.includes('all')) ||
+            ((_b = userObj.permissions) === null || _b === void 0 ? void 0 : _b.includes('system.settings')) ||
+            ((_c = userObj.permissions) === null || _c === void 0 ? void 0 : _c.includes('accounting.manage')));
+        if (!isAllowed) {
+            conn.release();
+            return res.status(403).json({
+                code: 'FORBIDDEN',
+                message: 'غير مصرح لك بإجراء هذه العملية. تتطلب صلاحية مدير أو محاسب.'
+            });
+        }
         yield conn.beginTransaction();
-        // Get all accounts with their current and opening balances
-        const [accounts] = yield conn.query('SELECT id, code, name, type, openingBalance, balance FROM accounts');
+        // Get all accounts with their current and opening balances (including subType)
+        const [accounts] = yield conn.query('SELECT id, code, name, type, subType, openingBalance, balance FROM accounts');
         // Get all journal line movements grouped by account
         const [movements] = yield conn.query(`
             SELECT 
@@ -221,12 +276,17 @@ const recalculateAccountBalances = (req, res) => __awaiter(void 0, void 0, void 
             const totalCredit = (movement === null || movement === void 0 ? void 0 : movement.totalCredit) || 0;
             const openingBalance = parseFloat(account.openingBalance) || 0;
             let newBalance;
-            if (debitNormalTypes.includes(account.type)) {
+            let isDebitNormal = debitNormalTypes.includes(account.type);
+            // Contra-asset accounts like accumulated depreciation are credit-normal
+            if (account.subType === 'ACCUMULATED_DEPRECIATION') {
+                isDebitNormal = false;
+            }
+            if (isDebitNormal) {
                 // For ASSET/EXPENSE: Balance = Opening + Debits - Credits
                 newBalance = openingBalance + totalDebit - totalCredit;
             }
             else {
-                // For LIABILITY/EQUITY/REVENUE: Balance = Opening + Credits - Debits
+                // For LIABILITY/EQUITY/REVENUE/ACCUMULATED_DEPRECIATION: Balance = Opening + Credits - Debits
                 newBalance = openingBalance + totalCredit - totalDebit;
             }
             // Round to 2 decimal places
@@ -245,7 +305,7 @@ const recalculateAccountBalances = (req, res) => __awaiter(void 0, void 0, void 
         }
         yield conn.commit();
         // Log audit trail
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || ((_c = req.body) === null || _c === void 0 ? void 0 : _c.user) || 'System';
+        const user = (userObj === null || userObj === void 0 ? void 0 : userObj.name) || (userObj === null || userObj === void 0 ? void 0 : userObj.username) || 'System';
         if (updatedCount > 0) {
             yield (0, auditController_1.logAction)(user, 'ACCOUNT', 'RECALCULATE', `إعادة احتساب أرصدة الحسابات`, `تم تحديث ${updatedCount} حساب`);
         }
@@ -290,28 +350,55 @@ const getTreasuryOpeningBalance = (req, res) => __awaiter(void 0, void 0, void 0
         if (!date) {
             return res.status(400).json({ error: 'date parameter is required (YYYY-MM-DD)' });
         }
-        // Determine which account codes to include
+        // Determine which account codes to include symmetrically
         let codeFilter;
+        const isCashExpr = `(a.code LIKE '101%' OR a.id IN (SELECT accountId FROM banks WHERE bankType = 'TREASURY') OR (a.type = 'ASSET' AND (a.name LIKE '%صندوق%' OR a.name LIKE '%خزينة%' OR a.name LIKE '%نقدية%') AND a.id NOT IN (SELECT accountId FROM banks WHERE bankType = 'BANK')))`;
         if (accountFilter === 'CASH') {
-            codeFilter = "a.code LIKE '101%' OR (a.type = 'ASSET' AND (a.name LIKE '%صندوق%' OR a.name LIKE '%خزينة%' OR a.name LIKE '%نقدية%'))";
+            codeFilter = isCashExpr;
         }
         else if (accountFilter === 'BANK') {
-            codeFilter = "a.code LIKE '102%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND a.name LIKE '%بنك%')";
+            codeFilter = `(a.code LIKE '102%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND a.name LIKE '%بنك%') OR a.id IN (SELECT accountId FROM banks WHERE bankType = 'BANK')) AND NOT ${isCashExpr}`;
         }
         else if (accountFilter === 'CHEQUES') {
             codeFilter = "(a.code LIKE '106%' OR a.code LIKE '107%')";
         }
         else {
             // ALL
-            codeFilter = "(a.code LIKE '101%' OR a.code LIKE '102%' OR a.code LIKE '106%' OR a.code LIKE '107%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND (a.name LIKE '%صندوق%' OR a.name LIKE '%خزينة%' OR a.name LIKE '%نقدية%' OR a.name LIKE '%بنك%')))";
+            codeFilter = `(${isCashExpr} OR a.code LIKE '102%' OR a.code LIKE '106%' OR a.code LIKE '107%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND a.name LIKE '%بنك%') OR a.id IN (SELECT accountId FROM banks WHERE bankType = 'BANK'))`;
+        }
+        // Resolve branch vs cost center scope
+        const { branchId: userBranchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
+        let effectiveBranchId = null;
+        let isBranchSelection = false;
+        if (costCenterId && costCenterId !== 'ALL') {
+            const [branchRows] = yield conn.query('SELECT 1 FROM branches WHERE id = ?', [costCenterId]);
+            if (branchRows && branchRows.length > 0) {
+                isBranchSelection = true;
+            }
+        }
+        if (!isPrivileged && userBranchId) {
+            effectiveBranchId = userBranchId;
+        }
+        else if (isBranchSelection) {
+            effectiveBranchId = costCenterId;
         }
         // Pre-filter account IDs for faster queries (avoids repeated LIKE on joined tables)
-        const [acctRows] = yield conn.query(`SELECT id, code, name, COALESCE(openingBalance, 0) as openingBalance FROM accounts a WHERE ${codeFilter}`);
+        let acctQuery = `SELECT a.id, a.code, a.name, COALESCE(a.openingBalance, 0) as openingBalance FROM accounts a WHERE ${codeFilter}`;
+        let acctParams = [];
+        if (effectiveBranchId) {
+            acctQuery = `SELECT a.id, a.code, a.name, COALESCE(a.openingBalance, 0) as openingBalance 
+                         FROM accounts a 
+                         JOIN banks b ON b.accountId = a.id
+                         WHERE ${codeFilter} AND b.branchId = ?`;
+            acctParams.push(effectiveBranchId);
+        }
+        const [acctRows] = yield conn.query(acctQuery, acctParams);
         const accountIds = acctRows.map((r) => r.id);
         if (accountIds.length === 0) {
             return res.json({ openingBalance: 0, totalIn: 0, totalOut: 0, accountOpenings: 0, accountDetails: [] });
         }
         const placeholders = accountIds.map(() => '?').join(',');
+        const escapedAccountIds = accountIds.map(id => `'${id}'`).join(',');
         // Build per-account map for detailed breakdown
         const acctMap = new Map();
         for (const r of acctRows) {
@@ -375,7 +462,18 @@ const getTreasuryOpeningBalance = (req, res) => __awaiter(void 0, void 0, void 0
             additionalFilterSQL += " AND je.createdBy = ?";
             additionalParams.push(createdBy);
         }
-        if (costCenterId) {
+        // Apply comprehensive branch filter to period queries
+        if (effectiveBranchId) {
+            additionalFilterSQL += ` AND (
+                je.branchId = ?
+                OR EXISTS (SELECT 1 FROM journal_lines jlf WHERE jlf.journalId = je.id AND jlf.costCenterId = ?)
+                OR EXISTS (SELECT 1 FROM journal_lines jlf JOIN banks bk ON jlf.accountId = bk.accountId WHERE jlf.journalId = je.id AND bk.branchId = ?)
+                OR EXISTS (SELECT 1 FROM invoices inv WHERE inv.id = je.referenceId AND (inv.branchId = ? OR inv.warehouseId IN (SELECT id FROM warehouses WHERE branchId = ?)))
+            )`;
+            additionalParams.push(effectiveBranchId, effectiveBranchId, effectiveBranchId, effectiveBranchId, effectiveBranchId);
+        }
+        // If the costCenterId is a cost center (not a branch), apply the cost center filter
+        if (costCenterId && costCenterId !== 'ALL' && !isBranchSelection) {
             additionalFilterSQL += " AND EXISTS (SELECT 1 FROM journal_lines jlf WHERE jlf.journalId = je.id AND jlf.costCenterId = ?)";
             additionalParams.push(costCenterId);
         }
@@ -398,17 +496,17 @@ const getTreasuryOpeningBalance = (req, res) => __awaiter(void 0, void 0, void 0
                 // BUG FIX: Negative credits (credit=-200) have net impact = 0-(-200) = +200, which IS inflow.
                 // EXCLUDE مصروف/سند صرف descriptions to prevent reversed expenses showing as income.
                 // INCLUDE سند قبض by description to catch reversed receipts (عكسي) where cash net < 0.
+                // Escaped Account IDs are inlined to avoid dynamic parameters mismatch.
                 additionalFilterSQL += ` AND (
                     EXISTS (
                         SELECT 1 FROM journal_lines jlf 
-                        WHERE jlf.journalId = je.id AND jlf.accountId IN (${placeholders}) 
+                        WHERE jlf.journalId = je.id AND jlf.accountId IN (${escapedAccountIds}) 
                         GROUP BY jlf.journalId 
                         HAVING (COALESCE(SUM(jlf.debit),0) - COALESCE(SUM(jlf.credit),0)) > 0
                     )
                     OR je.description LIKE '%سند قبض%'
                     OR je.description LIKE '%متحصلات نقدية%'
                 ) AND je.description NOT LIKE '%سند صرف%' AND je.description NOT LIKE '%مصروف%' AND je.description NOT LIKE '%expense%'`;
-                additionalParams.push(...accountIds);
             }
             else if (transactionFilter === 'OUTCOME') {
                 // صادر (دفعيات) — cash outflow EXCLUDING مصروفات
@@ -417,16 +515,16 @@ const getTreasuryOpeningBalance = (req, res) => __awaiter(void 0, void 0, void 0
                 //   Negative entries: cash credit=-200 → net = 0-(-200) = +200 (NOT outflow)
                 // Also includes سند صرف by description regardless of direction.
                 // EXCLUDES سند قبض — reversed receipts belong in INCOME, not OUTCOME.
+                // Escaped Account IDs are inlined to avoid dynamic parameters mismatch.
                 additionalFilterSQL += ` AND (
                     EXISTS (
                         SELECT 1 FROM journal_lines jlf
-                        WHERE jlf.journalId = je.id AND jlf.accountId IN (${placeholders})
+                        WHERE jlf.journalId = je.id AND jlf.accountId IN (${escapedAccountIds})
                         GROUP BY jlf.journalId
                         HAVING (COALESCE(SUM(jlf.debit),0) - COALESCE(SUM(jlf.credit),0)) < 0
                     )
                     OR je.description LIKE '%سند صرف%'
                 ) AND je.description NOT LIKE '%مصروف%' AND je.description NOT LIKE '%expense%' AND je.description NOT LIKE '%سند قبض%' AND je.description NOT LIKE '%متحصلات نقدية%'`;
-                additionalParams.push(...accountIds);
             }
         }
         // EXCLUDE search: pipe-separated terms to EXCLUDE from results.
@@ -439,23 +537,15 @@ const getTreasuryOpeningBalance = (req, res) => __awaiter(void 0, void 0, void 0
                 additionalParams.push(`%${term}%`, `%${term}%`);
             }
         }
-        // DEDUP: Exclude duplicate journal entries with same referenceId (keep only the latest).
-        // This MUST match the dedup condition in journalController.getJournalEntries so that
-        // the totals computed here match the entries shown in the paginated list.
-        // Without this, old/superseded journal entries inflate totalIn/totalOut/totalExpenses.
-        additionalFilterSQL += ` AND (je.referenceId IS NULL OR je.referenceId = '' OR je.referenceId = 'MANUAL' OR NOT EXISTS (SELECT 1 FROM journal_entries j2 WHERE j2.referenceId = je.referenceId AND j2.referenceId IS NOT NULL AND j2.referenceId != '' AND j2.referenceId != 'MANUAL' AND j2.id > je.id))`;
         // 1. Get sum of opening balances for matching accounts (only makes sense if no advanced filters)
         const accountOpenings = acctRows.reduce((sum, r) => sum + (parseFloat(r.openingBalance) || 0), 0);
         // 2. Get per-account journal movements BEFORE the specified date
         // CRITICAL FIX: Opening balance must ALWAYS be unfiltered — it represents the true
-        // cash position at period start. Applying search/category/transaction filters here
-        // would cause the opening balance to change depending on the active filter, making
-        // رصيد الفترة appear corrupt when switching between filtered and unfiltered views.
-        // NOTE: DEDUP is NOT a filter — it prevents duplicate journal entries from inflating balances.
-        const dedupSQL = `AND (je.referenceId IS NULL OR je.referenceId = '' OR je.referenceId = 'MANUAL' OR NOT EXISTS (SELECT 1 FROM journal_entries j2 WHERE j2.referenceId = je.referenceId AND j2.referenceId IS NOT NULL AND j2.referenceId != '' AND j2.referenceId != 'MANUAL' AND j2.id > je.id))`;
+        // cash position at period start. Branch/costCenter filters are removed to maintain
+        // visual and accounting period integrity.
         let movRows;
         try {
-            [movRows] = yield conn.query(`SELECT 
+            const obQuery = `SELECT 
                     jl.accountId,
                     COALESCE(SUM(jl.debit), 0) as totalDebit,
                     COALESCE(SUM(jl.credit), 0) as totalCredit
@@ -463,23 +553,24 @@ const getTreasuryOpeningBalance = (req, res) => __awaiter(void 0, void 0, void 0
                  JOIN journal_entries je ON jl.journalId = je.id
                  WHERE jl.accountId IN (${placeholders})
                    AND je.date < ?
-                   ${dedupSQL}
-                 GROUP BY jl.accountId`, [...accountIds, date]);
+                 GROUP BY jl.accountId`;
+            const obParams = [...accountIds, date];
+            [movRows] = yield conn.query(obQuery, obParams);
         }
         catch (movErr) {
             // Fallback: If je.id alias fails (MariaDB/MySQL compat), use subquery instead
             if (movErr.code === 'ER_BAD_FIELD_ERROR' || ((_a = movErr.message) === null || _a === void 0 ? void 0 : _a.includes('Unknown column'))) {
                 console.warn(`[getTreasuryOpeningBalance] ER_BAD_FIELD_ERROR on opening balance query — using fallback. Error: ${movErr.message}`);
-                [movRows] = yield conn.query(`SELECT 
+                const fallbackObQuery = `SELECT 
                         jl.accountId,
                         COALESCE(SUM(jl.debit), 0) as totalDebit,
                         COALESCE(SUM(jl.credit), 0) as totalCredit
                      FROM journal_lines jl
-                     JOIN journal_entries je ON jl.journalId = je.id
                      WHERE jl.accountId IN (${placeholders})
-                       AND je.date < ?
-                       ${dedupSQL}
-                     GROUP BY jl.accountId`, [...accountIds, date]);
+                       AND jl.journalId IN (SELECT id FROM journal_entries WHERE date < ?)
+                     GROUP BY jl.accountId`;
+                const fallbackObParams = [...accountIds, date];
+                [movRows] = yield conn.query(fallbackObQuery, fallbackObParams);
             }
             else {
                 throw movErr;
@@ -719,8 +810,9 @@ const getAccountsLedger = (req, res) => __awaiter(void 0, void 0, void 0, functi
             if (account.currencyCode && account.currencyCode !== 'EGP')
                 isForeign = true;
         }
+        const { branchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
         if (startDate) {
-            const [obRows] = yield conn.query(`
+            let obQuery = `
                 SELECT 
                     SUM(jl.debit) as debit,
                     SUM(jl.credit) as credit,
@@ -729,7 +821,13 @@ const getAccountsLedger = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 FROM journal_lines jl
                 JOIN journal_entries je ON jl.journalId = je.id
                 WHERE jl.accountId IN (${placeholders}) AND je.date < ?
-            `, [...accountsList, startDate]);
+            `;
+            const obParams = [...accountsList, startDate];
+            if (branchId && !isPrivileged) {
+                obQuery += " AND (je.branchId = ? OR je.branchId IS NULL)";
+                obParams.push(branchId);
+            }
+            const [obRows] = yield conn.query(obQuery, obParams);
             if (obRows[0]) {
                 const row = obRows[0];
                 if (isForeign) {
@@ -757,6 +855,10 @@ const getAccountsLedger = (req, res) => __awaiter(void 0, void 0, void 0, functi
             dateFilter.push("je.date <= ?");
             params.push(endDate.includes('T') ? endDate : endDate + ' 23:59:59');
         }
+        if (branchId && !isPrivileged) {
+            dateFilter.push("(je.branchId = ? OR je.branchId IS NULL)");
+            params.push(branchId);
+        }
         const dateWhere = dateFilter.length > 0 ? "AND " + dateFilter.join(" AND ") : "";
         // FAST QUERY: No LEFT JOIN on invoices — that OR condition caused full table scans
         const [lines] = yield conn.query(`
@@ -778,32 +880,61 @@ const getAccountsLedger = (req, res) => __awaiter(void 0, void 0, void 0, functi
             GROUP BY je.id, je.date, je.description, je.referenceId, je.createdBy
             ORDER BY je.date ASC
         `, params);
-        // BATCH LOOKUP: Fetch bankTransferReference only for the referenceIds we found
+        // BATCH LOOKUP: Fetch document info (number, posShiftId, bankTransferReference) for referenceIds
         // This is much faster than LEFT JOIN with OR on every row
         const refIds = [...new Set(lines.map((l) => l.referenceId).filter(Boolean))];
         const refMap = new Map();
+        const numMap = new Map();
+        const shiftMap = new Map();
         if (refIds.length > 0) {
             // Batch in chunks of 500 to avoid query size limits
             const CHUNK = 500;
             for (let i = 0; i < refIds.length; i += CHUNK) {
                 const chunk = refIds.slice(i, i + CHUNK);
                 const ph = chunk.map(() => '?').join(',');
-                const [invRows] = yield conn.query(`SELECT id, number, bankTransferReference FROM invoices 
-                     WHERE bankTransferReference IS NOT NULL 
-                       AND bankTransferReference != '' 
-                       AND (id IN (${ph}) OR number IN (${ph}))`, [...chunk, ...chunk]);
+                const [invRows] = yield conn.query(`SELECT id, number, posShiftId, bankTransferReference FROM invoices 
+                     WHERE id IN (${ph}) OR number IN (${ph})`, [...chunk, ...chunk]);
                 for (const inv of invRows) {
                     if (inv.bankTransferReference) {
                         refMap.set(inv.id, inv.bankTransferReference);
                         if (inv.number)
                             refMap.set(inv.number, inv.bankTransferReference);
                     }
+                    if (inv.number) {
+                        numMap.set(inv.id, inv.number);
+                    }
+                    if (inv.posShiftId) {
+                        shiftMap.set(inv.id, inv.posShiftId);
+                        if (inv.number)
+                            shiftMap.set(inv.number, inv.posShiftId);
+                    }
+                }
+                // Query pos_expenses to map payouts/expenses to their shift ID
+                const [posExpRows] = yield conn.query(`SELECT id, shiftId FROM pos_expenses WHERE id IN (${ph})`, [...chunk]);
+                for (const exp of posExpRows) {
+                    if (exp.shiftId) {
+                        shiftMap.set(exp.id, exp.shiftId);
+                    }
+                }
+                // Query pos_shifts to map shift-related entries directly to their shift ID
+                const [shiftRows] = yield conn.query(`SELECT id FROM pos_shifts WHERE id IN (${ph})`, [...chunk]);
+                for (const s of shiftRows) {
+                    shiftMap.set(s.id, s.id);
                 }
             }
         }
-        // Enrich transactions with bankTransferReference
+        // Enrich transactions with bankTransferReference, documentNumber, and posShiftId
+        const unmatchedRefs = new Set();
         for (const line of lines) {
             line.bankTransferReference = refMap.get(line.referenceId) || null;
+            line.documentNumber = numMap.get(line.referenceId) || line.referenceId || null;
+            line.posShiftId = shiftMap.get(line.referenceId) || null;
+            if (line.referenceId && !line.bankTransferReference && !numMap.has(line.referenceId)) {
+                unmatchedRefs.add(line.referenceId);
+            }
+        }
+        if (unmatchedRefs.size > 0) {
+            console.warn(`[getAccountsLedger] Unmatched referenceIds for document mapping:`, Array.from(unmatchedRefs));
         }
         res.json({
             openingBalance: totalOpeningBalance,
@@ -893,15 +1024,27 @@ const getAccountBalances = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const result = accounts.map((acc) => {
             const obRow = obMap.get(acc.id);
             const periodRow = periodMap.get(acc.id);
+            const baseOpening = parseFloat(acc.openingBalance) || 0;
+            const opDebit = obRow ? parseFloat(obRow.debit) : 0;
+            const opCredit = obRow ? parseFloat(obRow.credit) : 0;
+            const debitNormalTypes = ['ASSET', 'EXPENSE'];
+            let isDebitNormal = debitNormalTypes.includes(acc.type);
+            if (acc.subType === 'ACCUMULATED_DEPRECIATION') {
+                isDebitNormal = false;
+            }
+            const openingBalance = isDebitNormal
+                ? baseOpening + opDebit - opCredit
+                : baseOpening + opCredit - opDebit;
             return {
                 id: acc.id,
                 code: acc.code,
                 name: acc.name,
                 type: acc.type,
                 subType: acc.subType || null,
-                baseOpeningBalance: parseFloat(acc.openingBalance) || 0,
-                openingDebit: obRow ? parseFloat(obRow.debit) : 0,
-                openingCredit: obRow ? parseFloat(obRow.credit) : 0,
+                baseOpeningBalance: baseOpening,
+                openingDebit: opDebit,
+                openingCredit: opCredit,
+                openingBalance: Math.round(openingBalance * 100) / 100,
                 movementDebit: periodRow ? parseFloat(periodRow.debit) : 0,
                 movementCredit: periodRow ? parseFloat(periodRow.credit) : 0
             };
@@ -918,14 +1061,21 @@ exports.getAccountBalances = getAccountBalances;
 // ========================================================================
 const getMonthlyProfit = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const { year } = req.query;
+        const { year, branchId, month } = req.query;
         if (!year) {
             return res.status(400).json({ error: 'Year is required' });
         }
         const conn = yield (0, db_1.getConnection)();
-        // Use standard grouping, casting year back to integer for safety.
-        // It aggregates revenue and expense properly using the accounts type.
-        const [rows] = yield conn.query(`
+        const authReq = req;
+        const { branchId: userBranchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(authReq);
+        let effectiveBranchId = null;
+        if (!isPrivileged && userBranchId) {
+            effectiveBranchId = userBranchId;
+        }
+        else if (branchId && branchId !== 'ALL' && branchId !== '') {
+            effectiveBranchId = branchId;
+        }
+        let query = `
             SELECT 
                 MONTH(j.date) as month,
                 SUM(CASE WHEN a.type = 'REVENUE' THEN (jl.credit - jl.debit) ELSE 0 END) as revenue,
@@ -934,12 +1084,24 @@ const getMonthlyProfit = (req, res) => __awaiter(void 0, void 0, void 0, functio
             JOIN journal_lines jl ON j.id = jl.journalId
             JOIN accounts a ON jl.accountId = a.id
             WHERE YEAR(j.date) = ?
+        `;
+        const params = [Number(year)];
+        if (month && month !== 'ALL') {
+            query += ` AND MONTH(j.date) = ?`;
+            params.push(Number(month));
+        }
+        if (effectiveBranchId) {
+            query += ` AND j.branchId = ?`;
+            params.push(effectiveBranchId);
+        }
+        query += `
             GROUP BY MONTH(j.date)
             ORDER BY MONTH(j.date) ASC
-        `, [Number(year)]);
+        `;
+        const [rows] = yield conn.query(query, params);
         conn.release();
         // Fill all 12 months, even if there's no data for some.
-        const monthsData = Array.from({ length: 12 }, (_, i) => ({
+        let monthsData = Array.from({ length: 12 }, (_, i) => ({
             month: i + 1,
             revenue: 0,
             expense: 0,
@@ -957,6 +1119,9 @@ const getMonthlyProfit = (req, res) => __awaiter(void 0, void 0, void 0, functio
                     profit: revenue - expense
                 };
             }
+        }
+        if (month && month !== 'ALL') {
+            monthsData = monthsData.filter(m => m.month === Number(month));
         }
         res.json(monthsData);
     }
@@ -978,6 +1143,7 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
         // 1. Fetch Purchase Invoice Lines (For Discounts and Bonus)
         const [purchaseRows] = yield conn.query(`
             SELECT 
+                i.id as invoiceId,
                 i.partnerId as supplierId,
                 p.name as supplierName,
                 il.productId,
@@ -1002,6 +1168,7 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
         // 2. Fetch Sales Invoice Lines
         const [saleRows] = yield conn.query(`
             SELECT 
+                i.id as invoiceId,
                 i.partnerId as customerId,
                 p.name as customerName,
                 il.productId,
@@ -1044,11 +1211,13 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 bySupplierDisc[supplierId] = { id: supplierId, name: supplierName, purchases: 0, discounts: 0, invoiceCount: 0 };
             bySupplierDisc[supplierId].purchases += lineGross;
             bySupplierDisc[supplierId].discounts += lineDiscounts;
-            // Increment count per unique supplier... simplified by assuming this runs per row. 
-            // Wait, we can't increment invoiceCount cleanly here since it's per line. We'll skip exact invoiceCount or estimate it,
-            // actually, we don't have invoiceId in the SELECT! Let's add it to correctly count invoices.
-            // But we don't really need exact invoice count in the final UI, we can just leave it as 0 or lines processed.
-            bySupplierDisc[supplierId].invoiceCount++; // It will show line count instead, which is fine or we can add invoiceId to query.
+            // Keep track of unique invoices per supplier
+            if (row.invoiceId) {
+                if (!invoiceCountDisc.has(supplierId)) {
+                    invoiceCountDisc.set(supplierId, new Set());
+                }
+                invoiceCountDisc.get(supplierId).add(row.invoiceId);
+            }
             if (!byProductDisc[pid])
                 byProductDisc[pid] = { id: pid, name: row.productName, purchases: 0, discounts: 0, qty: 0 };
             byProductDisc[pid].purchases += lineGross;
@@ -1078,7 +1247,10 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
             }
         }
         const discountSupplierList = Object.values(bySupplierDisc)
-            .map((s) => (Object.assign(Object.assign({}, s), { discountPct: s.purchases > 0 ? (s.discounts / s.purchases) * 100 : 0 })))
+            .map((s) => {
+            var _a;
+            return (Object.assign(Object.assign({}, s), { invoiceCount: ((_a = invoiceCountDisc.get(s.id)) === null || _a === void 0 ? void 0 : _a.size) || 0, discountPct: s.purchases > 0 ? (s.discounts / s.purchases) * 100 : 0 }));
+        })
             .sort((a, b) => b.discounts - a.discounts);
         const discountProductList = Object.values(byProductDisc)
             .map((p) => (Object.assign(Object.assign({}, p), { discountPct: p.purchases > 0 ? (p.discounts / p.purchases) * 100 : 0 })))
@@ -1090,6 +1262,7 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
         let totalExtraProfit = 0;
         let totalNetCost = 0;
         const byCustomer = {};
+        const saleInvoiceCountMap = new Map();
         for (const row of saleRows) {
             const customerId = row.customerId;
             const customerName = row.customerName || 'غير معروف';
@@ -1105,6 +1278,9 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 const discountPct = purchaseData.discountTotal / purchaseData.grossTotal;
                 netUnitCost = rawCost * (1 - discountPct);
             }
+            else if (!purchaseData) {
+                console.warn(`[getProfitAnalysis] Product ${pid} (${row.productName}) has no purchase data to determine discount-adjusted cost. Using raw cost: ${rawCost}`);
+            }
             const lineNetCost = netUnitCost * qty;
             const lineProfit = lineTotal - lineCost;
             const netProfit = lineTotal - lineNetCost;
@@ -1118,11 +1294,20 @@ const getProfitAnalysis = (req, res) => __awaiter(void 0, void 0, void 0, functi
             byCustomer[customerId].netCostTotal += lineNetCost;
             byCustomer[customerId].extraProfit += lineProfit;
             byCustomer[customerId].netProfit += netProfit;
-            byCustomer[customerId].invoiceCount++; // Treating lines as count to avoid excessive query data, or just rough logic
+            // Keep track of unique invoices per customer
+            if (row.invoiceId) {
+                if (!saleInvoiceCountMap.has(customerId)) {
+                    saleInvoiceCountMap.set(customerId, new Set());
+                }
+                saleInvoiceCountMap.get(customerId).add(row.invoiceId);
+            }
         }
         const totalNetProfit = totalSales - totalNetCost;
         const customerList = Object.values(byCustomer)
-            .map((c) => (Object.assign(Object.assign({}, c), { profitPct: c.sales > 0 ? (c.netProfit / c.sales) * 100 : 0 })))
+            .map((c) => {
+            var _a;
+            return (Object.assign(Object.assign({}, c), { invoiceCount: ((_a = saleInvoiceCountMap.get(c.id)) === null || _a === void 0 ? void 0 : _a.size) || 0, profitPct: c.sales > 0 ? (c.netProfit / c.sales) * 100 : 0 }));
+        })
             .sort((a, b) => b.netProfit - a.netProfit);
         res.json({
             discountAnalysis: {

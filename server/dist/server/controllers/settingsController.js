@@ -59,6 +59,36 @@ const errorHandler_1 = require("../utils/errorHandler");
 const eventBus_1 = require("../utils/eventBus");
 const aiChatController_1 = require("./aiChatController");
 /**
+ * Helper: Parse system config JSON column safely, supporting both standard
+ * flat encoding and legacy double-encoded formats.
+ */
+const parseConfig = (configVal) => {
+    let parsed = {};
+    if (!configVal)
+        return parsed;
+    if (typeof configVal === 'string') {
+        try {
+            parsed = JSON.parse(configVal);
+        }
+        catch (e) {
+            return parsed;
+        }
+    }
+    else if (typeof configVal === 'object') {
+        parsed = configVal;
+    }
+    // Support double-encoded legacy configuration format
+    if (parsed && parsed.config && typeof parsed.config === 'string') {
+        try {
+            const nested = JSON.parse(parsed.config);
+            parsed = Object.assign(Object.assign({}, parsed), nested);
+            delete parsed.config;
+        }
+        catch (e) { }
+    }
+    return parsed;
+};
+/**
  * Public endpoint — no authentication required.
  * Returns only the branding fields needed for the login screen.
  */
@@ -67,16 +97,7 @@ const getPublicBranding = (_req, res) => __awaiter(void 0, void 0, void 0, funct
         const [rows] = yield db_1.pool.query('SELECT companyName, config FROM system_config LIMIT 1');
         if (rows.length > 0) {
             const row = rows[0];
-            let additionalConfig = {};
-            if (row.config && typeof row.config === 'string') {
-                try {
-                    additionalConfig = JSON.parse(row.config);
-                }
-                catch (e) { /* ignore */ }
-            }
-            else if (row.config && typeof row.config === 'object') {
-                additionalConfig = row.config;
-            }
+            const additionalConfig = parseConfig(row.config);
             console.log('🎨 Public branding - appName:', additionalConfig.appName || '(empty)', ', loginTextColor:', additionalConfig.loginTextColor || '(empty)', ', loginAccentColor:', additionalConfig.loginAccentColor || '(empty)');
             res.json({
                 appName: additionalConfig.appName || '',
@@ -105,19 +126,7 @@ const getSystemConfig = (req, res) => __awaiter(void 0, void 0, void 0, function
         const [rows] = yield db_1.pool.query('SELECT * FROM system_config LIMIT 1');
         if (rows.length > 0) {
             const row = rows[0];
-            // Parse JSON config field if it exists
-            let additionalConfig = {};
-            if (row.config && typeof row.config === 'string') {
-                try {
-                    additionalConfig = JSON.parse(row.config);
-                }
-                catch (e) {
-                    console.error("Error parsing config JSON", e);
-                }
-            }
-            else if (row.config && typeof row.config === 'object') {
-                additionalConfig = row.config;
-            }
+            const additionalConfig = parseConfig(row.config);
             // Merge flat columns with parsed config
             const fullConfig = Object.assign(Object.assign({}, additionalConfig), { companyName: row.companyName, companyAddress: row.companyAddress, companyPhone: row.companyPhone, companyEmail: row.companyEmail, taxId: row.taxId, commercialRegister: row.commercialRegister, currency: row.currency, vatRate: row.vatRate, 
                 // Explicitly exclude the raw 'config' field to avoid confusion/duplication
@@ -160,8 +169,18 @@ exports.getSystemConfig = getSystemConfig;
 const updateSystemConfig = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const data = req.body;
     try {
+        // Unpack nested config if sent by frontend
+        let unpackedData = Object.assign({}, data);
+        if (unpackedData.config && typeof unpackedData.config === 'string') {
+            try {
+                const parsedConfig = JSON.parse(unpackedData.config);
+                unpackedData = Object.assign(Object.assign({}, unpackedData), parsedConfig);
+                delete unpackedData.config;
+            }
+            catch (e) { }
+        }
         // 1. Extract known columns
-        const { companyName, companyAddress, companyPhone, companyEmail, taxId, commercialRegister, currency, vatRate } = data, rest = __rest(data, ["companyName", "companyAddress", "companyPhone", "companyEmail", "taxId", "commercialRegister", "currency", "vatRate"]) // Everything else goes into the 'config' JSON column
+        const { companyName, companyAddress, companyPhone, companyEmail, taxId, commercialRegister, currency, vatRate } = unpackedData, rest = __rest(unpackedData, ["companyName", "companyAddress", "companyPhone", "companyEmail", "taxId", "commercialRegister", "currency", "vatRate"]) // Everything else goes into the 'config' JSON column
         ;
         // 2. Prepare JSON config
         const jsonConfig = JSON.stringify(rest);
@@ -192,16 +211,7 @@ const updateSystemConfig = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const [verifyRows] = yield db_1.pool.query('SELECT companyName, config FROM system_config LIMIT 1');
         if (verifyRows.length > 0) {
             const verifyRow = verifyRows[0];
-            let verifyConfig = {};
-            if (verifyRow.config && typeof verifyRow.config === 'string') {
-                try {
-                    verifyConfig = JSON.parse(verifyRow.config);
-                }
-                catch (e) { }
-            }
-            else if (verifyRow.config && typeof verifyRow.config === 'object') {
-                verifyConfig = verifyRow.config;
-            }
+            const verifyConfig = parseConfig(verifyRow.config);
             console.log('✅ [Settings Verify] DB confirms - appName:', verifyConfig.appName || '(empty)', ', appLogoUrl:', verifyConfig.appLogoUrl ? `[${verifyConfig.appLogoUrl.length} chars]` : '(empty)', ', logo:', verifyConfig.logo ? `[${verifyConfig.logo.length} chars]` : '(empty)');
             // Return the verified data from DB (not the in-memory data)
             const fullConfig = Object.assign(Object.assign({}, verifyConfig), { companyName: verifyRow.companyName || companyName, companyAddress,
@@ -258,16 +268,7 @@ const validateLicense = (req, res) => __awaiter(void 0, void 0, void 0, function
         const [rows] = yield db_1.pool.query('SELECT * FROM system_config LIMIT 1');
         if (rows.length > 0) {
             const row = rows[0];
-            let additionalConfig = {};
-            if (row.config && typeof row.config === 'string') {
-                try {
-                    additionalConfig = JSON.parse(row.config);
-                }
-                catch (e) { }
-            }
-            else if (row.config && typeof row.config === 'object') {
-                additionalConfig = row.config;
-            }
+            const additionalConfig = parseConfig(row.config);
             additionalConfig.licenseKey = licenseKey;
             additionalConfig.licenseExpiryDate = result.expiry;
             additionalConfig.licenseClient = result.client;

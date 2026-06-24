@@ -29,7 +29,7 @@ exports.resolveBranchIdForWrite = resolveBranchIdForWrite;
 exports.getBranchWarehouseIds = getBranchWarehouseIds;
 exports.appendWarehouseBranchFilter = appendWarehouseBranchFilter;
 exports.resolveBranchCashAccount = resolveBranchCashAccount;
-const PRIVILEGED_ROLES = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN', 'MANAGER', 'GENERAL_MANAGER'];
+const PRIVILEGED_ROLES = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN', 'GENERAL_MANAGER', 'MANAGER', 'ACCOUNTANT'];
 /**
  * Resolves the branch scope from the request.
  * Returns the user's branchId and whether they are privileged.
@@ -67,8 +67,9 @@ function appendBranchFilter(conditions, params, req, alias) {
  */
 function resolveBranchIdForWrite(req, explicitBranchId) {
     var _a;
-    if (explicitBranchId)
-        return explicitBranchId;
+    if (explicitBranchId !== undefined) {
+        return (explicitBranchId === '' || explicitBranchId === 'null') ? null : explicitBranchId;
+    }
     return ((_a = req.branchContext) === null || _a === void 0 ? void 0 : _a.branchId) || null;
 }
 /**
@@ -126,11 +127,11 @@ function appendWarehouseBranchFilter(conditions_1, params_1, conn_1, req_1) {
  */
 function resolveBranchCashAccount(conn, req) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a, _b;
-        const defaultBankId = (_a = req.branchContext) === null || _a === void 0 ? void 0 : _a.defaultBankId;
-        if (defaultBankId) {
-            // Branch has a default treasury — resolve its linked GL account
-            const [bankRows] = yield conn.query('SELECT accountId FROM banks WHERE id = ? LIMIT 1', [defaultBankId]);
+        var _a, _b, _c, _d;
+        // Priority 1: User's explicitly assigned default treasury
+        const defaultTreasuryId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.defaultTreasuryId;
+        if (defaultTreasuryId) {
+            const [bankRows] = yield conn.query('SELECT accountId FROM banks WHERE id = ? LIMIT 1', [defaultTreasuryId]);
             const accountId = (_b = bankRows[0]) === null || _b === void 0 ? void 0 : _b.accountId;
             if (accountId) {
                 const [accRows] = yield conn.query('SELECT id, name FROM accounts WHERE id = ? LIMIT 1', [accountId]);
@@ -138,7 +139,23 @@ function resolveBranchCashAccount(conn, req) {
                     return accRows[0];
             }
         }
-        // Fallback: legacy global resolution (no branch configured)
+        // Priority 2: Branch's default treasury
+        const defaultBankId = (_c = req.branchContext) === null || _c === void 0 ? void 0 : _c.defaultBankId;
+        if (defaultBankId) {
+            // Branch has a default treasury — resolve its linked GL account
+            const [bankRows] = yield conn.query('SELECT accountId FROM banks WHERE id = ? LIMIT 1', [defaultBankId]);
+            const accountId = (_d = bankRows[0]) === null || _d === void 0 ? void 0 : _d.accountId;
+            if (accountId) {
+                const [accRows] = yield conn.query('SELECT id, name FROM accounts WHERE id = ? LIMIT 1', [accountId]);
+                if (accRows[0])
+                    return accRows[0];
+            }
+        }
+        // Fallback: try treasury-type bank first (handles drawers with 102xx codes)
+        const [treasuryRows] = yield conn.query(`SELECT a.id, a.name FROM accounts a JOIN banks b ON a.id = b.accountId WHERE b.bankType = 'TREASURY' LIMIT 1`);
+        if (treasuryRows[0])
+            return treasuryRows[0];
+        // Then legacy global resolution by code prefix
         const [fallbackRows] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE '101%' LIMIT 1`);
         if (fallbackRows[0])
             return fallbackRows[0];

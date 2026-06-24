@@ -27,8 +27,11 @@ exports.deleteMapping = deleteMapping;
 exports.syncAttendanceLogs = syncAttendanceLogs;
 exports.getSyncHistory = getSyncHistory;
 exports.suggestMappings = suggestMappings;
+exports.getOverviewStats = getOverviewStats;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
+const zktecoAdapter_1 = require("./zktecoAdapter");
+const attendanceHelper_1 = require("./attendanceHelper");
 // ── NOTE: Schema tables are created in server/db.ts initDB() (schema v62+)
 // No runtime schema creation — tables exist at startup.
 // ── Device Management ──────────────────────────────────────────────────
@@ -84,16 +87,15 @@ function testDeviceConnection(deviceId) {
         const device = yield getDevice(deviceId);
         if (!device)
             return { isConnected: false, error: 'Device not found' };
+        let zk;
         try {
-            const ZKLib = yield loadZKLib();
-            const zk = new ZKLib(device.ip, device.port, 10000, 4000);
-            yield zk.createSocket();
+            zk = yield (0, zktecoAdapter_1.getZKDeviceAdapter)(device.ip, device.port);
+            yield zk.connect();
             const info = yield zk.getInfo();
             // Update serial/model from device info
             if (info === null || info === void 0 ? void 0 : info.serialNumber) {
                 yield db_1.pool.query('UPDATE fingerprint_devices SET serialNumber = ?, model = ? WHERE id = ?', [info.serialNumber, info.platform || device.model, deviceId]);
             }
-            yield zk.disconnect();
             return {
                 isConnected: true,
                 serialNumber: info === null || info === void 0 ? void 0 : info.serialNumber,
@@ -108,6 +110,11 @@ function testDeviceConnection(deviceId) {
                 error: error.message || 'Connection failed',
             };
         }
+        finally {
+            if (zk) {
+                yield zk.disconnect().catch(() => { });
+            }
+        }
     });
 }
 /**
@@ -119,10 +126,10 @@ function getDeviceUsers(deviceId) {
         const device = yield getDevice(deviceId);
         if (!device)
             throw new Error('Device not found');
-        const ZKLib = yield loadZKLib();
-        const zk = new ZKLib(device.ip, device.port, 10000, 4000);
+        let zk;
         try {
-            yield zk.createSocket();
+            zk = yield (0, zktecoAdapter_1.getZKDeviceAdapter)(device.ip, device.port);
+            yield zk.connect();
             const result = yield zk.getUsers();
             return ((result === null || result === void 0 ? void 0 : result.data) || []).map((u) => ({
                 uid: u.uid,
@@ -136,7 +143,9 @@ function getDeviceUsers(deviceId) {
             throw new Error(`Failed to fetch users from ${device.name}: ${error.message}`);
         }
         finally {
-            yield zk.disconnect().catch(() => { });
+            if (zk) {
+                yield zk.disconnect().catch(() => { });
+            }
         }
     });
 }
@@ -256,15 +265,14 @@ function syncAttendanceLogs(deviceId, options) {
             for (const m of mappingRows) {
                 mappingLookup.set(String(m.deviceUserId), m.employeeId);
                 const rawSchedule = m.scheduledCheckIn || DEFAULT_SCHEDULED_START;
-                scheduleLookup.set(m.employeeId, padTime(String(rawSchedule).slice(0, 5)));
+                scheduleLookup.set(m.employeeId, (0, attendanceHelper_1.padTime)(String(rawSchedule).slice(0, 5)));
             }
             if (mappingLookup.size === 0) {
                 throw new Error('No employee mappings configured for this device');
             }
             // ── Step 2: Pull logs from device ──────────────────────────────
-            const ZKLib = yield loadZKLib();
-            zk = new ZKLib(device.ip, device.port, 10000, 4000);
-            yield zk.createSocket();
+            zk = yield (0, zktecoAdapter_1.getZKDeviceAdapter)(device.ip, device.port);
+            yield zk.connect();
             const rawLogs = yield zk.getAttendances();
             const logs = ((rawLogs === null || rawLogs === void 0 ? void 0 : rawLogs.data) || []).map((l) => ({
                 id: l.id,
@@ -339,13 +347,7 @@ function syncAttendanceLogs(deviceId, options) {
                 const empDays = grouped.get(empId);
                 if (!empDays.has(dateStr))
                     empDays.set(dateStr, []);
-                empDays.get(dateStr).push(padTime(p.punchHHMM));
-            }
-            // ── Step 6: Identify locked payroll dates ──────────────────────
-            const [lockedCycles] = yield db_1.pool.query(`SELECT month, year FROM payroll_cycles WHERE status IN ('APPROVED', 'PAID')`);
-            const lockedMonths = new Set();
-            for (const c of lockedCycles) {
-                lockedMonths.add(`${c.year}-${String(c.month).padStart(2, '0')}`);
+                empDays.get(dateStr).push((0, attendanceHelper_1.padTime)(p.punchHHMM));
             }
             // ── Step 7: Write attendance records ───────────────────────────
             const writeConn = yield (0, db_1.getConnection)();
@@ -354,45 +356,32 @@ function syncAttendanceLogs(deviceId, options) {
                 for (const [employeeId, days] of grouped) {
                     const scheduledStart = scheduleLookup.get(employeeId) || DEFAULT_SCHEDULED_START;
                     for (const [date, times] of days) {
-                        // Skip dates in locked payroll periods
-                        if (lockedMonths.has(date.slice(0, 7))) {
-                            result.skippedLocked++;
-                            continue;
-                        }
                         const sorted = times.sort();
                         const checkIn = sorted[0];
-                        const checkOut = sorted.length > 1 ? sorted[sorted.length - 1] : '';
-                        // Late calculation that handles night shifts (e.g. scheduled 22:00):
-                        // A punch at 22:15 is 15 min late. A punch at 06:00 the next day
-                        // is NOT late — it's the checkout, not a tardy check-in.
-                        // We use a 12-hour forward window: anything within 0-720 min
-                        // after scheduled start counts as "late arrival" territory.
-                        const checkInMin = timeToMinutes(checkIn);
-                        const scheduledMin = timeToMinutes(scheduledStart);
-                        const MINUTES_IN_DAY = 1440;
-                        const LATE_WINDOW_MINUTES = 720; // 12 hours — max plausible lateness
-                        const diff = (checkInMin - scheduledMin + MINUTES_IN_DAY) % MINUTES_IN_DAY;
-                        const isLate = diff > 0 && diff <= LATE_WINDOW_MINUTES;
-                        const status = isLate ? 'LATE' : 'PRESENT';
-                        const lateMinutes = isLate ? diff : 0;
-                        const id = (0, crypto_1.randomUUID)();
-                        const [upsertResult] = yield writeConn.query(`INSERT INTO attendance_records (
-                            id, employeeId, date, checkIn, checkOut, status,
-                            isOvertime, overtimeHours, lateMinutes,
-                            scheduledCheckIn, notes, source
-                        ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?, ?, ?, 'FINGERPRINT')
-                        ON DUPLICATE KEY UPDATE
-                            checkIn = VALUES(checkIn),
-                            checkOut = VALUES(checkOut),
-                            status = VALUES(status),
-                            lateMinutes = VALUES(lateMinutes),
-                            scheduledCheckIn = VALUES(scheduledCheckIn),
-                            notes = VALUES(notes),
-                            source = 'FINGERPRINT'`, [id, employeeId, date, checkIn, checkOut, status, lateMinutes, scheduledStart, 'بصمة آلية']);
-                        if (upsertResult.affectedRows === 1)
-                            result.newRecords++;
-                        else if (upsertResult.affectedRows === 2)
-                            result.updatedRecords++;
+                        const checkOut = sorted.length > 1 ? sorted[sorted.length - 1] : undefined;
+                        const upsertRes = yield (0, attendanceHelper_1.upsertAttendanceRecord)({
+                            employeeId,
+                            dateStr: date,
+                            checkIn,
+                            checkOut,
+                            notes: 'بصمة آلية',
+                            source: 'FINGERPRINT',
+                            scheduledCheckIn: scheduledStart
+                        }, writeConn);
+                        if (upsertRes.status === 'LOCKED') {
+                            result.skippedLocked++;
+                        }
+                        else if (upsertRes.status === 'SUCCESS') {
+                            if (upsertRes.isNew) {
+                                result.newRecords++;
+                            }
+                            else {
+                                result.updatedRecords++;
+                            }
+                        }
+                        else {
+                            result.errors.push(`Failed to sync date ${date} for employee ${employeeId}`);
+                        }
                     }
                 }
                 yield writeConn.commit();
@@ -473,24 +462,22 @@ function suggestMappings(deviceId, deviceUsers) {
         });
     });
 }
+function getOverviewStats() {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b, _c, _d, _e;
+        const [deviceCounts] = yield db_1.pool.query(`SELECT COUNT(*) as total, SUM(CASE WHEN isActive = 1 THEN 1 ELSE 0 END) as active FROM fingerprint_devices`);
+        const [unmapped] = yield db_1.pool.query(`SELECT COUNT(DISTINCT deviceUserId) as cnt FROM fingerprint_raw_logs WHERE employeeId IS NULL`);
+        const [syncStats] = yield db_1.pool.query(`SELECT SUM(skippedLocked) as locked, SUM(totalLogs) as logs FROM fingerprint_sync_log`);
+        return {
+            totalDevices: ((_a = deviceCounts[0]) === null || _a === void 0 ? void 0 : _a.total) || 0,
+            activeDevices: ((_b = deviceCounts[0]) === null || _b === void 0 ? void 0 : _b.active) || 0,
+            unmappedUsersCount: ((_c = unmapped[0]) === null || _c === void 0 ? void 0 : _c.cnt) || 0,
+            skippedLockedCount: Number(((_d = syncStats[0]) === null || _d === void 0 ? void 0 : _d.locked) || 0),
+            totalLogsCount: Number(((_e = syncStats[0]) === null || _e === void 0 ? void 0 : _e.logs) || 0),
+        };
+    });
+}
 // ── Helpers ────────────────────────────────────────────────────────────
-/**
- * Ensure time string is always in HH:MM format (zero-padded).
- * Prevents string comparison bugs: "9:30" → "09:30"
- */
-function padTime(time) {
-    if (!time)
-        return '00:00';
-    const parts = time.split(':');
-    const h = (parts[0] || '0').padStart(2, '0');
-    const m = (parts[1] || '0').padStart(2, '0');
-    return `${h}:${m}`;
-}
-/** Convert "HH:MM" to total minutes for arithmetic. */
-function timeToMinutes(time) {
-    const [h, m] = time.split(':').map(Number);
-    return (h || 0) * 60 + (m || 0);
-}
 function normalizeName(name) {
     return name
         .trim()
@@ -514,21 +501,4 @@ function calculateNameSimilarity(a, b) {
     }
     const union = tokensA.size + tokensB.size - intersection;
     return union > 0 ? intersection / union : 0;
-}
-/**
- * Dynamic require of node-zklib.
- * Throws a clear error if not installed.
- * Uses require() to avoid TS compile-time module resolution failures.
- */
-function loadZKLib() {
-    return __awaiter(this, void 0, void 0, function* () {
-        try {
-            // eslint-disable-next-line @typescript-eslint/no-var-requires
-            return require('node-zklib');
-        }
-        catch (_a) {
-            throw new Error('node-zklib is not installed. Run: cd server && npm install node-zklib\n' +
-                'This package is required for fingerprint device communication.');
-        }
-    });
 }

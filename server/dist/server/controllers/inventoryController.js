@@ -9,7 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getStockValuation = exports.getStagnantItemsReport = exports.getVariablePricingReport = exports.getItemProfitsReport = exports.getSupplierProducts = exports.getProductInquiry = exports.getInventoryFlowReport = exports.recalculateStock = exports.getRecalculateStatus = exports.deleteStockTakingSession = exports.updateStockTakingSession = exports.createStockTakingSession = exports.getStockTakingSessions = void 0;
+exports.getSupplierInventoryPaymentsReport = exports.getStockValuation = exports.getStagnantItemsReport = exports.getVariablePricingReport = exports.getItemProfitsReport = exports.getSupplierProducts = exports.getProductInquiry = exports.getInventoryFlowReport = exports.recalculateStock = exports.getRecalculateStatus = exports.deleteStockTakingSession = exports.updateStockTakingSession = exports.createStockTakingSession = exports.getStockTakingSessions = void 0;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -66,7 +66,7 @@ const createStockTakingSession = (req, res) => __awaiter(void 0, void 0, void 0,
     try {
         yield conn.beginTransaction();
         const sessionId = session.id || (0, crypto_1.randomUUID)();
-        yield conn.query('INSERT INTO stock_taking_sessions (id, date, warehouseId, status) VALUES (?, ?, ?, ?)', [sessionId, toMySQLDate(session.date), session.warehouseId, session.status]);
+        yield conn.query('INSERT INTO stock_taking_sessions (id, date, warehouseId, status, categoryId) VALUES (?, ?, ?, ?, ?)', [sessionId, toMySQLDate(session.date), session.warehouseId, session.status, session.categoryId || null]);
         if (session.items && session.items.length > 0) {
             // PERF: Batch INSERT (1 query instead of N)
             const itemValues = session.items.map((item) => [
@@ -94,7 +94,7 @@ const updateStockTakingSession = (req, res) => __awaiter(void 0, void 0, void 0,
     const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        yield conn.query('UPDATE stock_taking_sessions SET date=?, warehouseId=?, status=? WHERE id=?', [toMySQLDate(session.date), session.warehouseId, session.status, id]);
+        yield conn.query('UPDATE stock_taking_sessions SET date=?, warehouseId=?, status=?, categoryId=? WHERE id=?', [toMySQLDate(session.date), session.warehouseId, session.status, session.categoryId || null, id]);
         // Delete existing items and re-insert (simplest for now)
         yield conn.query('DELETE FROM stock_taking_items WHERE sessionId = ?', [id]);
         if (session.items && session.items.length > 0) {
@@ -281,9 +281,61 @@ function runPhase0_RebuildMovements() {
             if (systemAdjCount > 0) {
                 // PERF: console.log(`   🧹 Wiped ${systemAdjCount} old SYSTEM_ADJUSTMENTS (idempotency reset)`);
             }
-            // 0A: Rebuild from INVOICES
+            // 0-PRE3: Cleanup orphaned invoice movements where the product was swapped.
+            // When an invoice is edited (Product A → Product B), the old movement for Product A
+            // may remain if the sync path or a partial failure left it behind.
+            // This deletes movements that reference an invoice but don't match any current invoice_lines.
+            const [deletedOrphans] = yield conn.query(`
+            DELETE sm FROM stock_movements sm
+            WHERE sm.reference_type IN ('INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE')
+              AND sm.reference_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM invoices i WHERE i.id = sm.reference_id
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM invoice_lines il
+                  WHERE il.invoiceId = sm.reference_id
+                    AND il.productId = sm.product_id
+              )
+        `);
+            const orphanCount = deletedOrphans.affectedRows || 0;
+            if (orphanCount > 0) {
+                console.log(`   🧹 Cleaned up ${orphanCount} orphaned invoice movements (product swaps)`);
+            }
+            // 0-PRE4: Cleanup net-zero movement pairs from sync re-saves.
+            // When syncController re-saves an invoice, it may create +40 and -40 for the same
+            // reference_id+product_id, netting to zero. These are visual noise — delete both.
+            const [netZeroRefs] = yield conn.query(`
+            SELECT reference_id, product_id
+            FROM stock_movements
+            WHERE reference_type IN ('INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE')
+              AND reference_id IS NOT NULL
+            GROUP BY reference_id, product_id
+            HAVING COUNT(*) > 1 AND ABS(SUM(qty_change)) < 0.001
+        `);
+            if (netZeroRefs.length > 0) {
+                for (const ref of netZeroRefs) {
+                    // Keep only the FIRST movement (oldest), delete the rest that net to zero
+                    const [rows] = yield conn.query(`SELECT id FROM stock_movements 
+                     WHERE reference_id = ? AND product_id = ? 
+                     ORDER BY id ASC`, [ref.reference_id, ref.product_id]);
+                    const ids = rows.map((r) => r.id);
+                    if (ids.length > 1) {
+                        // Delete ALL of them — they net to zero, so none should exist
+                        // The rebuild step below will recreate the correct single movement
+                        yield conn.query('DELETE FROM stock_movements WHERE id IN (?)', [ids]);
+                    }
+                }
+                console.log(`   🧹 Cleaned up ${netZeroRefs.length} net-zero movement groups`);
+            }
             // FIX: INNER JOIN products to skip orphaned product references (deleted products)
             // Without this, the FK constraint on stock_movements.product_id → products.id fails
+            // FIX2: Skip invoice_lines where the invoice was EDITED to swap products.
+            // When updateInvoice swaps Product A → Product B, it deletes old movements and creates
+            // new ones for Product B. Without the coverage check below, Phase 0 would see that
+            // Product A has no movement and "rebuild" a phantom +40, duplicating the real +40 on Product B.
+            // The coverage check: if the invoice already has movements covering ALL its current lines,
+            // then any "missing" combo is a ghost from a prior edit — skip it.
             const [missingInvoiceMovements] = yield conn.query(`
             SELECT i.id as invoiceId, i.type, i.date, 
                    COALESCE(il.warehouseId, i.warehouseId) as warehouseId,
@@ -306,6 +358,16 @@ function runPhase0_RebuildMovements() {
                     AND sr.status IN ('RESERVED', 'DISPATCHED')
               )
               AND (COALESCE(il.warehouseId, i.warehouseId) IS NOT NULL OR i.date < '2026-02-10')
+              AND (
+                  SELECT COUNT(DISTINCT sm2.product_id)
+                  FROM stock_movements sm2
+                  WHERE sm2.reference_id = i.id
+                    AND sm2.reference_type IN ('INVOICE_SALE', 'INVOICE_PURCHASE', 'RETURN_SALE', 'RETURN_PURCHASE', 'SALE', 'PURCHASE', 'RETURN_IN', 'RETURN_OUT')
+              ) < (
+                  SELECT COUNT(DISTINCT il2.productId)
+                  FROM invoice_lines il2
+                  WHERE il2.invoiceId = i.id
+              )
         `);
             for (const row of missingInvoiceMovements) {
                 const qty = parseFloat(row.quantity) || 0;
@@ -1118,29 +1180,46 @@ exports.getSupplierProducts = getSupplierProducts;
 const getItemProfitsReport = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     let conn = null;
     try {
-        const { startDate, endDate, categoryId } = req.query;
+        const { startDate, endDate, categoryId, productId } = req.query;
         conn = yield (0, db_1.getHeavyConnection)();
-        // Build product query with category filter
-        let productQuery = 'SELECT id, name, sku, categoryId, cost FROM products WHERE 1=1';
+        // Build product query with category and product filters, including active variants
+        let productQuery = `
+            SELECT * FROM (
+                SELECT p.id, p.id AS parentProductId, p.name, p.sku, p.categoryId, p.cost 
+                FROM products p 
+                
+                UNION ALL
+                
+                SELECT pv.id, p.id AS parentProductId, pv.name, COALESCE(pv.sku, p.sku) AS sku, p.categoryId, COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0) AS cost
+                FROM product_variants pv
+                JOIN products p ON pv.productId = p.id
+                WHERE pv.isActive = 1
+            ) AS items WHERE 1=1
+        `;
         const productParams = [];
         if (categoryId && categoryId !== 'ALL') {
             productQuery += ' AND categoryId = ?';
             productParams.push(categoryId);
         }
+        if (productId && productId !== 'ALL') {
+            productQuery += ' AND parentProductId = ?';
+            productParams.push(productId);
+        }
         const [products] = yield conn.query(productQuery, productParams);
         const endDateTime = endDate ? `${endDate} 23:59:59` : null;
-        // Query the invoices using JOIN
+        // Query the invoices using JOIN, grouping by variant/product level
         let invoiceQuery = `
-            SELECT il.productId,
+            SELECT COALESCE(il.variantId, il.productId) as itemId,
                    SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN il.quantity ELSE 0 END) as qtySold,
                    SUM(CASE WHEN i.type = 'RETURN_SALE' THEN il.quantity ELSE 0 END) as qtyReturned,
                    SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN coalesce(il.total, 0) ELSE 0 END) as revenue,
                    SUM(CASE WHEN i.type = 'RETURN_SALE' THEN coalesce(il.total, 0) ELSE 0 END) as returns,
-                   SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN (il.quantity * coalesce(il.cost, p.cost, 0)) ELSE 0 END) as costOfSales,
-                   SUM(CASE WHEN i.type = 'RETURN_SALE' THEN (il.quantity * coalesce(il.cost, p.cost, 0)) ELSE 0 END) as costOfReturns
+                   SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN (il.quantity * coalesce(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE 0 END) as costOfSales,
+                   SUM(CASE WHEN i.type = 'RETURN_SALE' THEN (il.quantity * coalesce(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE 0 END) as costOfReturns
             FROM invoice_lines il
             JOIN invoices i ON il.invoiceId = i.id
             LEFT JOIN products p ON il.productId = p.id
+            LEFT JOIN product_variants pv ON il.variantId = pv.id
             WHERE i.status = 'POSTED' AND i.type IN ('INVOICE_SALE', 'RETURN_SALE')
         `;
         const invoiceParams = [];
@@ -1148,10 +1227,14 @@ const getItemProfitsReport = (req, res) => __awaiter(void 0, void 0, void 0, fun
             invoiceQuery += ' AND i.date >= ? AND i.date <= ?';
             invoiceParams.push(startDate, endDateTime);
         }
-        invoiceQuery += ' GROUP BY il.productId';
+        if (productId && productId !== 'ALL') {
+            invoiceQuery += ' AND il.productId = ?';
+            invoiceParams.push(productId);
+        }
+        invoiceQuery += ' GROUP BY COALESCE(il.variantId, il.productId)';
         const [invoiceStats] = yield conn.query(invoiceQuery, invoiceParams);
         // Map it all together
-        const statsMap = new Map(invoiceStats.map(x => [x.productId, x]));
+        const statsMap = new Map(invoiceStats.map(x => [x.itemId, x]));
         const report = products.map(p => {
             const stat = statsMap.get(p.id) || { qtySold: 0, qtyReturned: 0, revenue: 0, returns: 0, costOfSales: 0, costOfReturns: 0 };
             const netQty = Number(stat.qtySold) - Number(stat.qtyReturned);
@@ -1205,11 +1288,12 @@ const getVariablePricingReport = (req, res) => __awaiter(void 0, void 0, void 0,
                    il.price, 
                    SUM(il.quantity) as qty, 
                    SUM(il.total) as revenue, 
-                   SUM(il.quantity * COALESCE(il.cost, p.cost, 0)) as cost,
+                   SUM(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) as cost,
                    GROUP_CONCAT(DISTINCT i.partnerName SEPARATOR '||') as customers
             FROM invoice_lines il
             JOIN invoices i ON il.invoiceId = i.id
             JOIN products p ON il.productId = p.id
+            LEFT JOIN product_variants pv ON il.variantId = pv.id
             WHERE i.status = 'POSTED' AND i.type = 'INVOICE_SALE'
         `;
         const params = [];
@@ -1327,87 +1411,208 @@ const getStockValuation = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const sortBy = req.query.sortBy || 'totalCost';
         const sortDir = req.query.sortDir || 'desc';
         const offset = (page - 1) * limit;
-        // Build stock source — either warehouse-specific or global
+        // Build stock source — either warehouse-specific or global, including active variants aggregated under parent
         let stockExpr;
-        const params = [];
+        let itemsFromClause;
+        const subqueryParams = [];
         if (warehouseId && warehouseId !== 'ALL') {
-            stockExpr = 'COALESCE(ps.stock, 0)';
+            stockExpr = 'COALESCE(i.warehouseStock, 0)';
+            itemsFromClause = `
+                (
+                    -- 1. Standard products (no active variants)
+                    SELECT 
+                        p.id AS id,
+                        p.name AS name,
+                        p.sku AS sku,
+                        p.barcode AS barcode,
+                        COALESCE(p.cost, 0) AS cost,
+                        COALESCE(p.price, 0) AS price,
+                        p.categoryId AS categoryId,
+                        COALESCE(ps.stock, 0) AS warehouseStock,
+                        0 AS globalStock,
+                        0 AS embeddedVariantCount,
+                        p.isActive AS isActive
+                    FROM products p
+                    LEFT JOIN product_stocks ps ON p.id = ps.productId AND ps.warehouseId = ?
+                    WHERE p.isActive = 1 
+                      AND NOT EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1)
+
+                    UNION ALL
+
+                    -- 2. Parent products with active variants aggregated
+                    SELECT 
+                        p.id AS id,
+                        p.name AS name,
+                        p.sku AS sku,
+                        p.barcode AS barcode,
+                        -- Weighted average cost from active variants
+                        COALESCE(
+                            CASE WHEN SUM(COALESCE(pvs.stock, 0)) > 0 
+                                 THEN SUM(COALESCE(pvs.stock, 0) * COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0)) / SUM(COALESCE(pvs.stock, 0))
+                                 ELSE AVG(COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0))
+                            END, 0
+                        ) AS cost,
+                        -- Weighted average price from active variants
+                        COALESCE(
+                            CASE WHEN SUM(COALESCE(pvs.stock, 0)) > 0 
+                                 THEN SUM(COALESCE(pvs.stock, 0) * COALESCE(NULLIF(pv.sellingPrice, 0), p.price, 0)) / SUM(COALESCE(pvs.stock, 0))
+                                 ELSE AVG(COALESCE(NULLIF(pv.sellingPrice, 0), p.price, 0))
+                            END, 0
+                        ) AS price,
+                        p.categoryId AS categoryId,
+                        SUM(COALESCE(pvs.stock, 0)) AS warehouseStock,
+                        0 AS globalStock,
+                        COUNT(pv.id) AS embeddedVariantCount,
+                        p.isActive AS isActive
+                    FROM products p
+                    JOIN product_variants pv ON pv.productId = p.id AND pv.isActive = 1
+                    LEFT JOIN product_variant_stocks pvs ON pv.id = pvs.variantId AND pvs.warehouseId = ?
+                    WHERE p.isActive = 1
+                    GROUP BY p.id, p.name, p.sku, p.barcode, p.categoryId, p.isActive
+                ) AS i
+            `;
+            subqueryParams.push(warehouseId, warehouseId);
         }
         else {
-            stockExpr = 'p.stock';
+            stockExpr = 'COALESCE(i.globalStock, 0)';
+            itemsFromClause = `
+                (
+                    -- 1. Standard products (no active variants)
+                    SELECT 
+                        p.id AS id,
+                        p.name AS name,
+                        p.sku AS sku,
+                        p.barcode AS barcode,
+                        COALESCE(p.cost, 0) AS cost,
+                        COALESCE(p.price, 0) AS price,
+                        p.categoryId AS categoryId,
+                        NULL AS warehouseStock,
+                        COALESCE(ps.totalStock, 0) AS globalStock,
+                        0 AS embeddedVariantCount,
+                        p.isActive AS isActive
+                    FROM products p
+                    LEFT JOIN (
+                        SELECT productId, SUM(stock) as totalStock 
+                        FROM product_stocks 
+                        GROUP BY productId
+                    ) ps ON p.id = ps.productId
+                    WHERE p.isActive = 1 
+                      AND NOT EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1)
+
+                    UNION ALL
+
+                    -- 2. Parent products with active variants aggregated
+                    SELECT 
+                        p.id AS id,
+                        p.name AS name,
+                        p.sku AS sku,
+                        p.barcode AS barcode,
+                        -- Weighted average cost from active variants
+                        COALESCE(
+                            CASE WHEN SUM(COALESCE(pvs.totalStock, 0)) > 0 
+                                 THEN SUM(COALESCE(pvs.totalStock, 0) * COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0)) / SUM(COALESCE(pvs.totalStock, 0))
+                                 ELSE AVG(COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0))
+                            END, 0
+                        ) AS cost,
+                        -- Weighted average price from active variants
+                        COALESCE(
+                            CASE WHEN SUM(COALESCE(pvs.totalStock, 0)) > 0 
+                                 THEN SUM(COALESCE(pvs.totalStock, 0) * COALESCE(NULLIF(pv.sellingPrice, 0), p.price, 0)) / SUM(COALESCE(pvs.totalStock, 0))
+                                 ELSE AVG(COALESCE(NULLIF(pv.sellingPrice, 0), p.price, 0))
+                            END, 0
+                        ) AS price,
+                        p.categoryId AS categoryId,
+                        NULL AS warehouseStock,
+                        SUM(COALESCE(pvs.totalStock, 0)) AS globalStock,
+                        COUNT(pv.id) AS embeddedVariantCount,
+                        p.isActive AS isActive
+                    FROM products p
+                    JOIN product_variants pv ON pv.productId = p.id AND pv.isActive = 1
+                    LEFT JOIN (
+                        SELECT variantId, SUM(stock) as totalStock 
+                        FROM product_variant_stocks 
+                        GROUP BY variantId
+                    ) pvs ON pv.id = pvs.variantId
+                    WHERE p.isActive = 1
+                    GROUP BY p.id, p.name, p.sku, p.barcode, p.categoryId, p.isActive
+                ) AS i
+            `;
         }
         // Build WHERE conditions
-        const conditions = [];
+        const conditions = ['i.isActive = 1'];
+        const params = [];
         if (categoryId && categoryId !== 'ALL') {
-            conditions.push('p.categoryId = ?');
+            conditions.push('i.categoryId = ?');
             params.push(categoryId);
         }
         if (hideZero) {
             conditions.push(`${stockExpr} != 0`);
         }
         if (search) {
-            conditions.push('(p.name LIKE ? OR p.sku LIKE ? OR p.barcode LIKE ?)');
+            conditions.push('(i.name LIKE ? OR i.sku LIKE ? OR i.barcode LIKE ?)');
             const s = `%${search}%`;
             params.push(s, s, s);
         }
         const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-        // JOIN for warehouse-specific stock
-        let joinClause = '';
-        if (warehouseId && warehouseId !== 'ALL') {
-            joinClause = 'LEFT JOIN product_stocks ps ON p.id = ps.productId AND ps.warehouseId = ?';
-            params.unshift(warehouseId); // prepend for JOIN
-        }
         // Sort mapping
         const sortMap = {
-            name: 'p.name',
+            name: 'i.name',
             stock: stockExpr,
-            cost: 'COALESCE(p.cost, 0)',
-            totalCost: `(${stockExpr} * COALESCE(p.cost, 0))`,
-            price: 'COALESCE(p.price, 0)',
-            totalRetail: `(${stockExpr} * COALESCE(p.price, 0))`,
-            margin: `CASE WHEN COALESCE(p.cost, 0) > 0 THEN ((COALESCE(p.price, 0) - COALESCE(p.cost, 0)) / COALESCE(p.cost, 0) * 100) ELSE 0 END`
+            cost: 'COALESCE(i.cost, 0)',
+            totalCost: `(${stockExpr} * COALESCE(i.cost, 0))`,
+            price: 'COALESCE(i.price, 0)',
+            totalRetail: `(${stockExpr} * COALESCE(i.price, 0))`,
+            margin: `CASE WHEN COALESCE(i.price, 0) > 0 THEN (CASE WHEN COALESCE(i.cost, 0) > 0 THEN ((COALESCE(i.price, 0) - COALESCE(i.cost, 0)) / COALESCE(i.cost, 0) * 100) ELSE 100 END) ELSE -999 END`
         };
         const orderExpr = sortMap[sortBy] || sortMap.totalCost;
         const orderDir = sortDir === 'asc' ? 'ASC' : 'DESC';
+        const orderClause = sortBy === 'margin'
+            ? `CASE WHEN (${orderExpr}) = -999 THEN 1 ELSE 0 END ASC, ${orderExpr} ${orderDir}`
+            : `${orderExpr} ${orderDir}`;
         // 1. Get summary stats (single query, no LIMIT)
-        const countParams = [...params];
+        const countParams = [...subqueryParams, ...params];
         const [summaryRows] = yield db_1.pool.query(`
             SELECT 
                 COUNT(*) as total,
-                SUM(${stockExpr} * COALESCE(p.cost, 0)) as totalAsset,
-                SUM(${stockExpr} * COALESCE(p.price, 0)) as totalRetail,
-                SUM(CASE WHEN COALESCE(p.price, 0) > 0 THEN ${stockExpr} * COALESCE(p.cost, 0) ELSE 0 END) as sellableAsset,
-                SUM(CASE WHEN COALESCE(p.price, 0) > 0 THEN ${stockExpr} * COALESCE(p.price, 0) ELSE 0 END) as sellableRetail,
+                SUM(${stockExpr}) as totalStock,
+                SUM(${stockExpr} * COALESCE(i.cost, 0)) as totalAsset,
+                SUM(${stockExpr} * COALESCE(i.price, 0)) as totalRetail,
+                SUM(CASE WHEN COALESCE(i.price, 0) > 0 THEN ${stockExpr} * COALESCE(i.cost, 0) ELSE 0 END) as sellableAsset,
+                SUM(CASE WHEN COALESCE(i.price, 0) > 0 THEN ${stockExpr} * COALESCE(i.price, 0) ELSE 0 END) as sellableRetail,
                 SUM(CASE WHEN ${stockExpr} < 0 THEN 1 ELSE 0 END) as negativeCount,
-                SUM(CASE WHEN COALESCE(p.price, 0) = 0 AND ${stockExpr} > 0 THEN 1 ELSE 0 END) as noPriceCount
-            FROM products p ${joinClause} ${whereClause}
+                SUM(CASE WHEN COALESCE(i.price, 0) = 0 AND ${stockExpr} > 0 THEN 1 ELSE 0 END) as noPriceCount
+            FROM ${itemsFromClause} ${whereClause}
         `, countParams);
         const summary = summaryRows[0];
         // 2. Get paginated products
-        const dataParams = [...params, limit, offset];
+        const dataParams = [...subqueryParams, ...params, limit, offset];
         const [productRows] = yield db_1.pool.query(`
             SELECT 
-                p.id, p.name, p.sku, p.barcode,
+                i.id, i.name, i.sku, i.barcode,
                 ${stockExpr} as stock,
-                COALESCE(p.cost, 0) as cost,
-                COALESCE(p.price, 0) as price,
-                (${stockExpr} * COALESCE(p.cost, 0)) as totalCost,
-                (${stockExpr} * COALESCE(p.price, 0)) as totalRetail,
-                CASE WHEN COALESCE(p.price, 0) > 0 
-                     THEN (${stockExpr} * COALESCE(p.price, 0)) - (${stockExpr} * COALESCE(p.cost, 0))
+                COALESCE(i.cost, 0) as cost,
+                COALESCE(i.price, 0) as price,
+                (${stockExpr} * COALESCE(i.cost, 0)) as totalCost,
+                (${stockExpr} * COALESCE(i.price, 0)) as totalRetail,
+                CASE WHEN COALESCE(i.price, 0) > 0 
+                     THEN (${stockExpr} * COALESCE(i.price, 0)) - (${stockExpr} * COALESCE(i.cost, 0))
                      ELSE 0 END as profit,
-                CASE WHEN COALESCE(p.cost, 0) > 0 AND COALESCE(p.price, 0) > 0
-                     THEN ((COALESCE(p.price, 0) - COALESCE(p.cost, 0)) / COALESCE(p.cost, 0) * 100)
-                     ELSE 0 END as margin,
-                CASE WHEN COALESCE(p.price, 0) > 0 THEN 1 ELSE 0 END as hasPrice
-            FROM products p ${joinClause} ${whereClause}
-            ORDER BY ${orderExpr} ${orderDir}
+                CASE WHEN COALESCE(i.price, 0) > 0 THEN
+                     CASE WHEN COALESCE(i.cost, 0) > 0 
+                          THEN ((COALESCE(i.price, 0) - COALESCE(i.cost, 0)) / COALESCE(i.cost, 0) * 100)
+                          ELSE 100 END
+                     ELSE -999 END as margin,
+                CASE WHEN COALESCE(i.price, 0) > 0 THEN 1 ELSE 0 END as hasPrice,
+                i.embeddedVariantCount
+            FROM ${itemsFromClause} ${whereClause}
+            ORDER BY ${orderClause}
             LIMIT ? OFFSET ?
         `, dataParams);
         res.json({
             products: productRows,
             summary: {
                 total: Number(summary.total) || 0,
+                totalStock: Number(summary.totalStock) || 0,
                 totalAsset: Math.round((Number(summary.totalAsset) || 0) * 100) / 100,
                 totalRetail: Math.round((Number(summary.totalRetail) || 0) * 100) / 100,
                 sellableAsset: Math.round((Number(summary.sellableAsset) || 0) * 100) / 100,
@@ -1428,3 +1633,181 @@ const getStockValuation = (req, res) => __awaiter(void 0, void 0, void 0, functi
     }
 });
 exports.getStockValuation = getStockValuation;
+const getSupplierInventoryPaymentsReport = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { startDate, endDate } = req.query;
+        let dateFilterInvoices = '';
+        let dateFilterLines = '';
+        let dateFilterCheques = '';
+        const params = [];
+        let formattedStartDate = startDate;
+        let formattedEndDate = endDate;
+        if (startDate && endDate) {
+            formattedStartDate = `${startDate} 00:00:00`;
+            formattedEndDate = `${endDate} 23:59:59`;
+            dateFilterInvoices = 'AND i.date >= ? AND i.date <= ?';
+            dateFilterLines = 'AND i.date >= ? AND i.date <= ?';
+            dateFilterCheques = 'AND c.dueDate >= ? AND c.dueDate <= ?';
+            // We pass the parameters multiple times for each CTE that needs it
+        }
+        let query = `
+            -- Step 1: Map each product to its latest supplier
+            WITH LatestSupplierPerProduct AS (
+                SELECT 
+                    il.productId, 
+                    i.partnerId AS supplierId,
+                    MAX(i.date) as lastPurchaseDate,
+                    ROW_NUMBER() OVER(PARTITION BY il.productId ORDER BY MAX(i.date) DESC) as rn
+                FROM invoice_lines il
+                JOIN invoices i ON il.invoiceId = i.id
+                WHERE i.type = 'INVOICE_PURCHASE' 
+                  AND i.status != 'VOID' 
+                  AND il.productId IS NOT NULL
+                  AND i.partnerId IS NOT NULL
+                GROUP BY il.productId, i.partnerId
+            ),
+            ProductSupplier AS (
+                SELECT productId, supplierId, lastPurchaseDate
+                FROM LatestSupplierPerProduct
+                WHERE rn = 1
+            ),
+            
+            -- Step 2: Purchases and Returns
+            SupplierPurchases AS (
+                SELECT 
+                    i.partnerId as supplierId,
+                    SUM(CASE WHEN i.type = 'INVOICE_PURCHASE' THEN i.total ELSE 0 END) as totalPurchases,
+                    SUM(CASE WHEN i.type = 'RETURN_PURCHASE' THEN i.total ELSE 0 END) as totalReturns
+                FROM invoices i
+                WHERE i.type IN ('INVOICE_PURCHASE', 'RETURN_PURCHASE') AND i.status != 'VOID' ${dateFilterInvoices}
+                GROUP BY i.partnerId
+            ),
+
+            -- Step 3: Payments
+            SupplierPayments AS (
+                SELECT 
+                    i.partnerId as supplierId,
+                    SUM(CASE WHEN i.type = 'PAYMENT' THEN i.total ELSE 0 END) as totalPayments,
+                    SUM(CASE WHEN i.type = 'RECEIPT' THEN i.total ELSE 0 END) as totalRefunds
+                FROM invoices i
+                WHERE i.type IN ('PAYMENT', 'RECEIPT') AND i.status != 'VOID' ${dateFilterInvoices}
+                GROUP BY i.partnerId
+            ),
+
+            -- Step 4: Cheques
+            SupplierCheques AS (
+                SELECT 
+                    c.partnerId as supplierId,
+                    SUM(c.amount) as pendingCheques
+                FROM cheques c
+                WHERE c.type = 'PAYMENT' AND c.status = 'PENDING' ${dateFilterCheques}
+                GROUP BY c.partnerId
+            ),
+
+            -- Step 5: Sales & ROI (Based on products supplied by this supplier)
+            SupplierSales AS (
+                SELECT 
+                    ps.supplierId,
+                    SUM(il.total) as totalRevenue,
+                    SUM(il.quantity * il.cost) as totalCOGS,
+                    SUM(il.total - (il.quantity * il.cost)) as totalProfit,
+                    MAX(i.date) as lastSaleDate
+                FROM invoice_lines il
+                JOIN invoices i ON il.invoiceId = i.id
+                JOIN ProductSupplier ps ON il.productId = ps.productId
+                WHERE i.type = 'INVOICE_SALE' AND i.status != 'VOID' ${dateFilterInvoices}
+                GROUP BY ps.supplierId
+            ),
+
+            -- Step 6: Inventory
+            SupplierInventory AS (
+                SELECT 
+                    ps.supplierId,
+                    p.id as productId,
+                    p.name as productName,
+                    p.stock,
+                    COALESCE(NULLIF(p.avgCost, 0), p.cost, 0) as avgCost,
+                    (p.stock * COALESCE(NULLIF(p.avgCost, 0), p.cost, 0)) as productValue,
+                    ps.lastPurchaseDate,
+                    DATEDIFF(CURRENT_DATE(), ps.lastPurchaseDate) as daysSincePurchase
+                FROM products p
+                JOIN ProductSupplier ps ON p.id = ps.productId
+                WHERE p.stock > 0
+            ),
+            SupplierInventoryTotals AS (
+                SELECT 
+                    supplierId,
+                    SUM(productValue) as totalInventoryValue
+                FROM SupplierInventory
+                GROUP BY supplierId
+            )
+
+            -- Final Select
+            SELECT 
+                part.id AS supplierId,
+                part.name AS supplierName,
+                ROUND(COALESCE(part.balance, 0), 2) AS supplierBalance,
+
+                -- Financials
+                ROUND(COALESCE(pur.totalPurchases, 0), 2) AS totalPurchases,
+                ROUND(COALESCE(pur.totalReturns, 0), 2) AS totalReturns,
+                ROUND(COALESCE(pay.totalPayments, 0), 2) AS totalPayments,
+                ROUND(COALESCE(pay.totalRefunds, 0), 2) AS totalRefunds,
+                ROUND(COALESCE(chq.pendingCheques, 0), 2) AS pendingCheques,
+
+                -- ROI
+                ROUND(COALESCE(sal.totalRevenue, 0), 2) AS totalRevenue,
+                ROUND(COALESCE(sal.totalCOGS, 0), 2) AS totalCOGS,
+                ROUND(COALESCE(sal.totalProfit, 0), 2) AS totalProfit,
+                sal.lastSaleDate,
+
+                -- Inventory
+                ROUND(COALESCE(inv_t.totalInventoryValue, 0), 2) AS totalInventoryValue,
+
+                -- Inventory Detail Mapping
+                inv.productId,
+                inv.productName,
+                ROUND(COALESCE(inv.stock, 0), 2) AS stockRemaining,
+                ROUND(COALESCE(inv.avgCost, 0), 2) AS avgCost,
+                ROUND(COALESCE(inv.productValue, 0), 2) AS productValue,
+                inv.lastPurchaseDate,
+                inv.daysSincePurchase
+
+            FROM partners part
+            LEFT JOIN SupplierPurchases pur ON part.id = pur.supplierId
+            LEFT JOIN SupplierPayments pay ON part.id = pay.supplierId
+            LEFT JOIN SupplierCheques chq ON part.id = chq.supplierId
+            LEFT JOIN SupplierSales sal ON part.id = sal.supplierId
+            LEFT JOIN SupplierInventoryTotals inv_t ON part.id = inv_t.supplierId
+            LEFT JOIN SupplierInventory inv ON part.id = inv.supplierId
+
+            WHERE (part.type = 'SUPPLIER' OR part.isSupplier = 1)
+              AND (
+                  COALESCE(pur.totalPurchases, 0) > 0 OR 
+                  COALESCE(inv_t.totalInventoryValue, 0) > 0 OR
+                  COALESCE(part.balance, 0) != 0 OR
+                  COALESCE(pay.totalPayments, 0) > 0
+              )
+            ORDER BY 
+                part.name, 
+                inv.productValue DESC;
+        `;
+        let queryParams = [];
+        if (startDate && endDate) {
+            // For SupplierPurchases
+            queryParams.push(formattedStartDate, formattedEndDate);
+            // For SupplierPayments
+            queryParams.push(formattedStartDate, formattedEndDate);
+            // For SupplierCheques
+            queryParams.push(formattedStartDate, formattedEndDate);
+            // For SupplierSales
+            queryParams.push(formattedStartDate, formattedEndDate);
+        }
+        const [rows] = yield db_1.pool.query(query, queryParams);
+        res.status(200).json(rows);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'getSupplierInventoryPaymentsReport');
+    }
+});
+exports.getSupplierInventoryPaymentsReport = getSupplierInventoryPaymentsReport;

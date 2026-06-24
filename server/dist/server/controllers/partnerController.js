@@ -30,20 +30,21 @@ function buildInvAggSQL(opts) {
     return `(
         SELECT i.partnerId,
             SUM(CASE
-                WHEN i.type = 'INVOICE_SALE' AND COALESCE(i.paymentMethod, '') != 'CASH' THEN i.total
-                WHEN i.type = 'RETURN_SALE' AND COALESCE(i.paymentMethod, '') != 'CASH' THEN -(i.total)
-                WHEN i.type IN ('RECEIPT', 'DISCOUNT_ALLOWED', 'CHEQUE_DEPOSIT', 'CHEQUE_COLLECT') AND COALESCE(i.voucherCategory, '') != 'supplier' THEN -(i.total)
-                WHEN i.type = 'PAYMENT' AND i.voucherCategory = 'customer' THEN i.total
+                WHEN i.type = 'INVOICE_SALE' AND COALESCE(i.paymentMethod, '') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') NOT IN ('DEFERRED', 'CREDIT')) THEN i.total
+                WHEN i.type = 'RETURN_SALE' AND COALESCE(i.paymentMethod, '') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') NOT IN ('DEFERRED', 'CREDIT')) THEN -(i.total)
+                WHEN i.type IN ('RECEIPT', 'DISCOUNT_ALLOWED', 'CHEQUE_DEPOSIT', 'CHEQUE_COLLECT') AND (COALESCE(p2.isSupplier, 0) = 0 OR COALESCE(i.voucherCategory, '') NOT IN ('supplier', 'supplier_refund')) THEN -(i.total)
+                WHEN i.type = 'PAYMENT' AND (COALESCE(p2.isSupplier, 0) = 0 OR i.voucherCategory IN ('customer', 'labour')) THEN i.total
                 ELSE 0 END) as cImpact,
             SUM(CASE
-                WHEN i.type = 'INVOICE_PURCHASE' AND COALESCE(i.paymentMethod, '') != 'CASH' THEN -(i.total)
-                WHEN i.type = 'RETURN_PURCHASE' AND COALESCE(i.paymentMethod, '') != 'CASH' THEN i.total
-                WHEN i.type IN ('PAYMENT', 'DISCOUNT_EARNED', 'CHEQUE_CASHED') AND COALESCE(i.voucherCategory, '') != 'customer' THEN i.total
-                WHEN i.type = 'RECEIPT' AND i.voucherCategory = 'supplier' THEN -(i.total)
+                WHEN i.type = 'INVOICE_PURCHASE' AND COALESCE(i.paymentMethod, '') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') NOT IN ('DEFERRED', 'CREDIT')) THEN -(i.total)
+                WHEN i.type = 'RETURN_PURCHASE' AND COALESCE(i.paymentMethod, '') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') NOT IN ('DEFERRED', 'CREDIT')) THEN i.total
+                WHEN i.type IN ('PAYMENT', 'DISCOUNT_EARNED', 'CHEQUE_CASHED') AND (COALESCE(p2.isCustomer, 0) = 0 OR COALESCE(i.voucherCategory, '') NOT IN ('customer', 'labour')) THEN i.total
+                WHEN i.type = 'RECEIPT' AND (COALESCE(p2.isCustomer, 0) = 0 OR i.voucherCategory IN ('supplier', 'supplier_refund')) THEN -(i.total)
                 ELSE 0 END) as sImpact,
             SUM(CASE WHEN i.type = 'RECEIPT' THEN -(i.total) ELSE 0 END) as supplierReceiptImpact,
             SUM(CASE WHEN i.type = 'CHEQUE_BOUNCE' THEN i.total ELSE 0 END) as bounceImpact
         FROM invoices i
+        LEFT JOIN partners p2 ON i.partnerId = p2.id
         WHERE i.status IN ('POSTED', 'COMPLETED', 'PARTIAL') ${pf} ${df}
         GROUP BY i.partnerId
     )`;
@@ -153,6 +154,17 @@ const getPartners = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         const isCustomer = req.query.isCustomer;
         const isSupplier = req.query.isSupplier;
         const balanceStatus = req.query.balanceStatus;
+        // Sorting parameters with strict whitelisting to prevent SQL injection
+        const sortBy = req.query.sortBy || 'name';
+        const sortOrder = (req.query.sortOrder || 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
+        const allowedSortCols = {
+            name: 'p.name',
+            code: 'CAST(p.code AS UNSIGNED)',
+            phone: 'p.phone',
+            balance: 'calculatedBalance',
+            limit: 'p.creditLimit'
+        };
+        const sortSql = allowedSortCols[sortBy] || 'p.name';
         // Build WHERE clause
         const conditions = [];
         const params = [];
@@ -289,7 +301,7 @@ const getPartners = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                  LEFT JOIN price_lists pl ON p.priceListId = pl.id
                  ${whereClause} 
                  ${havingClause}
-                 ORDER BY p.name 
+                 ORDER BY ${sortSql} ${sortOrder}, p.id 
                  LIMIT ? OFFSET ?`, [...params, limit, offset]);
         }
         catch (joinErr) {
@@ -302,7 +314,7 @@ const getPartners = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
                      LEFT JOIN salesmen s ON p.salesmanId = s.id
                      ${whereClause} 
                      ${havingClause}
-                     ORDER BY p.name 
+                     ORDER BY ${sortSql} ${sortOrder}, p.id 
                      LIMIT ? OFFSET ?`, [...params, limit, offset]);
             }
             else {
@@ -436,7 +448,7 @@ const createPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
     const conn = yield (0, db_1.getConnection)();
     try {
         yield conn.beginTransaction();
-        const { name, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, ceramicPriceListId, ceramicDiscountListId, gender, dateOfBirth } = req.body;
+        const { name, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, ceramicPriceListId, ceramicDiscountListId, gender, dateOfBirth, request_type } = req.body;
         // Default values for mobile app compatibility
         let { type, isCustomer, isSupplier } = req.body;
         // PERF: console.log('DEBUG CREATE PARTNER - RAW:', { type, isCustomer, isSupplier, body: req.body });
@@ -508,6 +520,64 @@ const createPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         const ceramicPriceListValue = ceramicPriceListId === '' ? null : (ceramicPriceListId || null);
         const ceramicDiscountListValue = ceramicDiscountListId === '' ? null : (ceramicDiscountListId || null);
+        // Generate unique referral code for the customer
+        let referralCode = 'REF-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+        let isUnique = false;
+        let attempts = 0;
+        while (!isUnique && attempts < 10) {
+            const [dupCode] = yield conn.query('SELECT id FROM partners WHERE referral_code = ? LIMIT 1', [referralCode]);
+            if (dupCode.length === 0) {
+                isUnique = true;
+            }
+            else {
+                referralCode = 'REF-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+                attempts++;
+            }
+        }
+        // Referral check
+        let referredById = null;
+        let refereeCouponCode = null;
+        const refCode = req.body.referredByCode || req.body.referral_code_applied;
+        if (refCode && typeof refCode === 'string' && refCode.trim() !== '') {
+            const [referrerRows] = yield conn.query(`SELECT id FROM partners WHERE referral_code = ? LIMIT 1`, [refCode.trim().toUpperCase()]);
+            if (referrerRows.length > 0) {
+                referredById = referrerRows[0].id;
+                if (referredById === id) {
+                    referredById = null; // Cannot refer self
+                }
+            }
+        }
+        if (referredById) {
+            refereeCouponCode = 'REF-10PCT-' + Math.random().toString(36).substring(2, 8).toUpperCase();
+            const promoId = (0, crypto_1.randomUUID)();
+            const promoName = `كوبون خصم الإحالة (10%) للعميل: ${name}`;
+            const promoType = 'PERCENT_ORDER';
+            const promoStatus = 'ACTIVE';
+            const promoTrigger = 'COUPON_CODE';
+            const promoDiscountValue = 10.00;
+            const promoDiscountType = 'PERCENT';
+            const promoMaxUsageTotal = 1;
+            const promoMaxUsagePerCustomer = 1;
+            const promoIsCombinable = 0;
+            const promoPriority = 10;
+            const nowStr = new Date().toISOString().slice(0, 19).replace('T', ' ');
+            const endDateObj = new Date();
+            endDateObj.setDate(endDateObj.getDate() + 30);
+            const endDateStr = endDateObj.toISOString().slice(0, 19).replace('T', ' ');
+            yield conn.query(`INSERT INTO promotions 
+                 (id, name, type, status, \`trigger\`, couponCode, discountValue, discountType,
+                  maxUsageTotal, maxUsagePerCustomer, isCombainable, priority,
+                  startDate, endDate, createdAt, createdBy, maxDiscountAmount)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`, [
+                promoId, promoName, promoType, promoStatus, promoTrigger, refereeCouponCode,
+                promoDiscountValue, promoDiscountType, promoMaxUsageTotal, promoMaxUsagePerCustomer,
+                promoIsCombinable, promoPriority, nowStr, endDateStr, nowStr, 'System (Referral)'
+            ]);
+            // Log the referral tracking record
+            const referralId = (0, crypto_1.randomUUID)();
+            yield conn.query(`INSERT INTO loyalty_referrals (id, referrer_id, referee_id, referral_code, coupon_code, status, rewarded_points, created_at)
+                 VALUES (?, ?, ?, ?, ?, 'PENDING', 50, ?)`, [referralId, referredById, id, refCode.trim().toUpperCase(), refereeCouponCode, nowStr]);
+        }
         // Handle Foreign Currency Logic
         const isForeign = currencyCode && currencyCode !== 'EGP';
         const finalForeignBalance = isForeign ? (openingBalance || 0) : 0;
@@ -523,7 +593,7 @@ const createPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 // This caused "maxCode + 1" to do string concatenation ("9991" + 1 = "99911")
                 // instead of arithmetic (9991 + 1 = 9992). Use parseInt() to force numeric addition.
                 // Also exclude corrupted codes (> 1M) from the MAX() to prevent runaway sequences.
-                const [maxResult] = yield conn.query('SELECT COALESCE(MAX(CAST(code AS UNSIGNED)), 0) as maxCode FROM partners WHERE code REGEXP "^[0-9]+$" AND CAST(code AS UNSIGNED) < 1000000');
+                const [maxResult] = yield conn.query('SELECT COALESCE(MAX(CAST(code AS UNSIGNED)), 0) as maxCode FROM partners WHERE code COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" AND CAST(code AS UNSIGNED) < 1000000');
                 const maxCode = parseInt(String(((_a = maxResult[0]) === null || _a === void 0 ? void 0 : _a.maxCode) || 0), 10);
                 nextCode = String(maxCode + 1);
             }
@@ -532,7 +602,18 @@ const createPartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 nextCode = null;
             }
         }
-        yield conn.query('INSERT INTO partners (id, name, type, isCustomer, isSupplier, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance, balance, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, foreignBalance, ceramicPriceListId, ceramicDiscountListId, code, gender, dateOfBirth) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, type, isCustomer ? 1 : 0, isSupplier ? 1 : 0, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance || 0, finalBalance, creditLimit || 0, classification, status || 'ACTIVE', groupId, commercialRegister, salesmanValue, priceListValue, currencyCode || 'EGP', finalForeignBalance, ceramicPriceListValue, ceramicDiscountListValue, nextCode, gender || null, dateOfBirth || null]);
+        try {
+            yield conn.query('INSERT INTO partners (id, name, type, isCustomer, isSupplier, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance, balance, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, foreignBalance, ceramicPriceListId, ceramicDiscountListId, code, gender, dateOfBirth, request_type, referral_code, referred_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, type, isCustomer ? 1 : 0, isSupplier ? 1 : 0, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance || 0, finalBalance, creditLimit || 0, classification, status || 'ACTIVE', groupId, commercialRegister, salesmanValue, priceListValue, currencyCode || 'EGP', finalForeignBalance, ceramicPriceListValue, ceramicDiscountListValue, nextCode, gender || null, dateOfBirth || null, request_type || 'NONE', referralCode, referredById]);
+        }
+        catch (insertErr) {
+            // Fallback for older schemas missing CRM columns
+            if (insertErr.code === 'ER_BAD_FIELD_ERROR') {
+                yield conn.query('INSERT INTO partners (id, name, type, isCustomer, isSupplier, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance, balance, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, foreignBalance, ceramicPriceListId, ceramicDiscountListId, code, referral_code, referred_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, type, isCustomer ? 1 : 0, isSupplier ? 1 : 0, phone, email, taxId, address, contactPerson, paymentTerms, openingBalance || 0, finalBalance, creditLimit || 0, classification, status || 'ACTIVE', groupId, commercialRegister, salesmanValue, priceListValue, currencyCode || 'EGP', finalForeignBalance, ceramicPriceListValue, ceramicDiscountListValue, nextCode, referralCode, referredById]);
+            }
+            else {
+                throw insertErr;
+            }
+        }
         yield conn.commit();
         // Log audit trail
         const user = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || ((_c = req.user) === null || _c === void 0 ? void 0 : _c.username) || req.body.user || 'System';
@@ -557,7 +638,7 @@ const updatePartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
     try {
         yield conn.beginTransaction();
         const { id } = req.params;
-        const { name, type, phone, email, taxId, address, contactPerson, paymentTerms, isCustomer, isSupplier, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, ceramicPriceListId, ceramicDiscountListId, gender, dateOfBirth } = req.body;
+        const { name, type, phone, email, taxId, address, contactPerson, paymentTerms, isCustomer, isSupplier, creditLimit, classification, status, groupId, commercialRegister, salesmanId, priceListId, currencyCode, ceramicPriceListId, ceramicDiscountListId, gender, dateOfBirth, request_type } = req.body;
         // Validation: At least one type must be selected
         if (isCustomer !== undefined || isSupplier !== undefined) {
             if (!isCustomer && !isSupplier) {
@@ -630,7 +711,18 @@ const updatePartner = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const ceramicPriceListValue = ceramicPriceListId === '' ? null : (ceramicPriceListId || null);
         const ceramicDiscountListValue = ceramicDiscountListId === '' ? null : (ceramicDiscountListId || null);
         const partnerCodeValue = req.body.code === undefined ? currentRow.code : (req.body.code || null);
-        yield conn.query('UPDATE partners SET name = ?, type = ?, isCustomer = ?, isSupplier = ?, phone = ?, email = ?, taxId = ?, address = ?, contactPerson = ?, paymentTerms = ?, creditLimit = ?, classification = ?, status = ?, groupId = ?, commercialRegister = ?, openingBalance = ?, balance = ?, salesmanId = ?, priceListId = ?, currencyCode = ?, foreignBalance = ?, ceramicPriceListId = ?, ceramicDiscountListId = ?, code = ?, gender = ?, dateOfBirth = ? WHERE id = ?', [name, type, isCustomer ? 1 : 0, isSupplier ? 1 : 0, phone, email, taxId, address, contactPerson, paymentTerms, creditLimit || 0, classification, status, groupId, commercialRegister, finalOpeningBalance, finalBalance, salesmanValue, priceListValue, currencyCode || 'EGP', finalForeignBalance, ceramicPriceListValue, ceramicDiscountListValue, partnerCodeValue, gender || null, dateOfBirth || null, id]);
+        try {
+            yield conn.query('UPDATE partners SET name = ?, type = ?, isCustomer = ?, isSupplier = ?, phone = ?, email = ?, taxId = ?, address = ?, contactPerson = ?, paymentTerms = ?, creditLimit = ?, classification = ?, status = ?, groupId = ?, commercialRegister = ?, openingBalance = ?, balance = ?, salesmanId = ?, priceListId = ?, currencyCode = ?, foreignBalance = ?, ceramicPriceListId = ?, ceramicDiscountListId = ?, code = ?, gender = ?, dateOfBirth = ?, request_type = ? WHERE id = ?', [name, type, isCustomer ? 1 : 0, isSupplier ? 1 : 0, phone, email, taxId, address, contactPerson, paymentTerms, creditLimit || 0, classification, status, groupId, commercialRegister, finalOpeningBalance, finalBalance, salesmanValue, priceListValue, currencyCode || 'EGP', finalForeignBalance, ceramicPriceListValue, ceramicDiscountListValue, partnerCodeValue, gender || null, dateOfBirth || null, request_type || 'NONE', id]);
+        }
+        catch (updateErr) {
+            // Fallback for older schemas missing CRM columns
+            if (updateErr.code === 'ER_BAD_FIELD_ERROR') {
+                yield conn.query('UPDATE partners SET name = ?, type = ?, isCustomer = ?, isSupplier = ?, phone = ?, email = ?, taxId = ?, address = ?, contactPerson = ?, paymentTerms = ?, creditLimit = ?, classification = ?, status = ?, groupId = ?, commercialRegister = ?, openingBalance = ?, balance = ?, salesmanId = ?, priceListId = ?, currencyCode = ?, foreignBalance = ?, ceramicPriceListId = ?, ceramicDiscountListId = ?, code = ? WHERE id = ?', [name, type, isCustomer ? 1 : 0, isSupplier ? 1 : 0, phone, email, taxId, address, contactPerson, paymentTerms, creditLimit || 0, classification, status, groupId, commercialRegister, finalOpeningBalance, finalBalance, salesmanValue, priceListValue, currencyCode || 'EGP', finalForeignBalance, ceramicPriceListValue, ceramicDiscountListValue, partnerCodeValue, id]);
+            }
+            else {
+                throw updateErr;
+            }
+        }
         // CASCADE: Update partner name in all related records
         // This ensures name changes are reflected everywhere in the system
         if (name) {

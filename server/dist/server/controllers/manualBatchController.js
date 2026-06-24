@@ -74,10 +74,10 @@ const createManualBatch = (req, res) => __awaiter(void 0, void 0, void 0, functi
             // Deduct stock
             yield conn.query('UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?', [input.quantity, input.productId]);
             yield conn.query(`
-                UPDATE product_stocks 
-                SET quantity = GREATEST(0, quantity - ?) 
-                WHERE product_id = ? AND warehouse_id = ?
-            `, [input.quantity, input.productId, warehouseId]);
+                INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                VALUES (?, ?, ?, 0)
+                ON DUPLICATE KEY UPDATE stock = ROUND(GREATEST(0, stock - ?), 5)
+            `, [(0, crypto_1.randomUUID)(), input.productId, warehouseId, input.quantity]);
             // Stock Movement
             yield conn.query(`
                 INSERT INTO stock_movements (product_id, warehouse_id, movement_type, qty_change, reference_type, reference_id, notes)
@@ -105,10 +105,10 @@ const createManualBatch = (req, res) => __awaiter(void 0, void 0, void 0, functi
             }
             // Update warehouse stock
             yield conn.query(`
-                INSERT INTO product_stocks (product_id, warehouse_id, quantity)
-                VALUES (?, ?, ?)
-                ON DUPLICATE KEY UPDATE quantity = quantity + ?
-            `, [output.productId, warehouseId, output.quantity, output.quantity]);
+                INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)
+            `, [(0, crypto_1.randomUUID)(), output.productId, warehouseId, output.quantity, output.quantity]);
             // Stock Movement
             yield conn.query(`
                 INSERT INTO stock_movements (product_id, warehouse_id, movement_type, qty_change, reference_type, reference_id, notes)
@@ -143,12 +143,20 @@ const deleteManualBatch = (req, res) => __awaiter(void 0, void 0, void 0, functi
         // Reverse inputs (add back)
         for (const input of inputs) {
             yield conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [input.quantity, input.product_id]);
-            yield conn.query('UPDATE product_stocks SET quantity = quantity + ? WHERE product_id = ? AND warehouse_id = ?', [input.quantity, input.product_id, warehouseId]);
+            yield conn.query(`
+                INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                VALUES (?, ?, ?, ?)
+                ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)
+            `, [(0, crypto_1.randomUUID)(), input.product_id, warehouseId, input.quantity, input.quantity]);
         }
         // Reverse outputs (subtract)
         for (const output of outputs) {
             yield conn.query('UPDATE products SET stock = GREATEST(0, stock - ?) WHERE id = ?', [output.quantity, output.product_id]);
-            yield conn.query('UPDATE product_stocks SET quantity = GREATEST(0, quantity - ?) WHERE product_id = ? AND warehouse_id = ?', [output.quantity, output.product_id, warehouseId]);
+            yield conn.query(`
+                INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                VALUES (?, ?, ?, 0)
+                ON DUPLICATE KEY UPDATE stock = ROUND(GREATEST(0, stock - ?), 5)
+            `, [(0, crypto_1.randomUUID)(), output.product_id, warehouseId, output.quantity]);
         }
         // Delete movements
         yield conn.query('DELETE FROM stock_movements WHERE reference_type = "MANUAL_BATCH" AND reference_id = ?', [id]);

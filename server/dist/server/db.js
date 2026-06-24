@@ -53,6 +53,7 @@ exports.safeGetConnection = safeGetConnection;
 exports.getHeavyConnection = getHeavyConnection;
 exports.safePoolQuery = safePoolQuery;
 exports.initDB = initDB;
+exports.syncBranchChatGroups = syncBranchChatGroups;
 const promise_1 = __importDefault(require("mysql2/promise"));
 const dotenv_1 = __importDefault(require("dotenv"));
 const async_hooks_1 = require("async_hooks");
@@ -429,10 +430,10 @@ function safePoolQuery(sql_1, params_1) {
         throw new Error('safePoolQuery: should not reach here');
     });
 }
-exports.SCHEMA_VERSION = 74; // Bump this when adding new migrations
+exports.SCHEMA_VERSION = 80; // Bump this when adding new migrations
 function initDB() {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a, _b, _c, _d;
+        var _a, _b, _c, _d, _e, _f;
         let conn;
         try {
             // Connect without database selected to create it if not exists
@@ -480,12 +481,33 @@ function initDB() {
                     console.log(`🔄 Schema v${currentVersion} → v${exports.SCHEMA_VERSION}. Running migrations...`);
                 }
             }
-            catch (_e) {
+            catch (_g) {
                 // schema_meta table doesn't exist yet — first run, needs full init
                 console.log('🆕 First run (or empty database) detected. Running full database initialization...');
             }
             // Disable foreign key checks during table creation to avoid order dependency issues
             yield conn.query('SET FOREIGN_KEY_CHECKS = 0');
+            // Add created_by and address to crm_leads
+            try {
+                yield conn.query('ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS created_by VARCHAR(36) NULL');
+                yield conn.query('ALTER TABLE crm_leads ADD COLUMN IF NOT EXISTS address VARCHAR(255) NULL');
+                // Backfill created_by from the first activity if it is currently null
+                yield conn.query(`
+        UPDATE crm_leads l
+        JOIN (
+          SELECT lead_id, created_by 
+          FROM crm_activities 
+          WHERE type = 'SYSTEM' 
+          GROUP BY lead_id 
+          ORDER BY created_at ASC
+        ) a ON l.id = a.lead_id
+        SET l.created_by = a.created_by
+        WHERE l.created_by IS NULL
+      `);
+            }
+            catch (e) {
+                console.warn('⚠️ crm_leads created_by addition failed:', e === null || e === void 0 ? void 0 : e.message);
+            }
             if (!needsMigrations) {
                 // Fast path: only run CREATE TABLE IF NOT EXISTS (instant for existing tables)
                 // and skip all ALTER TABLE migrations
@@ -594,6 +616,294 @@ function initDB() {
                 }
                 catch (waErr) {
                     console.warn('⚠️ WhatsApp table fast-path creation warning:', waErr === null || waErr === void 0 ? void 0 : waErr.message);
+                }
+                // ── CRM Complaints tables (fast-path) ──
+                try {
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS crm_complaints (
+            id VARCHAR(36) PRIMARY KEY,
+            complaint_number VARCHAR(50) UNIQUE NOT NULL,
+            partner_id VARCHAR(36),
+            partner_name VARCHAR(255),
+            partner_phone VARCHAR(50),
+            subject VARCHAR(255) NOT NULL,
+            description TEXT NOT NULL,
+            type ENUM('PRODUCT_QUALITY', 'SERVICE_DELAY', 'EMPLOYEE_BEHAVIOR', 'FINANCIAL_ERROR', 'PACKAGING_ISSUE', 'OTHER') DEFAULT 'OTHER',
+            severity ENUM('LOW', 'MEDIUM', 'HIGH', 'CRITICAL') DEFAULT 'MEDIUM',
+            status ENUM('NEW', 'UNDER_REVIEW', 'INVESTIGATING', 'RESOLVED', 'REJECTED', 'CLOSED') DEFAULT 'NEW',
+            source ENUM('PHONE', 'WHATSAPP', 'EMAIL', 'WALK_IN', 'WEBSITE', 'OTHER') DEFAULT 'PHONE',
+            assigned_to VARCHAR(36),
+            created_by VARCHAR(36),
+            resolved_at DATETIME,
+            resolved_by VARCHAR(36),
+            resolution_summary TEXT,
+            client_mood ENUM('ANGRY', 'UPSET', 'NEUTRAL', 'SATISFIED') DEFAULT 'UPSET',
+            satisfaction_rating INT,
+            compensation_type ENUM('NONE', 'CREDIT_NOTE', 'REFUND', 'REPLACEMENT', 'REPAIR', 'DISCOUNT_VOUCHER', 'LOYALTY_POINTS', 'FREE_GIFT', 'FREE_SERVICE', 'OTHER') DEFAULT 'NONE',
+            compensation_amount DECIMAL(15,2) DEFAULT 0.00,
+            root_cause TEXT,
+            invoice_id VARCHAR(36),
+            attachments LONGTEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_crm_complaints_partner (partner_id),
+            INDEX idx_crm_complaints_status (status),
+            INDEX idx_crm_complaints_number (complaint_number)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS crm_complaint_comments (
+            id VARCHAR(36) PRIMARY KEY,
+            complaint_id VARCHAR(36) NOT NULL,
+            user_id VARCHAR(36) NOT NULL,
+            content TEXT NOT NULL,
+            is_internal TINYINT(1) DEFAULT 1,
+            attachments LONGTEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_crm_complaint_comments_complaint (complaint_id)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS crm_complaint_compensations (
+            id VARCHAR(36) PRIMARY KEY,
+            complaint_id VARCHAR(36) NOT NULL,
+            partner_id VARCHAR(36),
+            type ENUM('CREDIT_NOTE', 'REFUND', 'REPLACEMENT', 'DISCOUNT_VOUCHER', 'LOYALTY_POINTS', 'OTHER') NOT NULL,
+            amount DECIMAL(15,2) DEFAULT 0.00,
+            status ENUM('PENDING', 'APPROVED', 'REJECTED') DEFAULT 'PENDING',
+            approved_by VARCHAR(36),
+            approved_at DATETIME,
+            posted_invoice_id VARCHAR(36),
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX idx_crm_comp_status (status),
+            INDEX idx_crm_comp_complaint (complaint_id),
+            INDEX idx_crm_comp_partner (partner_id)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        `);
+                }
+                catch (complaintErr) {
+                    console.warn('⚠️ CRM Complaints table fast-path creation warning:', complaintErr === null || complaintErr === void 0 ? void 0 : complaintErr.message);
+                }
+                // ── Fix pos_cash_movements ENUM — 'EXPENSE' was missing, causing silent empty inserts ──
+                try {
+                    // Switch from ENUM to VARCHAR to prevent future silent drops
+                    yield conn.query(`ALTER TABLE pos_cash_movements MODIFY COLUMN type VARCHAR(50) NOT NULL DEFAULT 'SALE'`);
+                    yield conn.query(`ALTER TABLE pos_cash_movements MODIFY COLUMN paymentMethod VARCHAR(50) DEFAULT 'CASH'`);
+                    // Fix existing rows with empty type that are linked to pos_expenses
+                    yield conn.query(`
+          UPDATE pos_cash_movements SET type = 'EXPENSE'
+          WHERE (type = '' OR type IS NULL)
+            AND referenceId IS NOT NULL
+            AND referenceId IN (SELECT id FROM pos_expenses)
+        `);
+                    console.log('✅ pos_cash_movements type/paymentMethod columns expanded to VARCHAR(50)');
+                }
+                catch (posFixErr) {
+                    console.warn('⚠️ pos_cash_movements ENUM fix warning:', posFixErr === null || posFixErr === void 0 ? void 0 : posFixErr.message);
+                }
+                // ── Hotfix: Ensure stock_permits.posShiftId exists (migration 058 may not have been applied) ──
+                try {
+                    yield conn.query(`ALTER TABLE stock_permits ADD COLUMN IF NOT EXISTS posShiftId VARCHAR(36) NULL`);
+                }
+                catch ( /* column already exists or table doesn't exist yet */_h) { /* column already exists or table doesn't exist yet */ }
+                // ── Hotfix: Ensure bom.is_archived and production_orders.is_archived columns exist (migration 066) ──
+                try {
+                    yield conn.query(`ALTER TABLE bom ADD COLUMN IF NOT EXISTS is_archived TINYINT(1) DEFAULT 0`);
+                }
+                catch (err) {
+                    console.warn('⚠️ bom is_archived alter failed:', err.message);
+                }
+                try {
+                    yield conn.query(`ALTER TABLE production_orders ADD COLUMN IF NOT EXISTS is_archived TINYINT(1) DEFAULT 0`);
+                }
+                catch (err) {
+                    console.warn('⚠️ production_orders is_archived alter failed:', err.message);
+                }
+                // ── Ensure partners.companyName exists ──
+                try {
+                    yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS companyName VARCHAR(255) DEFAULT NULL`);
+                    yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS whatsappAutoSend TINYINT(1) DEFAULT 0`);
+                }
+                catch ( /* column already exists */_j) { /* column already exists */ }
+                // ── Ensure warranty / installation columns exist ──
+                try {
+                    yield conn.query(`ALTER TABLE pos_settings ADD COLUMN IF NOT EXISTS warrantyCategories JSON NULL`);
+                    yield conn.query(`ALTER TABLE invoice_lines ADD COLUMN IF NOT EXISTS hasWarranty TINYINT(1) DEFAULT 0`);
+                    yield conn.query(`ALTER TABLE invoice_lines ADD COLUMN IF NOT EXISTS inBranchInstallation TINYINT(1) DEFAULT 0`);
+                    yield conn.query(`ALTER TABLE invoice_lines ADD COLUMN IF NOT EXISTS warrantyMonths INT DEFAULT 0`);
+                    yield conn.query(`ALTER TABLE deleted_invoice_lines ADD COLUMN IF NOT EXISTS hasWarranty TINYINT(1) DEFAULT 0`);
+                    yield conn.query(`ALTER TABLE deleted_invoice_lines ADD COLUMN IF NOT EXISTS inBranchInstallation TINYINT(1) DEFAULT 0`);
+                    yield conn.query(`ALTER TABLE deleted_invoice_lines ADD COLUMN IF NOT EXISTS warrantyMonths INT DEFAULT 0`);
+                }
+                catch (err) {
+                    console.warn('⚠️ Warranty POS fast-path columns addition warning:', err === null || err === void 0 ? void 0 : err.message);
+                }
+                // ── Ensure chat groups and memberships exist (v75 migration) ──
+                try {
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS chat_groups (
+            id VARCHAR(100) PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            description TEXT NULL,
+            type ENUM('GLOBAL', 'BRANCH', 'CUSTOM') DEFAULT 'CUSTOM',
+            branchId VARCHAR(36) DEFAULT NULL,
+            createdBy VARCHAR(100) DEFAULT 'System',
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_group_branch (branchId)
+          ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS chat_group_members (
+            groupId VARCHAR(100) NOT NULL,
+            userId VARCHAR(100) NOT NULL,
+            joinedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (groupId, userId),
+            INDEX idx_member_user (userId),
+            FOREIGN KEY (groupId) REFERENCES chat_groups(id) ON DELETE CASCADE
+          ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+                    yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS groupId VARCHAR(100) DEFAULT NULL`).catch(() => { });
+                    yield conn.query(`CREATE INDEX IF NOT EXISTS idx_chat_msg_group ON chat_messages(groupId)`).catch(() => { });
+                    yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reactions JSON NULL`).catch(() => { });
+                    yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS replyTo JSON NULL`).catch(() => { });
+                    yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment JSON NULL`).catch(() => { });
+                }
+                catch (chatErr) {
+                    console.warn('⚠️ Chat groups tables fast-path creation warning:', chatErr === null || chatErr === void 0 ? void 0 : chatErr.message);
+                }
+                // ── Ensure active cashier carts table exists ──
+                try {
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS pos_active_carts (
+            cashierId VARCHAR(36) PRIMARY KEY,
+            cashierName VARCHAR(255) NOT NULL,
+            warehouseName VARCHAR(255) NOT NULL,
+            cartState JSON NOT NULL,
+            remoteUpdate JSON DEFAULT NULL,
+            updatedAt BIGINT NOT NULL
+          ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+                    yield conn.query(`ALTER TABLE pos_active_carts ADD COLUMN IF NOT EXISTS isLocked TINYINT(1) DEFAULT 0`);
+                    yield conn.query(`ALTER TABLE pos_active_carts ADD COLUMN IF NOT EXISTS lockedBy VARCHAR(255) DEFAULT NULL`);
+                    yield conn.query(`ALTER TABLE pos_active_carts ADD COLUMN IF NOT EXISTS lastInterventionReason VARCHAR(255) DEFAULT NULL`);
+                    yield conn.query(`ALTER TABLE pos_active_carts ADD COLUMN IF NOT EXISTS lastAdminMessage VARCHAR(255) DEFAULT NULL`);
+                }
+                catch (posCartErr) {
+                    console.warn('⚠️ pos_active_carts fast-path creation warning:', posCartErr === null || posCartErr === void 0 ? void 0 : posCartErr.message);
+                }
+                // ── Fix collation mismatch: MariaDB 11+ creates tables with utf8mb4_uca1400_ai_ci ──
+                // MariaDB 11+ blocks MODIFY COLUMN on FK-referenced columns regardless of FK_CHECKS.
+                // Nuclear fix: drop all FKs → modify all columns → re-add all FKs.
+                try {
+                    // Check if there are any mismatched columns at all (fast exit on clean DBs)
+                    const [checkCols] = yield conn.query(`
+          SELECT COUNT(*) as cnt FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = DATABASE()
+            AND COLLATION_NAME IS NOT NULL
+            AND COLLATION_NAME != 'utf8mb4_unicode_ci'
+            AND DATA_TYPE IN ('varchar', 'char', 'text', 'mediumtext', 'longtext', 'tinytext', 'enum', 'set')
+        `);
+                    const mismatchCount = ((_b = checkCols[0]) === null || _b === void 0 ? void 0 : _b.cnt) || 0;
+                    if (mismatchCount > 0) {
+                        console.log(`🔧 [Collation Fix] ${mismatchCount} columns need fixing. Running nuclear FK-safe migration...`);
+                        // Phase 1: Database-level default
+                        const [dbRows] = yield conn.query(`SELECT DATABASE() as db`);
+                        const dbName = (_c = dbRows[0]) === null || _c === void 0 ? void 0 : _c.db;
+                        if (dbName) {
+                            yield conn.query(`ALTER DATABASE \`${dbName}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+                        }
+                        // Phase 2: Snapshot ALL foreign key constraints
+                        const [fkRows] = yield conn.query(`
+            SELECT 
+              tc.CONSTRAINT_NAME, tc.TABLE_NAME,
+              kcu.COLUMN_NAME, kcu.REFERENCED_TABLE_NAME, kcu.REFERENCED_COLUMN_NAME,
+              rc.UPDATE_RULE, rc.DELETE_RULE
+            FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+            JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+              ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA AND tc.TABLE_NAME = kcu.TABLE_NAME
+            JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+              ON tc.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
+            WHERE tc.TABLE_SCHEMA = DATABASE() AND tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+            ORDER BY tc.TABLE_NAME, tc.CONSTRAINT_NAME
+          `);
+                        const fks = fkRows;
+                        console.log(`   📋 Captured ${fks.length} FK constraints to restore`);
+                        // Phase 3: Drop all FKs
+                        yield conn.query('SET FOREIGN_KEY_CHECKS = 0');
+                        const droppedFKs = new Set();
+                        for (const fk of fks) {
+                            const key = `${fk.TABLE_NAME}.${fk.CONSTRAINT_NAME}`;
+                            if (droppedFKs.has(key))
+                                continue;
+                            try {
+                                yield conn.query(`ALTER TABLE \`${fk.TABLE_NAME}\` DROP FOREIGN KEY \`${fk.CONSTRAINT_NAME}\``);
+                                droppedFKs.add(key);
+                            }
+                            catch ( /* already dropped or doesn't exist */_k) { /* already dropped or doesn't exist */ }
+                        }
+                        console.log(`   🗑️ Dropped ${droppedFKs.size} FK constraints`);
+                        // Phase 4: Convert ALL tables that have columns with wrong collation (now no FKs block it)
+                        const [allTables] = yield conn.query(`
+            SELECT DISTINCT TABLE_NAME FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND COLLATION_NAME IS NOT NULL
+              AND COLLATION_NAME != 'utf8mb4_unicode_ci'
+              AND DATA_TYPE IN ('varchar', 'char', 'text', 'mediumtext', 'longtext', 'tinytext', 'enum', 'set')
+          `);
+                        let convertedCount = 0;
+                        for (const t of allTables) {
+                            try {
+                                yield conn.query(`ALTER TABLE \`${t.TABLE_NAME}\` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+                                convertedCount++;
+                            }
+                            catch (e) {
+                                // Some tables may still have issues (virtual columns, etc.) — try table default only
+                                try {
+                                    yield conn.query(`ALTER TABLE \`${t.TABLE_NAME}\` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+                                }
+                                catch ( /* skip */_l) { /* skip */ }
+                            }
+                        }
+                        console.log(`   ✅ Converted ${convertedCount} tables`);
+                        // Phase 5: Re-add all FKs
+                        let restoredCount = 0;
+                        let failedFKs = 0;
+                        const processedFKs = new Set();
+                        for (const fk of fks) {
+                            const key = `${fk.TABLE_NAME}.${fk.CONSTRAINT_NAME}`;
+                            if (processedFKs.has(key))
+                                continue;
+                            processedFKs.add(key);
+                            try {
+                                const onUpdate = fk.UPDATE_RULE && fk.UPDATE_RULE !== 'RESTRICT' ? `ON UPDATE ${fk.UPDATE_RULE}` : '';
+                                const onDelete = fk.DELETE_RULE && fk.DELETE_RULE !== 'RESTRICT' ? `ON DELETE ${fk.DELETE_RULE}` : '';
+                                yield conn.query(`
+                ALTER TABLE \`${fk.TABLE_NAME}\` 
+                ADD CONSTRAINT \`${fk.CONSTRAINT_NAME}\` 
+                FOREIGN KEY (\`${fk.COLUMN_NAME}\`) 
+                REFERENCES \`${fk.REFERENCED_TABLE_NAME}\`(\`${fk.REFERENCED_COLUMN_NAME}\`)
+                ${onUpdate} ${onDelete}
+              `);
+                                restoredCount++;
+                            }
+                            catch (_m) {
+                                failedFKs++;
+                            }
+                        }
+                        yield conn.query('SET FOREIGN_KEY_CHECKS = 1');
+                        console.log(`   🔗 Restored ${restoredCount} FK constraints${failedFKs > 0 ? `, ${failedFKs} failed` : ''}`);
+                        console.log(`✅ [Collation Fix] Nuclear migration complete`);
+                    }
+                }
+                catch (collationErr) {
+                    console.warn('⚠️ Collation fix error:', collationErr === null || collationErr === void 0 ? void 0 : collationErr.message);
+                    // Ensure FK checks are re-enabled even on error
+                    try {
+                        yield conn.query('SET FOREIGN_KEY_CHECKS = 1');
+                    }
+                    catch (_o) { }
                 }
                 yield conn.query('SET FOREIGN_KEY_CHECKS = 1');
                 conn.release();
@@ -766,7 +1076,7 @@ function initDB() {
             // Backfill existing partners that don't have a code yet
             try {
                 const [uncoded] = yield conn.query(`SELECT COUNT(*) as cnt FROM partners WHERE code IS NULL`);
-                if (((_b = uncoded[0]) === null || _b === void 0 ? void 0 : _b.cnt) > 0) {
+                if (((_d = uncoded[0]) === null || _d === void 0 ? void 0 : _d.cnt) > 0) {
                     // Assign sequential codes ordered by name to existing partners
                     yield conn.query(`
           SET @row_number = (SELECT COALESCE(MAX(code), 0) FROM partners WHERE code IS NOT NULL)
@@ -782,6 +1092,11 @@ function initDB() {
             }
             // Add unique index on code (after backfill to avoid conflicts)
             yield conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_partner_code ON partners(code)`).catch(() => { });
+            // CRM/membership columns
+            yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS gender VARCHAR(10) DEFAULT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS dateOfBirth DATE DEFAULT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS request_type VARCHAR(20) DEFAULT 'NONE'`).catch(() => { });
+            yield conn.query(`ALTER TABLE partners ADD COLUMN IF NOT EXISTS companyName VARCHAR(255) DEFAULT NULL`).catch(() => { });
             // Accounts Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS accounts (
@@ -843,6 +1158,7 @@ function initDB() {
                 conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bankTransfers TEXT COMMENT 'JSON array of bank transfer details'`).catch(() => { }),
                 conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS voucherCategory VARCHAR(50) DEFAULT NULL COMMENT 'supplier, expenses, employee_advance, labour, salary'`).catch(() => { }),
                 conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS bankTransferReference VARCHAR(100) DEFAULT NULL COMMENT 'بند رقم عملية التحويل البنكي'`).catch(() => { }),
+                conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS paymentSources TEXT DEFAULT NULL COMMENT 'JSON array of multi-source payment breakdown [{type,sourceId,sourceName,accountId,amount}]'`).catch(() => { }),
                 // Core columns that may be missing in older client databases
                 conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS notes TEXT`).catch(() => { }),
                 conn.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS dueDate DATETIME`).catch(() => { }),
@@ -858,6 +1174,9 @@ function initDB() {
             yield Promise.all([
                 conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_referenceInvoiceId ON invoices(referenceInvoiceId)`).catch(() => { }),
                 conn.query(`CREATE INDEX IF NOT EXISTS idx_invoices_pos_shift ON invoices(posShiftId)`).catch(() => { }),
+                // FIX: Ensure posShiftId uses utf8mb4 — on Hostinger the table may use utf8mb3,
+                // causing collation mismatches when comparing with pos_shifts.id (utf8mb4)
+                conn.query(`ALTER TABLE invoices MODIFY COLUMN posShiftId VARCHAR(36) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`).catch(() => { }),
                 // CONCURRENCY: Prevent duplicate invoice numbers when 10+ users create invoices simultaneously
                 conn.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_invoices_number_unique ON invoices(number)`).catch(() => { }),
                 // PERFORMANCE: Speed up partner statement queries & type-based filters
@@ -975,15 +1294,31 @@ function initDB() {
           varianceCard DECIMAL(15,2),
           totalSales DECIMAL(15,2) DEFAULT 0,
           totalRefunds DECIMAL(15,2) DEFAULT 0,
+          totalPurchases DECIMAL(15,2) DEFAULT 0,
           salesCount INT DEFAULT 0,
           refundCount INT DEFAULT 0,
+          purchasesCount INT DEFAULT 0,
           closingRecipientType ENUM('EMPLOYEE', 'TREASURY') DEFAULT NULL,
           closingRecipientId VARCHAR(36) DEFAULT NULL,
-          status ENUM('OPEN', 'CLOSED', 'VALIDATED', 'SUSPENDED') DEFAULT 'OPEN',
+          treasuryId VARCHAR(36) NULL,
+          adminOpeningAmount DECIMAL(15,2) NOT NULL DEFAULT 0,
+          adminOpeningAmountSetBy VARCHAR(36) NULL,
+          adminOpeningAmountSetAt DATETIME NULL,
+          shortageEmployeeId VARCHAR(36) NULL,
+          approvalStatus ENUM('pending','approved','flagged') NOT NULL DEFAULT 'pending',
+          approvedBy VARCHAR(36) NULL,
+          approvedAt DATETIME NULL,
+          actualCashReceived DECIMAL(15,2) NULL,
+          discrepancyAmount DECIMAL(15,2) NULL,
+          discrepancyNotes TEXT NULL,
+          adminNotes TEXT NULL,
+          adminShortageEmployeeId VARCHAR(36) NULL,
+          status ENUM('OPEN', 'CLOSED', 'PENDING_VALIDATION', 'VALIDATED', 'SUSPENDED') DEFAULT 'OPEN',
           notes TEXT,
           validatedBy VARCHAR(36),
           validatedAt DATETIME,
           validationNotes TEXT,
+          closingBankDetails TEXT NULL,
           createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
           updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
           INDEX idx_pos_shifts_user (userId),
@@ -997,9 +1332,9 @@ function initDB() {
         CREATE TABLE IF NOT EXISTS pos_cash_movements (
           id VARCHAR(36) PRIMARY KEY,
           shiftId VARCHAR(36) NOT NULL,
-          type ENUM('DEPOSIT', 'WITHDRAWAL', 'OPENING', 'SALE', 'REFUND', 'ADJUSTMENT', 'EXPENSE') NOT NULL,
+          type VARCHAR(50) NOT NULL DEFAULT 'SALE',
           amount DECIMAL(15,2) NOT NULL,
-          paymentMethod ENUM('CASH', 'BANK', 'CHEQUE', 'MIXED') DEFAULT 'CASH',
+          paymentMethod VARCHAR(50) DEFAULT 'CASH',
           description TEXT,
           referenceId VARCHAR(36),
           referenceType VARCHAR(50),
@@ -1061,6 +1396,16 @@ function initDB() {
             // Migration: Widen paymentMethod from ENUM to VARCHAR(50) — the ENUM was too narrow
             // (CASH, BANK, CHEQUE, MIXED, CREDIT) and silently truncated DEFERRED/TREASURY inserts
             yield conn.query(`ALTER TABLE pos_cash_movements MODIFY COLUMN paymentMethod VARCHAR(50) DEFAULT 'CASH'`).catch(() => { });
+            // Migration: Widen type from ENUM to VARCHAR(50) — the ENUM lacked EXPENSE/CASH_IN/CASH_OUT
+            // causing MariaDB to silently insert empty string for expense movements
+            yield conn.query(`ALTER TABLE pos_cash_movements MODIFY COLUMN type VARCHAR(50) NOT NULL DEFAULT 'SALE'`).catch(() => { });
+            // Fix orphaned empty-type rows linked to pos_expenses
+            yield conn.query(`
+      UPDATE pos_cash_movements SET type = 'EXPENSE'
+      WHERE (type = '' OR type IS NULL)
+        AND referenceId IS NOT NULL
+        AND referenceId IN (SELECT id FROM pos_expenses)
+    `).catch(() => { });
             // Add remaining pos_shifts columns (migrated from controllers)
             yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN treasuryId VARCHAR(36) NULL`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminOpeningAmount DECIMAL(15,2) NOT NULL DEFAULT 0`).catch(() => { });
@@ -1075,6 +1420,10 @@ function initDB() {
             yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN discrepancyNotes TEXT NULL`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminNotes TEXT NULL`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN adminShortageEmployeeId VARCHAR(36) NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN totalPurchases DECIMAL(15,2) DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN purchasesCount INT DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_shifts ADD COLUMN closingBankDetails TEXT NULL`).catch((e) => { if (e.code !== 'ER_DUP_FIELDNAME')
+                console.error(e); });
             // POS Settings
             yield conn.query(`
         CREATE TABLE IF NOT EXISTS pos_settings (
@@ -1087,6 +1436,7 @@ function initDB() {
             printAfterConfirm TINYINT(1) NOT NULL DEFAULT 1,
             useNumpad TINYINT(1) NOT NULL DEFAULT 1,
             allowedCategories JSON NULL,
+            warrantyCategories JSON NULL,
             autoCloseEnabled TINYINT(1) NOT NULL DEFAULT 0,
             autoCloseTime VARCHAR(5) NOT NULL DEFAULT '23:59',
             editCutoffDate DATE NULL,
@@ -1099,10 +1449,13 @@ function initDB() {
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN printAfterConfirm TINYINT(1) NOT NULL DEFAULT 1`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN useNumpad TINYINT(1) NOT NULL DEFAULT 1`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN allowedCategories JSON NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN warrantyCategories JSON NULL`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN autoCloseEnabled TINYINT(1) NOT NULL DEFAULT 0`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN autoCloseTime VARCHAR(5) NOT NULL DEFAULT '23:59'`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN editCutoffDate DATE NULL`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_settings ADD COLUMN editCutoffDays INT NOT NULL DEFAULT 0`).catch(() => { });
+            // Cashier discount cap: 0 = no limit, 5 = max 5% discount for non-admin users
+            yield conn.query(`ALTER TABLE pos_settings ADD COLUMN cashierMaxDiscountPercent DECIMAL(5,2) NOT NULL DEFAULT 0 COMMENT 'Max discount % for non-admin POS users (0 = no limit)'`).catch(() => { });
             // POS Expenses
             yield conn.query(`
         CREATE TABLE IF NOT EXISTS pos_expense_categories (
@@ -1132,6 +1485,19 @@ function initDB() {
     `).catch(() => { });
             yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN entityId VARCHAR(36) NULL`).catch(() => { });
             yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN entityType ENUM('EMPLOYEE', 'SUPPLIER', 'MISC') NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN description TEXT NULL`).catch(() => { });
+            yield conn.query(`ALTER TABLE pos_expenses ADD COLUMN sourceType VARCHAR(30) DEFAULT 'daily_takings'`).catch(() => { });
+            // Active cashier carts table
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS pos_active_carts (
+            cashierId VARCHAR(36) PRIMARY KEY,
+            cashierName VARCHAR(255) NOT NULL,
+            warehouseName VARCHAR(255) NOT NULL,
+            cartState JSON NOT NULL,
+            remoteUpdate JSON DEFAULT NULL,
+            updatedAt BIGINT NOT NULL
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `).catch(() => { });
             // ========================================
             // LOYALTY SYSTEM TABLES (نظام الولاء)
             // ========================================
@@ -1336,10 +1702,16 @@ function initDB() {
         total DECIMAL(15, 2) DEFAULT 0,
         warehouseId VARCHAR(36) DEFAULT NULL COMMENT 'مخزن خاص بالصنف',
         serials JSON DEFAULT NULL COMMENT 'أرقام تسلسلية للصنف',
+        hasWarranty TINYINT(1) DEFAULT 0,
+        inBranchInstallation TINYINT(1) DEFAULT 0,
+        warrantyMonths INT DEFAULT 0,
         FOREIGN KEY (invoiceId) REFERENCES invoices(id) ON DELETE CASCADE,
         FOREIGN KEY (productId) REFERENCES products(id) ON DELETE SET NULL
       )
     `);
+            yield conn.query(`ALTER TABLE invoice_lines ADD COLUMN hasWarranty TINYINT(1) DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE invoice_lines ADD COLUMN inBranchInstallation TINYINT(1) DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE invoice_lines ADD COLUMN warrantyMonths INT DEFAULT 0`).catch(() => { });
             // Migration: Ensure invoice_lines.id has AUTO_INCREMENT (fixes "Field 'id' doesn't have a default value" error)
             // This is needed for databases that were created with an older schema
             yield conn.query(`
@@ -1397,11 +1769,17 @@ function initDB() {
         cost DECIMAL(15, 2) DEFAULT 0,
         discount DECIMAL(15, 2) DEFAULT 0,
         total DECIMAL(15, 2) DEFAULT 0,
+        hasWarranty TINYINT(1) DEFAULT 0,
+        inBranchInstallation TINYINT(1) DEFAULT 0,
+        warrantyMonths INT DEFAULT 0,
         INDEX idx_deleted_lines_deletedInvoiceId (deletedInvoiceId),
         INDEX idx_deleted_lines_originalInvoiceId (originalInvoiceId),
         FOREIGN KEY (deletedInvoiceId) REFERENCES deleted_invoices(id) ON DELETE CASCADE
       )
     `);
+            yield conn.query(`ALTER TABLE deleted_invoice_lines ADD COLUMN hasWarranty TINYINT(1) DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE deleted_invoice_lines ADD COLUMN inBranchInstallation TINYINT(1) DEFAULT 0`).catch(() => { });
+            yield conn.query(`ALTER TABLE deleted_invoice_lines ADD COLUMN warrantyMonths INT DEFAULT 0`).catch(() => { });
             // Journal Entries Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS journal_entries (
@@ -1699,7 +2077,9 @@ function initDB() {
         lastLogin DATETIME,
         avatar TEXT,
         isHidden BOOLEAN DEFAULT FALSE,
-        salesmanId VARCHAR(36)
+        salesmanId VARCHAR(36),
+        partnerId VARCHAR(36) DEFAULT NULL,
+        userType VARCHAR(50) DEFAULT 'NORMAL'
       )
     `);
             // Add salesmanId column if it doesn't exist (for existing databases)
@@ -1767,6 +2147,22 @@ function initDB() {
             // Smart Attendance: Link users to employees for login-based attendance
             yield conn.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS employeeId VARCHAR(36)`).catch(() => { });
             yield conn.query(`CREATE INDEX IF NOT EXISTS idx_users_employeeId ON users(employeeId)`).catch(() => { });
+            // Storefront: Link users to partners (customer profile) and add userType column
+            yield conn.query(`ALTER TABLE users ADD COLUMN partnerId VARCHAR(36) DEFAULT NULL`).catch((e) => {
+                if (e.code !== 'ER_DUP_FIELDNAME')
+                    console.error('Error adding partnerId to users:', e.message);
+            });
+            try {
+                yield conn.query(`CREATE INDEX idx_users_partnerId ON users(partnerId)`);
+            }
+            catch (e) {
+                if (e.code !== 'ER_DUP_KEYNAME')
+                    console.error('Error creating index idx_users_partnerId:', e.message);
+            }
+            yield conn.query(`ALTER TABLE users ADD COLUMN userType VARCHAR(50) DEFAULT 'NORMAL'`).catch((e) => {
+                if (e.code !== 'ER_DUP_FIELDNAME')
+                    console.error('Error adding userType to users:', e.message);
+            });
             // Taxes Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS taxes (
@@ -1825,6 +2221,53 @@ function initDB() {
         INDEX idx_chat_private (userId, targetUserId)
       )
     `);
+            // ========================================
+            // CHAT GROUPS & MEMBERSHIPS (v75)
+            // ========================================
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS chat_groups (
+        id VARCHAR(100) PRIMARY KEY,
+        name VARCHAR(255) NOT NULL,
+        description TEXT NULL,
+        type ENUM('GLOBAL', 'BRANCH', 'CUSTOM') DEFAULT 'CUSTOM',
+        branchId VARCHAR(36) DEFAULT NULL,
+        createdBy VARCHAR(100) DEFAULT 'System',
+        createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_group_branch (branchId)
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS chat_group_members (
+        groupId VARCHAR(100) NOT NULL,
+        userId VARCHAR(100) NOT NULL,
+        joinedAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+        PRIMARY KEY (groupId, userId),
+        INDEX idx_member_user (userId),
+        FOREIGN KEY (groupId) REFERENCES chat_groups(id) ON DELETE CASCADE
+      ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `);
+            yield conn.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS groupId VARCHAR(100) DEFAULT NULL
+    `).catch(() => { });
+            yield conn.query(`
+      CREATE INDEX IF NOT EXISTS idx_chat_msg_group ON chat_messages(groupId)
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS readReceipts JSON DEFAULT NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS editedAt DATETIME DEFAULT NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS isPinned BOOLEAN DEFAULT FALSE
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS pinnedAt DATETIME DEFAULT NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS pinnedBy VARCHAR(100) DEFAULT NULL
+    `).catch(() => { });
             // Stock Taking Sessions Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS stock_taking_sessions (
@@ -1865,7 +2308,8 @@ function initDB() {
     `);
             // Branch isolation: default warehouse and treasury per branch
             yield conn.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS defaultWarehouseId VARCHAR(36)`).catch(() => { });
-            yield conn.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS defaultBankId VARCHAR(36) COMMENT 'الخزينة الافتراضية للفرع'`).catch(() => { });
+            yield conn.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS defaultBankId VARCHAR(36) COMMENT 'الحساب البنكي الافتراضي للفرع'`).catch(() => { });
+            yield conn.query(`ALTER TABLE branches ADD COLUMN IF NOT EXISTS defaultSafeId VARCHAR(36) COMMENT 'الخزينة الافتراضية للفرع'`).catch(() => { });
             // Warehouses Table
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS warehouses (
@@ -2144,6 +2588,13 @@ function initDB() {
             yield conn.query(`
       ALTER TABLE salesmen 
       ADD COLUMN IF NOT EXISTS userId VARCHAR(36)
+    `).catch(() => {
+                // Ignore error if column already exists
+            });
+            // Add teamId column to salesmen table to link salesmen to a specific team
+            yield conn.query(`
+      ALTER TABLE salesmen 
+      ADD COLUMN IF NOT EXISTS teamId VARCHAR(36)
     `).catch(() => {
                 // Ignore error if column already exists
             });
@@ -3107,6 +3558,7 @@ function initDB() {
         address TEXT,
         phone VARCHAR(50),
         email VARCHAR(255),
+        avatar VARCHAR(255) DEFAULT NULL,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
         updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
         INDEX idx_branch (branchId),
@@ -3202,10 +3654,15 @@ function initDB() {
         longitude DECIMAL(11, 8) NOT NULL,
         radiusMeters INT DEFAULT 200,
         isActive BOOLEAN DEFAULT TRUE,
+        wifiSsid VARCHAR(255) NULL,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_branch (branchId)
       ) ENGINE=InnoDB;
     `);
+            yield conn.query(`
+      ALTER TABLE attendance_locations
+      ADD COLUMN IF NOT EXISTS wifiSsid VARCHAR(255) NULL
+    `).catch(() => { });
             // Raw smart check-in punches (immutable audit trail)
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS smart_attendance_punches (
@@ -3227,12 +3684,46 @@ function initDB() {
         reviewedBy VARCHAR(36),
         reviewedAt DATETIME,
         reviewNotes TEXT,
+        wifiSsid VARCHAR(255) NULL,
+        isMockGps BOOLEAN DEFAULT FALSE,
         createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_employee (employeeId),
         INDEX idx_date (punchTime),
         INDEX idx_status (verificationStatus)
       ) ENGINE=InnoDB;
     `);
+            yield conn.query(`
+      ALTER TABLE smart_attendance_punches
+      ADD COLUMN IF NOT EXISTS wifiSsid VARCHAR(255) NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE smart_attendance_punches
+      ADD COLUMN IF NOT EXISTS isMockGps BOOLEAN DEFAULT FALSE
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE attendance_locations
+      ADD COLUMN IF NOT EXISTS allowedIp VARCHAR(255) NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE attendance_locations
+      MODIFY COLUMN allowedIp VARCHAR(255) NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE smart_attendance_punches
+      ADD COLUMN IF NOT EXISTS selfiePath VARCHAR(500) NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE smart_attendance_punches
+      ADD COLUMN IF NOT EXISTS deviceId VARCHAR(255) NULL
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE employees
+      ADD COLUMN IF NOT EXISTS allowAllLocations TINYINT(1) NOT NULL DEFAULT 0
+    `).catch(() => { });
+            yield conn.query(`
+      ALTER TABLE smart_attendance_punches
+      ADD COLUMN IF NOT EXISTS offlineCreatedTime DATETIME NULL
+    `).catch(() => { });
             // Migration: Add source column to attendance_records to track origin
             yield conn.query(`ALTER TABLE attendance_records ADD COLUMN IF NOT EXISTS source ENUM('FINGERPRINT', 'SMART', 'MANUAL') DEFAULT 'MANUAL'`).catch(() => { });
             // Employee Advances / Loans Table
@@ -3313,6 +3804,7 @@ function initDB() {
             yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS fingerprintId VARCHAR(50) DEFAULT NULL COMMENT 'Device enrollment number'`).catch(() => { });
             yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS scheduledCheckIn TIME DEFAULT '09:00:00' COMMENT 'Employee scheduled start time'`).catch(() => { });
             yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS scheduledCheckOut TIME DEFAULT '17:00:00' COMMENT 'Employee scheduled end time'`).catch(() => { });
+            yield conn.query(`ALTER TABLE employees ADD COLUMN IF NOT EXISTS boundDeviceId VARCHAR(255) DEFAULT NULL COMMENT 'Registered device hardware ID'`).catch(() => { });
             // Fingerprint Devices Registry
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS fingerprint_devices (
@@ -3347,7 +3839,7 @@ function initDB() {
         )
       `);
             }
-            catch (_f) {
+            catch (_p) {
                 // FK mismatch on Hostinger — create without FK constraints
                 yield conn.query(`
         CREATE TABLE IF NOT EXISTS fingerprint_mappings (
@@ -3491,7 +3983,11 @@ function initDB() {
       ('hr.manage', 'إدارة الموظفين', 'الموارد البشرية'),
       ('payroll.view', 'عرض كشف المرتبات', 'الموارد البشرية'),
       ('payroll.manage', 'إدارة المرتبات', 'الموارد البشرية'),
-      ('attendance.manage', 'إدارة الحضور والانصراف', 'الموارد البشرية')
+      ('attendance.manage', 'إدارة الحضور والانصراف', 'الموارد البشرية'),
+      ('hr.biometric.view', 'عرض أجهزة البصمة والربط', 'الموارد البشرية'),
+      ('hr.biometric.edit', 'إدارة أجهزة البصمة والمزامنة', 'الموارد البشرية'),
+      ('hr.smart_register.view', 'عرض التسجيل الذكي والمواقع', 'الموارد البشرية'),
+      ('hr.smart_register.edit', 'إدارة التسجيل الذكي والاعتمادات', 'الموارد البشرية')
     `);
             console.log('✅ All permissions inserted');
             // ========================================
@@ -3929,7 +4425,7 @@ function initDB() {
                     for (const row of missingStocks) {
                         // Get the current global stock for this product
                         const [productRow] = yield conn.query('SELECT stock FROM products WHERE id = ?', [row.product_id]);
-                        const globalStock = ((_c = productRow[0]) === null || _c === void 0 ? void 0 : _c.stock) || 0;
+                        const globalStock = ((_e = productRow[0]) === null || _e === void 0 ? void 0 : _e.stock) || 0;
                         // Create product_stocks entry
                         yield conn.query('INSERT INTO product_stocks (id, productId, warehouseId, stock) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE stock = stock', [uuidv4(), row.product_id, row.warehouse_id, globalStock]);
                     }
@@ -4268,6 +4764,33 @@ function initDB() {
             // CRM MODULE TABLES
             // ========================================
             yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_categories (
+        id VARCHAR(36) PRIMARY KEY,
+        name VARCHAR(200) NOT NULL,
+        type ENUM('LEAD','TICKET','INQUIRY') NOT NULL,
+        isActive BOOLEAN DEFAULT TRUE,
+        createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_categories creation failed:', e.message));
+            yield conn.query(`ALTER TABLE crm_leads ADD COLUMN categoryId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`ALTER TABLE crm_tickets ADD COLUMN categoryId VARCHAR(36)`).catch(() => { });
+            yield conn.query(`ALTER TABLE crm_leads ADD COLUMN appointment_date DATETIME`).catch(() => { });
+            yield conn.query(`ALTER TABLE crm_tickets ADD COLUMN appointment_date DATETIME`).catch(() => { });
+            // Safe column-addition helper — works on all MySQL versions (no IF NOT EXISTS needed)
+            const addColumnIfMissing = (table, column, definition) => __awaiter(this, void 0, void 0, function* () {
+                const [cols] = yield conn.query(`SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?`, [table, column]);
+                if (!cols.length) {
+                    yield conn.query(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+                }
+            });
+            // crm_tickets columns added post-release
+            yield addColumnIfMissing('crm_tickets', 'attachments', 'LONGTEXT NULL');
+            yield addColumnIfMissing('crm_tickets', 'created_by', 'VARCHAR(36) NULL');
+            yield addColumnIfMissing('crm_tickets', 'address', 'TEXT NULL');
+            // crm_ticket_comments columns added post-release
+            yield addColumnIfMissing('crm_ticket_comments', 'is_internal', 'TINYINT(1) NOT NULL DEFAULT 0');
+            yield addColumnIfMissing('crm_ticket_comments', 'attachments', 'LONGTEXT NULL');
+            yield conn.query(`
       CREATE TABLE IF NOT EXISTS crm_lead_stages (
         id VARCHAR(36) PRIMARY KEY,
         name VARCHAR(100) NOT NULL,
@@ -4322,7 +4845,7 @@ function initDB() {
     `).catch((e) => console.warn('⚠️ crm_activities creation failed:', e.message));
             // Seed default CRM stages if empty
             const [existingStages] = yield conn.query(`SELECT COUNT(*) as c FROM crm_lead_stages`).catch(() => [[{ c: 1 }]]);
-            if (((_d = existingStages[0]) === null || _d === void 0 ? void 0 : _d.c) === 0) {
+            if (((_f = existingStages[0]) === null || _f === void 0 ? void 0 : _f.c) === 0) {
                 const { randomUUID: uuidv4 } = require('crypto');
                 const defaultStages = [
                     { id: uuidv4(), name: 'عميل محتمل', color: '#6366f1', sortOrder: 0 },
@@ -4366,6 +4889,69 @@ function initDB() {
         INDEX idx_crm_ticket_comments_ticket (ticket_id)
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     `).catch((e) => console.warn('⚠️ crm_ticket_comments creation failed:', e.message));
+            // CRM Complaints (قسم الشكاوى) tables
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_complaints (
+        id VARCHAR(36) PRIMARY KEY,
+        complaint_number VARCHAR(50) UNIQUE NOT NULL,
+        partner_id VARCHAR(36),
+        partner_name VARCHAR(255),
+        partner_phone VARCHAR(50),
+        subject VARCHAR(255) NOT NULL,
+        description TEXT NOT NULL,
+        type ENUM('PRODUCT_QUALITY', 'SERVICE_DELAY', 'EMPLOYEE_BEHAVIOR', 'FINANCIAL_ERROR', 'PACKAGING_ISSUE', 'OTHER') DEFAULT 'OTHER',
+        severity ENUM('LOW', 'MEDIUM', 'HIGH', 'CRITICAL') DEFAULT 'MEDIUM',
+        status ENUM('NEW', 'UNDER_REVIEW', 'INVESTIGATING', 'RESOLVED', 'REJECTED', 'CLOSED') DEFAULT 'NEW',
+        source ENUM('PHONE', 'WHATSAPP', 'EMAIL', 'WALK_IN', 'WEBSITE', 'OTHER') DEFAULT 'PHONE',
+        assigned_to VARCHAR(36),
+        created_by VARCHAR(36),
+        resolved_at DATETIME,
+        resolved_by VARCHAR(36),
+        resolution_summary TEXT,
+        client_mood ENUM('ANGRY', 'UPSET', 'NEUTRAL', 'SATISFIED') DEFAULT 'UPSET',
+        satisfaction_rating INT,
+        compensation_type ENUM('NONE', 'CREDIT_NOTE', 'REFUND', 'REPLACEMENT', 'REPAIR', 'DISCOUNT_VOUCHER', 'LOYALTY_POINTS', 'FREE_GIFT', 'FREE_SERVICE', 'OTHER') DEFAULT 'NONE',
+        compensation_amount DECIMAL(15,2) DEFAULT 0.00,
+        root_cause TEXT,
+        invoice_id VARCHAR(36),
+        attachments LONGTEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_crm_complaints_partner (partner_id),
+        INDEX idx_crm_complaints_status (status),
+        INDEX idx_crm_complaints_number (complaint_number)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_complaints creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_complaint_comments (
+        id VARCHAR(36) PRIMARY KEY,
+        complaint_id VARCHAR(36) NOT NULL,
+        user_id VARCHAR(36) NOT NULL,
+        content TEXT NOT NULL,
+        is_internal TINYINT(1) DEFAULT 1,
+        attachments LONGTEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_crm_complaint_comments_complaint (complaint_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_complaint_comments creation failed:', e.message));
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS crm_complaint_compensations (
+        id VARCHAR(36) PRIMARY KEY,
+        complaint_id VARCHAR(36) NOT NULL,
+        partner_id VARCHAR(36),
+        type ENUM('CREDIT_NOTE', 'REFUND', 'REPLACEMENT', 'DISCOUNT_VOUCHER', 'LOYALTY_POINTS', 'OTHER') NOT NULL,
+        amount DECIMAL(15,2) DEFAULT 0.00,
+        status ENUM('PENDING', 'APPROVED', 'REJECTED') DEFAULT 'PENDING',
+        approved_by VARCHAR(36),
+        approved_at DATETIME,
+        posted_invoice_id VARCHAR(36),
+        notes TEXT,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_crm_comp_status (status),
+        INDEX idx_crm_comp_complaint (complaint_id),
+        INDEX idx_crm_comp_partner (partner_id)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    `).catch((e) => console.warn('⚠️ crm_complaint_compensations creation failed:', e.message));
             // ── Knowledge Base articles table (user-facing FAQ system) ──
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS kb_articles (
@@ -4457,6 +5043,8 @@ function initDB() {
                 // Stock Taking Sessions — scoped by branch
                 conn.query(`ALTER TABLE stock_taking_sessions ADD COLUMN IF NOT EXISTS branchId VARCHAR(36) DEFAULT NULL COMMENT 'فرع الجرد'`).catch(() => { }),
                 conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_taking_sessions_branchId ON stock_taking_sessions(branchId)`).catch(() => { }),
+                conn.query(`ALTER TABLE stock_taking_sessions ADD COLUMN IF NOT EXISTS categoryId VARCHAR(36) DEFAULT NULL COMMENT 'التصنيف المختار للجرد'`).catch(() => { }),
+                conn.query(`CREATE INDEX IF NOT EXISTS idx_stock_taking_sessions_categoryId ON stock_taking_sessions(categoryId)`).catch(() => { }),
             ]);
             console.log('✅ Branch isolation v2 columns and indexes applied');
             // SCHEMA VERSION TRACKING
@@ -4581,6 +5169,39 @@ function initDB() {
             catch (e) {
                 console.error('Failed to populate product_variant_stocks:', e);
             }
+            // ── Salary Rules for Deductions & Rewards (خصومات ومكافآت) ──
+            try {
+                yield conn.query(`
+          CREATE TABLE IF NOT EXISTS hr_salary_rules (
+            id VARCHAR(36) PRIMARY KEY,
+            name VARCHAR(100) NOT NULL,
+            nameEn VARCHAR(100),
+            type ENUM('EARNING', 'DEDUCTION') NOT NULL,
+            calculationType ENUM('FIXED', 'PERCENTAGE') DEFAULT 'FIXED',
+            amount DECIMAL(15,2) NOT NULL DEFAULT 0,
+            componentId VARCHAR(36),
+            notes TEXT,
+            isActive BOOLEAN DEFAULT TRUE,
+            createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updatedAt DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (componentId) REFERENCES salary_components(id) ON DELETE SET NULL,
+            INDEX idx_rules_type (type),
+            INDEX idx_rules_active (isActive)
+          ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `);
+                console.log('✅ hr_salary_rules table created');
+            }
+            catch (rulesErr) {
+                console.error('Failed to create hr_salary_rules table:', rulesErr === null || rulesErr === void 0 ? void 0 : rulesErr.message);
+            }
+            try {
+                yield conn.query(`ALTER TABLE additional_salary_entries ADD COLUMN IF NOT EXISTS ruleId VARCHAR(36)`).catch(() => { });
+                yield conn.query(`ALTER TABLE additional_salary_entries ADD CONSTRAINT fk_ase_rule FOREIGN KEY (ruleId) REFERENCES hr_salary_rules(id) ON DELETE SET NULL`).catch(() => { });
+                console.log('✅ ruleId column and foreign key constraint added to additional_salary_entries');
+            }
+            catch (aseRuleErr) {
+                console.warn('Failed to alter additional_salary_entries table:', aseRuleErr === null || aseRuleErr === void 0 ? void 0 : aseRuleErr.message);
+            }
             // ── WhatsApp Cloud API tables (v71) ──
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS whatsapp_settings (
@@ -4618,6 +5239,68 @@ function initDB() {
         INDEX idx_wa_log_wamid (wamid)
       )
     `).catch(() => { });
+            // ── Chat Widget Updates (v76) ──
+            try {
+                yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS reactions JSON NULL`);
+                yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS replyTo JSON NULL`);
+                yield conn.query(`ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS attachment JSON NULL`);
+                console.log('✅ Chat messages reactions, replyTo, and attachment columns ensured');
+            }
+            catch (chatColErr) {
+                console.warn('⚠️ Chat columns creation error:', chatColErr === null || chatColErr === void 0 ? void 0 : chatColErr.message);
+            }
+            // ── Sync bank balances trigger (v79) ──
+            try {
+                yield conn.query('DROP TRIGGER IF EXISTS trg_sync_bank_balance');
+                yield conn.query(`
+        CREATE TRIGGER trg_sync_bank_balance
+        AFTER UPDATE ON accounts
+        FOR EACH ROW
+        BEGIN
+          IF OLD.balance <> NEW.balance OR OLD.openingBalance <> NEW.openingBalance THEN
+            UPDATE banks 
+            SET balance = NEW.balance 
+            WHERE accountId = NEW.id;
+          END IF;
+        END
+      `);
+                console.log('✅ Created trigger trg_sync_bank_balance to auto-sync bank balances');
+            }
+            catch (triggerErr) {
+                console.warn('⚠️ Trigger creation failed (ignoring for backward compatibility/privileges):', triggerErr.message);
+            }
+            // Migration: Map display names in createdBy to usernames for invoices, journal_entries, cheques, and stock_permits
+            try {
+                console.log('🔄 Mapping display names in createdBy to usernames for invoices, journal_entries, cheques, and stock_permits...');
+                yield conn.query(`
+        UPDATE invoices i
+        JOIN users u ON i.createdBy = u.name
+        SET i.createdBy = u.username
+        WHERE i.createdBy IS NOT NULL AND i.createdBy != ''
+      `);
+                yield conn.query(`
+        UPDATE journal_entries j
+        JOIN users u ON j.createdBy = u.name
+        SET j.createdBy = u.username
+        WHERE j.createdBy IS NOT NULL AND j.createdBy != ''
+      `);
+                yield conn.query(`
+        UPDATE cheques c
+        JOIN users u ON c.createdBy = u.name
+        SET c.createdBy = u.username
+        WHERE c.createdBy IS NOT NULL AND c.createdBy != ''
+      `);
+                yield conn.query(`
+        UPDATE stock_permits s
+        JOIN users u ON s.createdBy = u.name
+        SET s.createdBy = u.username
+        WHERE s.createdBy IS NOT NULL AND s.createdBy != ''
+      `);
+                console.log('✅ Successfully completed createdBy username mapping migration.');
+            }
+            catch (migErr) {
+                console.warn('⚠️ CreatedBy username mapping migration warning:', migErr.message);
+            }
             yield conn.query(`
       INSERT INTO schema_meta (\`key\`, value) VALUES ('schema_version', ?)
       ON DUPLICATE KEY UPDATE value = VALUES(value), updated_at = CURRENT_TIMESTAMP
@@ -4633,6 +5316,7 @@ function initDB() {
             yield fixDirtyInvoiceNumbers();
             yield syncBankBalancesToGL();
             yield syncProductCostsFromPurchases();
+            yield syncBranchChatGroups(conn);
         }
         catch (err) {
             console.error("Error initializing database:", err);
@@ -4650,6 +5334,7 @@ function initDB() {
  */
 function seedInitialData() {
     return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b;
         let conn;
         try {
             conn = yield exports.pool.getConnection();
@@ -4667,6 +5352,12 @@ function seedInitialData() {
             else {
                 console.log('Accounts table already contains ' + accountCount + ' records, skipping seed');
             }
+            // Ensure Round Off account 511 exists
+            yield conn.query(`
+      INSERT INTO accounts (id, code, name, type, balance, openingBalance)
+      VALUES ('511', '511', 'فروق التقريب', 'EXPENSE', 0, 0)
+      ON DUPLICATE KEY UPDATE name = VALUES(name)
+    `);
             // Check if system_config is empty
             const [configRows] = yield conn.query('SELECT COUNT(*) as count FROM system_config');
             const configCount = configRows[0].count;
@@ -4798,6 +5489,84 @@ function seedInitialData() {
         INDEX idx_recon_journal (journalEntryId)
       )
     `).catch(() => { });
+            // ========================================
+            // Auto-migrate Permissions (Granular 598 Update)
+            // ========================================
+            try {
+                const [permRows] = yield conn.query('SELECT COUNT(*) as count FROM permissions');
+                const permCount = permRows[0].count;
+                const [crmCheck] = yield conn.query("SELECT COUNT(*) as count FROM permissions WHERE id = 'crm.leads.view'");
+                const hasCrmLeadsView = crmCheck[0].count > 0;
+                const [rulesCheck] = yield conn.query("SELECT COUNT(*) as count FROM permissions WHERE id = 'hr.rules.view'");
+                const hasHrRulesView = rulesCheck[0].count > 0;
+                if (permCount < 530 || !hasCrmLeadsView || !hasHrRulesView) {
+                    console.log(`\n[Auto-Migration] Found ${permCount} permissions (crm.leads.view exists: ${hasCrmLeadsView}, hr.rules.view exists: ${hasHrRulesView}). Running updatePermissions script...`);
+                    const { execSync } = require('child_process');
+                    const path = require('path');
+                    const fs = require('fs');
+                    const jsScriptPath = path.join(__dirname, 'scripts', 'updatePermissions.js');
+                    const tsScriptPath = path.join(__dirname, 'scripts', 'updatePermissions.ts');
+                    if (fs.existsSync(jsScriptPath)) {
+                        console.log(`[Auto-Migration] Executing: node ${jsScriptPath}`);
+                        execSync(`node "${jsScriptPath}"`, { stdio: 'inherit' });
+                    }
+                    else if (fs.existsSync(tsScriptPath)) {
+                        // Dev environment
+                        console.log(`[Auto-Migration] Executing: npx ts-node ${tsScriptPath}`);
+                        execSync(`npx ts-node "${tsScriptPath}"`, { stdio: 'inherit' });
+                    }
+                    else {
+                        console.warn('[Auto-Migration] Could not find updatePermissions script. Please run manually.');
+                    }
+                }
+            }
+            catch (permErr) {
+                console.warn('⚠️ Permission auto-migration check failed:', permErr.message);
+            }
+            // ========================================
+            // SEED: CRM Stages & Lost Reasons
+            // ========================================
+            try {
+                const [stageRows] = yield conn.query('SELECT COUNT(*) as count FROM crm_stages');
+                const stageCount = ((_a = stageRows[0]) === null || _a === void 0 ? void 0 : _a.count) || 0;
+                if (stageCount === 0) {
+                    console.log('🌱 [Auto-Seeding] Seeding default Arabic CRM stages...');
+                    const { randomUUID: uuidv4 } = require('crypto');
+                    const defaultStages = [
+                        { id: uuidv4(), name: 'جديد', sequence: 10, is_won: 0 },
+                        { id: uuidv4(), name: 'مؤهل', sequence: 20, is_won: 0 },
+                        { id: uuidv4(), name: 'تقديم عرض', sequence: 30, is_won: 0 },
+                        { id: uuidv4(), name: 'تفاوض', sequence: 40, is_won: 0 },
+                        { id: uuidv4(), name: 'ناجح', sequence: 50, is_won: 1 },
+                    ];
+                    for (const stage of defaultStages) {
+                        yield conn.query('INSERT INTO crm_stages (id, name, sequence, is_won, is_collapsed) VALUES (?, ?, ?, ?, 0)', [stage.id, stage.name, stage.sequence, stage.is_won]);
+                    }
+                    // Backfill stage_id for leads that do not have one
+                    const firstStageId = defaultStages[0].id;
+                    const [updateResult] = yield conn.query('UPDATE crm_leads SET stage_id = ? WHERE stage_id IS NULL', [firstStageId]);
+                    console.log(`🌱 [Auto-Seeding] Seeded default stages. Backfilled ${updateResult.affectedRows} leads.`);
+                }
+            }
+            catch (crmStageErr) {
+                console.warn('⚠️ CRM stage seeding/backfilling failed:', crmStageErr.message);
+            }
+            try {
+                const [reasonRows] = yield conn.query('SELECT COUNT(*) as count FROM crm_lost_reasons');
+                const reasonCount = ((_b = reasonRows[0]) === null || _b === void 0 ? void 0 : _b.count) || 0;
+                if (reasonCount === 0) {
+                    console.log('🌱 [Auto-Seeding] Seeding default CRM lost reasons...');
+                    const { randomUUID: uuidv4 } = require('crypto');
+                    const reasons = ['سعر مرتفع', 'نقص المهارات/الموظفين', 'نقص المخزون', 'المنافسين'];
+                    for (const r of reasons) {
+                        yield conn.query('INSERT INTO crm_lost_reasons (id, name) VALUES (?, ?)', [uuidv4(), r]);
+                    }
+                    console.log('🌱 [Auto-Seeding] Seeded default lost reasons.');
+                }
+            }
+            catch (crmReasonErr) {
+                console.warn('⚠️ CRM lost reason seeding failed:', crmReasonErr.message);
+            }
         }
         catch (err) {
             console.error("Error seeding initial data:", err);
@@ -5208,6 +5977,57 @@ function syncProductCostsFromPurchases() {
         finally {
             if (conn)
                 conn.release();
+        }
+    });
+}
+/**
+ * Automatically synchronize company-wide global chat groups and branch-specific groups.
+ * Ensures every active branch has a corresponding chat room and users are auto-enrolled.
+ */
+function syncBranchChatGroups(connection) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const conn = connection || (yield exports.pool.getConnection());
+        try {
+            // 1. Create or sync global group
+            yield conn.query(`
+      INSERT INTO chat_groups (id, name, description, type, createdBy)
+      VALUES ('global-chat', 'الدردشة العامة (الجميع)', 'الدردشة الجماعية لجميع موظفي الشركة', 'GLOBAL', 'System')
+      ON DUPLICATE KEY UPDATE name = VALUES(name)
+    `);
+            // 2. Fetch all branches
+            const [branches] = yield conn.query('SELECT id, name FROM branches');
+            for (const branch of branches) {
+                const branchGroupId = `branch-${branch.id}`;
+                const branchGroupName = `مجموعة فرع: ${branch.name}`;
+                yield conn.query(`
+        INSERT INTO chat_groups (id, name, description, type, branchId, createdBy)
+        VALUES (?, ?, ?, 'BRANCH', ?, 'System')
+        ON DUPLICATE KEY UPDATE name = VALUES(name)
+      `, [branchGroupId, branchGroupName, `مجموعة الدردشة المخصصة لفرع ${branch.name}`, branch.id]);
+            }
+            // 3. Add members to global group (all users)
+            yield conn.query(`
+      INSERT IGNORE INTO chat_group_members (groupId, userId)
+      SELECT 'global-chat', id FROM users WHERE isHidden = FALSE OR isHidden IS NULL
+    `);
+            // 4. Add members to branch groups
+            for (const branch of branches) {
+                const branchGroupId = `branch-${branch.id}`;
+                yield conn.query(`
+        INSERT IGNORE INTO chat_group_members (groupId, userId)
+        SELECT ?, id FROM users
+        WHERE branchId = ? AND (isHidden = FALSE OR isHidden IS NULL)
+      `, [branchGroupId, branch.id]);
+            }
+            console.log('✅ Chat groups and memberships auto-synchronized successfully.');
+        }
+        catch (error) {
+            console.error('⚠️ Error syncing branch chat groups:', (error === null || error === void 0 ? void 0 : error.message) || error);
+        }
+        finally {
+            if (!connection && conn) {
+                conn.release();
+            }
         }
     });
 }

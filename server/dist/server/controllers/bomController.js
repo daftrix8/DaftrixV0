@@ -75,7 +75,7 @@ const calculateAndUpdateProductCost = (bomId, connection) => __awaiter(void 0, v
 // Get all BOMs with optional filters
 const getBOMs = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const { productId, isActive } = req.query;
+        const { productId, isActive, showArchived } = req.query;
         let query = `
             SELECT b.*, 
                    p.name as finished_product_name,
@@ -103,6 +103,9 @@ const getBOMs = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             query += ' AND b.is_active = ?';
             params.push(isActive === 'true' ? 1 : 0);
         }
+        if (showArchived !== 'true') {
+            query += ' AND (b.is_archived = 0 OR b.is_archived IS NULL)';
+        }
         query += ' GROUP BY b.id ORDER BY b.created_at DESC';
         const [rows] = yield db_1.pool.query(query, params);
         // Convert snake_case to camelCase
@@ -114,6 +117,7 @@ const getBOMs = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             name: row.name,
             version: row.version,
             isActive: row.is_active === 1,
+            isArchived: row.is_archived === 1,
             laborCost: row.labor_cost,
             overheadCost: row.overhead_cost,
             notes: row.notes,
@@ -296,21 +300,38 @@ const updateBOM = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         yield connection.beginTransaction();
         const { id } = req.params;
-        const { finishedProductId, name, laborCost, overheadCost, notes, isActive, items } = req.body;
+        const { finishedProductId, name, laborCost, overheadCost, notes, isActive, isArchived, items } = req.body;
+        const nameVal = name !== undefined ? name : null;
+        const laborCostVal = laborCost !== undefined ? laborCost : null;
+        const overheadCostVal = overheadCost !== undefined ? overheadCost : null;
+        const notesVal = notes !== undefined ? notes : null;
+        const isActiveVal = isActive !== undefined ? (isActive ? 1 : 0) : null;
+        const isArchivedVal = isArchived !== undefined ? (isArchived ? 1 : 0) : null;
         // Update BOM header (including finishedProductId if provided)
         if (finishedProductId) {
             yield connection.query(`
                 UPDATE bom 
-                SET finished_product_id = ?, name = ?, labor_cost = ?, overhead_cost = ?, notes = ?, is_active = ?
+                SET finished_product_id = ?, 
+                    name = COALESCE(?, name), 
+                    labor_cost = COALESCE(?, labor_cost), 
+                    overhead_cost = COALESCE(?, overhead_cost), 
+                    notes = COALESCE(?, notes), 
+                    is_active = COALESCE(?, is_active),
+                    is_archived = COALESCE(?, is_archived)
                 WHERE id = ?
-            `, [finishedProductId, name, laborCost, overheadCost, notes, isActive, id]);
+            `, [finishedProductId, nameVal, laborCostVal, overheadCostVal, notesVal, isActiveVal, isArchivedVal, id]);
         }
         else {
             yield connection.query(`
                 UPDATE bom 
-                SET name = ?, labor_cost = ?, overhead_cost = ?, notes = ?, is_active = ?
+                SET name = COALESCE(?, name), 
+                    labor_cost = COALESCE(?, labor_cost), 
+                    overhead_cost = COALESCE(?, overhead_cost), 
+                    notes = COALESCE(?, notes), 
+                    is_active = COALESCE(?, is_active),
+                    is_archived = COALESCE(?, is_archived)
                 WHERE id = ?
-            `, [name, laborCost, overheadCost, notes, isActive, id]);
+            `, [nameVal, laborCostVal, overheadCostVal, notesVal, isActiveVal, isArchivedVal, id]);
         }
         // If items provided, replace all items
         if (items) {

@@ -27,6 +27,7 @@ router.get('/flow-report', (0, authMiddleware_1.requirePermission)('inventory.vi
 router.get('/reports/profits', (0, authMiddleware_1.requirePermission)('inventory.view'), inventoryController_1.getItemProfitsReport);
 router.get('/reports/variable-pricing', (0, authMiddleware_1.requirePermission)('inventory.view'), inventoryController_1.getVariablePricingReport);
 router.get('/reports/stagnant-items', (0, authMiddleware_1.requirePermission)('inventory.view'), inventoryController_1.getStagnantItemsReport);
+router.get('/reports/supplier-inventory-payments', (0, authMiddleware_1.requirePermission)('inventory.view'), inventoryController_1.getSupplierInventoryPaymentsReport);
 // Server-side stock valuation — replaces client-side limit=999999 product fetch
 router.get('/stock-valuation', (0, authMiddleware_1.requirePermission)('inventory.view'), inventoryController_1.getStockValuation);
 // Product Inquiry - stock, grades, reservations
@@ -81,73 +82,216 @@ router.get('/debug-variant-stock/:productId', (0, authMiddleware_1.requirePermis
 router.get('/historical-balance', (0, authMiddleware_1.requirePermission)('inventory.view'), (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     let conn;
     try {
-        const { date } = req.query;
+        const { date, categoryId, warehouseId } = req.query;
         if (!date)
             return res.status(400).json({ error: 'التاريخ مطلوب' });
         const { getConnection } = require('../db');
         conn = yield getConnection();
-        // FIX: Append time boundary so a date like '2026-05-08' captures the full day
-        // Without this, DATETIME columns like '2026-05-08 14:30:00' would be EXCLUDED
-        // because '2026-05-08 14:30:00' > '2026-05-08' (which MySQL treats as '2026-05-08 00:00:00')
-        const dateEndOfDay = `${date} 23:59:59`;
-        // Check if product_variants table exists for embeddedVariantCount
-        let embeddedVariantSelect = ', 0 AS embeddedVariantCount';
+        // Check if product_variants table exists for parent product aggregation
+        let hasVariantsTable = false;
         try {
             const [pvCheck] = yield conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'product_variants' AND TABLE_SCHEMA = DATABASE() LIMIT 1`);
-            if (pvCheck.length > 0) {
-                embeddedVariantSelect = ', (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) AS embeddedVariantCount';
+            hasVariantsTable = pvCheck.length > 0;
+        }
+        catch ( /* ignore */_a) { /* ignore */ }
+        // Build product query with optional filters, aggregating variants under parents if table exists
+        const productParams = [];
+        let productQuery = '';
+        if (hasVariantsTable) {
+            productQuery = `
+                SELECT * FROM (
+                    -- 1. Standard products (no active variants)
+                    SELECT 
+                        p.id, p.name, p.sku, p.price, p.cost, 
+                        COALESCE(ps.totalStock, 0) AS currentStock, 
+                        p.categoryId, p.warehouseId, p.isActive, p.minStock, p.barcode,
+                        p.type, p.unit, 0 AS isVariant, NULL AS parentProductId,
+                        0 AS embeddedVariantCount
+                    FROM products p
+                    LEFT JOIN (
+                        SELECT productId, SUM(stock) as totalStock 
+                        FROM product_stocks 
+                        GROUP BY productId
+                    ) ps ON p.id = ps.productId
+                    WHERE p.isActive = 1 
+                      AND NOT EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1)
+                    
+                    UNION ALL
+                    
+                    -- 2. Parent products with active variants aggregated
+                    SELECT 
+                        p.id, p.name, p.sku, 
+                        -- Weighted average price from variants
+                        COALESCE(
+                            CASE WHEN SUM(COALESCE(pvs.totalStock, 0)) > 0 
+                                 THEN SUM(COALESCE(pvs.totalStock, 0) * COALESCE(NULLIF(pv.sellingPrice, 0), p.price, 0)) / SUM(COALESCE(pvs.totalStock, 0))
+                                 ELSE AVG(COALESCE(NULLIF(pv.sellingPrice, 0), p.price, 0))
+                            END, 0
+                        ) AS price,
+                        -- Weighted average cost from variants
+                        COALESCE(
+                            CASE WHEN SUM(COALESCE(pvs.totalStock, 0)) > 0 
+                                 THEN SUM(COALESCE(pvs.totalStock, 0) * COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0)) / SUM(COALESCE(pvs.totalStock, 0))
+                                 ELSE AVG(COALESCE(NULLIF(pv.purchasePrice, 0), p.cost, 0))
+                            END, 0
+                        ) AS cost,
+                        -- Aggregated current stock
+                        SUM(COALESCE(pvs.totalStock, 0)) AS currentStock, 
+                        p.categoryId, p.warehouseId, p.isActive, p.minStock, p.barcode,
+                        p.type, p.unit, 0 AS isVariant, NULL AS parentProductId,
+                        COUNT(pv.id) AS embeddedVariantCount
+                    FROM products p
+                    JOIN product_variants pv ON pv.productId = p.id AND pv.isActive = 1
+                    LEFT JOIN (
+                        SELECT variantId, SUM(stock) as totalStock 
+                        FROM product_variant_stocks 
+                        GROUP BY variantId
+                    ) pvs ON pv.id = pvs.variantId
+                    WHERE p.isActive = 1
+                    GROUP BY p.id, p.name, p.sku, p.categoryId, p.warehouseId, p.isActive, p.minStock, p.barcode, p.type, p.unit
+                ) AS items WHERE isActive = 1
+            `;
+        }
+        else {
+            productQuery = `
+                SELECT 
+                    p.id, p.name, p.sku, p.price, p.cost, 
+                    COALESCE(ps.totalStock, 0) AS currentStock, 
+                    p.categoryId, p.warehouseId, p.isActive, p.minStock, p.barcode,
+                    p.type, p.unit, 0 AS isVariant, NULL AS parentProductId,
+                    0 AS embeddedVariantCount
+                FROM products p
+                LEFT JOIN (
+                    SELECT productId, SUM(stock) as totalStock 
+                    FROM product_stocks 
+                    GROUP BY productId
+                ) ps ON p.id = ps.productId
+                WHERE p.isActive = 1
+            `;
+        }
+        if (categoryId && categoryId !== 'ALL') {
+            productQuery += ` AND categoryId = ?`;
+            productParams.push(categoryId);
+        }
+        const [products] = yield conn.query(productQuery, productParams);
+        // Determine if the requested date is today or future
+        // If so, read from product_stocks directly (guaranteed match with current report)
+        const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+        const isCurrentOrFuture = date >= today;
+        let stockMap;
+        if (isCurrentOrFuture) {
+            // ═══════════════════════════════════════════════════════════════
+            // DATE >= TODAY: Read from product_stocks (excluding variant parent products)
+            // and read individual variant stock from product_variant_stocks (aggregated to parent ID)
+            // ═══════════════════════════════════════════════════════════════
+            let stockQuery = `
+                SELECT ps.productId, ps.warehouseId, ps.stock
+                FROM product_stocks ps
+                INNER JOIN warehouses w ON ps.warehouseId = w.id
+                WHERE ps.warehouseId IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = ps.productId AND pv.isActive = 1)
+            `;
+            const stockParams = [];
+            if (warehouseId && warehouseId !== 'ALL') {
+                stockQuery += ` AND ps.warehouseId = ?`;
+                stockParams.push(warehouseId);
+            }
+            if (categoryId && categoryId !== 'ALL') {
+                stockQuery += ` AND EXISTS (SELECT 1 FROM products p WHERE p.id = ps.productId AND p.categoryId = ?)`;
+                stockParams.push(categoryId);
+            }
+            stockQuery += `
+                UNION ALL
+                
+                SELECT pv.productId as productId, pvs.warehouseId, pvs.stock
+                FROM product_variant_stocks pvs
+                INNER JOIN product_variants pv ON pvs.variantId = pv.id
+                INNER JOIN warehouses w ON pvs.warehouseId = w.id
+                WHERE pvs.warehouseId IS NOT NULL AND pv.isActive = 1
+            `;
+            const variantParams = [];
+            if (warehouseId && warehouseId !== 'ALL') {
+                stockQuery += ` AND pvs.warehouseId = ?`;
+                variantParams.push(warehouseId);
+            }
+            if (categoryId && categoryId !== 'ALL') {
+                stockQuery += ` AND EXISTS (SELECT 1 FROM products p WHERE p.id = pv.productId AND p.categoryId = ?)`;
+                variantParams.push(categoryId);
+            }
+            const [productStocks] = yield conn.query(stockQuery, [...stockParams, ...variantParams]);
+            stockMap = new Map();
+            for (const ps of productStocks) {
+                const qty = parseFloat(ps.stock) || 0;
+                if (qty === 0)
+                    continue;
+                if (!stockMap.has(ps.productId))
+                    stockMap.set(ps.productId, new Map());
+                const currentQty = stockMap.get(ps.productId).get(ps.warehouseId) || 0;
+                stockMap.get(ps.productId).set(ps.warehouseId, currentQty + qty);
             }
         }
-        catch ( /* table check failed — use default 0 */_a) { /* table check failed — use default 0 */ }
-        // Get all products 
-        const [products] = yield conn.query(`
-            SELECT p.id, p.name, p.sku, p.price, p.cost, p.stock as currentStock, 
-                   p.categoryId, p.warehouseId, p.isActive, p.minStock, p.barcode,
-                   p.type, p.unit${embeddedVariantSelect}
-            FROM products p
-        `);
-        // Sum all movements up to the date from the unified stock_movements table
-        // MUST match the same exclusions as recalculate engine (Phase 1 & 2) AND movement card
-        // to prevent drift between historical view, current view, and movement card
-        const [movements] = yield conn.query(`
-            SELECT 
-                product_id as productId,
-                warehouse_id as warehouseId,
-                SUM(qty_change) as netMovement
-            FROM stock_movements
-            WHERE movement_date <= ?
-              AND (reference_type IS NULL OR reference_type NOT IN ('VAN_SALE', 'BALANCE_SYNC', 'SYSTEM_ADJUSTMENT'))
-              AND (notes IS NULL OR notes NOT LIKE '%بيع متنقل%')
-            GROUP BY product_id, warehouse_id
-        `, [dateEndOfDay]);
-        conn.release();
-        // Build stock map: productId -> { warehouseId -> netQty }
-        const stockMap = new Map();
-        for (const m of movements) {
-            if (!stockMap.has(m.productId))
-                stockMap.set(m.productId, new Map());
-            const whMap = stockMap.get(m.productId);
-            const whId = m.warehouseId || 'ALL';
-            whMap.set(whId, (whMap.get(whId) || 0) + Number(m.netMovement));
+        else {
+            // ═══════════════════════════════════════════════════════════════
+            // DATE IN PAST: Compute from stock_movements up to that date
+            // Must match recalculate engine Phase 1 exactly:
+            // - INNER JOIN products (skip orphaned)
+            // - warehouse_id IS NOT NULL
+            // - Exclude: VAN_SALE, BALANCE_SYNC, SYSTEM_ADJUSTMENT, بيع متنقل
+            // - SYSTEM_ADJUSTMENT excluded because Phase 0 deletes them
+            // ═══════════════════════════════════════════════════════════════
+            const dateEndOfDayISO = `${date}T23:59:59.999Z`;
+            const dateEndOfDaySQL = `${date} 23:59:59`;
+            let movementQuery = `
+                SELECT 
+                    sm.product_id as productId,
+                    sm.warehouse_id as warehouseId,
+                    SUM(sm.qty_change) as netMovement
+                FROM stock_movements sm
+                INNER JOIN products p ON sm.product_id = p.id
+                WHERE sm.warehouse_id IS NOT NULL
+                  AND (sm.movement_date IS NULL OR sm.movement_date <= ? OR sm.movement_date <= ?)
+                  AND (sm.reference_type IS NULL OR sm.reference_type NOT IN ('VAN_SALE', 'BALANCE_SYNC', 'SYSTEM_ADJUSTMENT'))
+                  AND (sm.notes IS NULL OR sm.notes NOT LIKE '%بيع متنقل%')
+            `;
+            const movementParams = [dateEndOfDayISO, dateEndOfDaySQL];
+            if (warehouseId && warehouseId !== 'ALL') {
+                movementQuery += ` AND sm.warehouse_id = ?`;
+                movementParams.push(warehouseId);
+            }
+            if (categoryId && categoryId !== 'ALL') {
+                movementQuery += ` AND p.categoryId = ?`;
+                movementParams.push(categoryId);
+            }
+            movementQuery += ` GROUP BY sm.product_id, sm.warehouse_id`;
+            const [movements] = yield conn.query(movementQuery, movementParams);
+            // Get valid warehouse IDs
+            const [validWarehouses] = yield conn.query('SELECT id FROM warehouses');
+            const validWarehouseIds = new Set(validWarehouses.map((w) => w.id));
+            stockMap = new Map();
+            for (const m of movements) {
+                if (!m.warehouseId || !validWarehouseIds.has(m.warehouseId))
+                    continue;
+                if (!m.productId)
+                    continue;
+                const qty = Number(parseFloat(m.netMovement).toFixed(5));
+                if (qty === 0)
+                    continue;
+                if (!stockMap.has(m.productId))
+                    stockMap.set(m.productId, new Map());
+                stockMap.get(m.productId).set(m.warehouseId, (stockMap.get(m.productId).get(m.warehouseId) || 0) + qty);
+            }
         }
-        // Build results: each product with its historical stock
+        conn.release();
+        // Build results: each product with its historical stock per warehouse
         const results = [];
         for (const p of products) {
             const whMap = stockMap.get(p.id);
-            if (whMap) {
-                // Return breakdown per warehouse if there are movements
+            if (whMap && whMap.size > 0) {
                 let totalStock = 0;
                 whMap.forEach((qty) => { totalStock += qty; });
-                // FIX: Build warehouse stocks array excluding NULL-warehouse entries
-                // The 'ALL' bucket captures movements with no warehouse_id assigned.
-                // We include it in the total but don't create a phantom warehouse row for it.
                 const warehouseStocks = Array.from(whMap.entries())
-                    .filter(([whId]) => whId !== 'ALL')
+                    .filter(([, qty]) => qty !== 0)
                     .map(([whId, qty]) => ({ warehouseId: whId, stock: qty }));
-                // If product only has NULL-warehouse movements, still include them as a single entry
-                if (warehouseStocks.length === 0 && totalStock !== 0) {
-                    warehouseStocks.push({ warehouseId: p.warehouseId || 'ALL', stock: totalStock });
-                }
                 results.push(Object.assign(Object.assign({}, p), { stock: totalStock, warehouseStocks, historicalDate: date }));
             }
             else {

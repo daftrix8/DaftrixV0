@@ -1,0 +1,12 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const budgetController_1 = require("../controllers/budgetController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const router = (0, express_1.Router)();
+router.get('/', (0, authMiddleware_1.requirePermission)('accounting.view'), budgetController_1.getBudgets);
+router.post('/', (0, authMiddleware_1.requirePermission)('accounting.manage'), budgetController_1.createBudget);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('accounting.manage'), budgetController_1.updateBudget);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('accounting.manage'), budgetController_1.deleteBudget);
+router.get('/variance', (0, authMiddleware_1.requirePermission)('accounting.view'), budgetController_1.getBudgetVariance);
+exports.default = router;

@@ -69,7 +69,7 @@ function fetchPromotionsWithRules(conn_1) {
             const existing = rulesByPromoId.get(rule.promotionId) || [];
             rulesByPromoId.set(rule.promotionId, [...existing, rule]);
         }
-        return promotions.map(p => (Object.assign(Object.assign({}, p), { isCombainable: Boolean(p.isCombainable), discountValue: Number(p.discountValue), maxUsageTotal: p.maxUsageTotal !== null ? Number(p.maxUsageTotal) : null, maxUsagePerCustomer: p.maxUsagePerCustomer !== null ? Number(p.maxUsagePerCustomer) : null, priority: Number(p.priority), usageCount: Number(p.usageCount), rules: rulesByPromoId.get(p.id) || [] })));
+        return promotions.map(p => (Object.assign(Object.assign({}, p), { isCombainable: Boolean(p.isCombainable), discountValue: Number(p.discountValue), maxUsageTotal: p.maxUsageTotal !== null ? Number(p.maxUsageTotal) : null, maxUsagePerCustomer: p.maxUsagePerCustomer !== null ? Number(p.maxUsagePerCustomer) : null, priority: Number(p.priority), usageCount: Number(p.usageCount), maxDiscountAmount: p.maxDiscountAmount !== null && p.maxDiscountAmount !== undefined ? Number(p.maxDiscountAmount) : null, rules: rulesByPromoId.get(p.id) || [] })));
     });
 }
 /** Count how many times a specific customer has used a promotion. */
@@ -118,7 +118,7 @@ const createPromotion = (req, res) => __awaiter(void 0, void 0, void 0, function
     var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { name, type, trigger = 'AUTO', couponCode, discountValue, discountType = 'PERCENT', maxUsageTotal, maxUsagePerCustomer, isCombainable = false, priority = 10, startDate, endDate, rules = [], } = req.body;
+        const { name, type, trigger = 'AUTO', couponCode, discountValue, discountType = 'PERCENT', maxUsageTotal, maxUsagePerCustomer, isCombainable = false, priority = 10, startDate, endDate, rules = [], maxDiscountAmount, } = req.body;
         const userName = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
         if (!name || name.trim().length < 2) {
             return res.status(400).json({ error: 'اسم العرض مطلوب (حرفين على الأقل)' });
@@ -145,8 +145,8 @@ const createPromotion = (req, res) => __awaiter(void 0, void 0, void 0, function
         yield conn.query(`INSERT INTO promotions 
              (id, name, type, status, \`trigger\`, couponCode, discountValue, discountType,
               maxUsageTotal, maxUsagePerCustomer, isCombainable, priority,
-              startDate, endDate, createdAt, createdBy)
-             VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+              startDate, endDate, createdAt, createdBy, maxDiscountAmount)
+             VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
             id, name.trim(), type, trigger,
             trigger === 'COUPON_CODE' ? couponCode.trim().toUpperCase() : null,
             discountValue, discountType,
@@ -155,6 +155,7 @@ const createPromotion = (req, res) => __awaiter(void 0, void 0, void 0, function
             isCombainable ? 1 : 0, priority,
             startDate || null, endDate || null,
             now, userName,
+            maxDiscountAmount !== undefined ? maxDiscountAmount : null,
         ]);
         // Insert rules
         for (const rule of rules) {
@@ -191,7 +192,7 @@ const updatePromotion = (req, res) => __awaiter(void 0, void 0, void 0, function
         const allowedFields = [
             'name', 'type', 'status', 'trigger', 'couponCode',
             'discountValue', 'discountType', 'maxUsageTotal', 'maxUsagePerCustomer',
-            'isCombainable', 'priority', 'startDate', 'endDate',
+            'isCombainable', 'priority', 'startDate', 'endDate', 'maxDiscountAmount',
         ];
         yield conn.beginTransaction();
         const setClauses = [];

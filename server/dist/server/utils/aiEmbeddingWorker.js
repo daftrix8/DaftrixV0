@@ -18,6 +18,9 @@ let isProcessing = false;
 let consecutiveFailures = 0;
 const MAX_CONSECUTIVE_FAILURES = 5; // Stop worker after 5 consecutive failures
 function startEmbeddingWorker() {
+    if (process.env.ENABLE_SEMANTIC_SEARCH !== 'true') {
+        return;
+    }
     if (embeddingInterval)
         return;
     console.log('🤖 AI Background Worker started. Waiting for server idle to process missing vectors...');

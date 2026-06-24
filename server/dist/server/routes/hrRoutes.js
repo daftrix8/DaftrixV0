@@ -8,6 +8,7 @@ const hrController_1 = require("../controllers/hrController");
 const fingerprintController_1 = require("../controllers/fingerprintController");
 const hrDocumentsController_1 = require("../controllers/hrDocumentsController");
 const smartAttendanceController_1 = require("../controllers/smartAttendanceController");
+const trainingController_1 = require("../controllers/trainingController");
 const multer_1 = __importDefault(require("multer"));
 const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
@@ -32,17 +33,43 @@ const hrDocsUpload = (0, multer_1.default)({
         cb(null, allowed.includes(file.mimetype));
     },
 });
+// ── Multer setup for Employee Avatars ────────────────────────────────
+const empAvatarDir = path_1.default.join(process.cwd(), 'uploads', 'employees');
+if (!fs_1.default.existsSync(empAvatarDir))
+    fs_1.default.mkdirSync(empAvatarDir, { recursive: true });
+const empAvatarStorage = multer_1.default.diskStorage({
+    destination: (_req, _file, cb) => cb(null, empAvatarDir),
+    filename: (_req, file, cb) => {
+        const ext = path_1.default.extname(file.originalname);
+        cb(null, `avatar-${Date.now()}-${Math.random().toString(36).slice(2)}${ext}`);
+    },
+});
+const empAvatarUpload = (0, multer_1.default)({
+    storage: empAvatarStorage,
+    limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+    fileFilter: (_req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/webp'];
+        if (allowed.includes(file.mimetype)) {
+            cb(null, true);
+        }
+        else {
+            cb(new Error('Only images are allowed (JPEG, PNG, WEBP)'));
+        }
+    },
+});
 const router = express_1.default.Router();
 // Employees
 router.get('/employees', (0, authMiddleware_1.requirePermission)('hr.view'), hrController_1.getEmployees);
 router.post('/employees', (0, authMiddleware_1.requirePermission)('hr.manage'), hrController_1.createEmployee);
 router.put('/employees/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), hrController_1.updateEmployee);
 router.delete('/employees/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), hrController_1.deleteEmployee);
+router.post('/employees/:id/avatar', (0, authMiddleware_1.requirePermission)('hr.manage'), empAvatarUpload.single('avatar'), hrController_1.uploadEmployeeAvatar);
 // Attendance
 router.get('/attendance', (0, authMiddleware_1.requirePermission)('hr.attendance'), hrController_1.getAttendance);
 router.post('/attendance', (0, authMiddleware_1.requirePermission)('hr.attendance'), hrController_1.recordAttendance);
 // Payroll
 router.get('/payroll', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.getPayrollCycles);
+router.get('/payroll/:id', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.getPayrollCycle);
 router.post('/payroll', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.createPayrollCycle);
 router.get('/payroll/:payrollId/entries', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.getPayrollEntries);
 router.delete('/payroll/:id', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.deletePayrollCycle);
@@ -154,6 +181,13 @@ router.post('/additional-salary/:id/cancel', (0, authMiddleware_1.requirePermiss
 router.post('/additional-salary/bulk-approve', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.bulkApproveAdditionalSalary);
 router.get('/additional-salary/stats', (0, authMiddleware_1.requirePermission)('hr.payroll'), hrController_1.getAdditionalSalaryStats);
 // ==========================================
+// Deductions & Rewards Rules (خصومات ومكافآت)
+// ==========================================
+router.get('/salary-rules', (0, authMiddleware_1.requirePermission)('hr.rules.view'), hrController_1.getSalaryRules);
+router.post('/salary-rules', (0, authMiddleware_1.requirePermission)('hr.rules.manage'), hrController_1.createSalaryRule);
+router.put('/salary-rules/:id', (0, authMiddleware_1.requirePermission)('hr.rules.manage'), hrController_1.updateSalaryRule);
+router.delete('/salary-rules/:id', (0, authMiddleware_1.requirePermission)('hr.rules.manage'), hrController_1.deleteSalaryRule);
+// ==========================================
 // Beast Mode: GL Integration
 // ==========================================
 router.get('/payroll-gl-mappings', (0, authMiddleware_1.requirePermission)('hr.gl_mappings'), hrController_1.getPayrollGLMappings);
@@ -170,21 +204,22 @@ router.delete('/rule-categories/:id', (0, authMiddleware_1.requirePermission)('h
 // ==========================================
 // Fingerprint Device Integration
 // ==========================================
-router.get('/fingerprint/devices', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.getDevices);
-router.post('/fingerprint/devices', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.createDevice);
-router.put('/fingerprint/devices/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.updateDevice);
-router.delete('/fingerprint/devices/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.deleteDevice);
-router.post('/fingerprint/devices/:id/test', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.testConnection);
-router.get('/fingerprint/devices/:id/users', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.getDeviceUserList);
+router.get('/fingerprint/overview', (0, authMiddleware_1.requirePermission)('hr.biometric.view'), fingerprintController_1.getOverview);
+router.get('/fingerprint/devices', (0, authMiddleware_1.requirePermission)('hr.biometric.view'), fingerprintController_1.getDevices);
+router.post('/fingerprint/devices', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.createDevice);
+router.put('/fingerprint/devices/:id', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.updateDevice);
+router.delete('/fingerprint/devices/:id', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.deleteDevice);
+router.post('/fingerprint/devices/:id/test', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.testConnection);
+router.get('/fingerprint/devices/:id/users', (0, authMiddleware_1.requirePermission)('hr.biometric.view'), fingerprintController_1.getDeviceUserList);
 // Fingerprint Employee Mapping
-router.get('/fingerprint/devices/:id/mappings', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.getMappings);
-router.post('/fingerprint/devices/:id/mappings', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.saveMappings);
-router.delete('/fingerprint/mappings/:mappingId', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.deleteMapping);
-router.get('/fingerprint/devices/:id/suggest-mappings', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.suggestMappings);
+router.get('/fingerprint/devices/:id/mappings', (0, authMiddleware_1.requirePermission)('hr.biometric.view'), fingerprintController_1.getMappings);
+router.post('/fingerprint/devices/:id/mappings', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.saveMappings);
+router.delete('/fingerprint/mappings/:mappingId', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.deleteMapping);
+router.get('/fingerprint/devices/:id/suggest-mappings', (0, authMiddleware_1.requirePermission)('hr.biometric.view'), fingerprintController_1.suggestMappings);
 // Fingerprint Attendance Sync
-router.post('/fingerprint/devices/:id/sync', (0, authMiddleware_1.requirePermission)('hr.attendance'), fingerprintController_1.syncDevice);
-router.post('/fingerprint/sync-all', (0, authMiddleware_1.requirePermission)('hr.attendance'), fingerprintController_1.syncAllDevices);
-router.get('/fingerprint/devices/:id/sync-history', (0, authMiddleware_1.requirePermission)('hr.manage'), fingerprintController_1.getSyncHistory);
+router.post('/fingerprint/devices/:id/sync', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.syncDevice);
+router.post('/fingerprint/sync-all', (0, authMiddleware_1.requirePermission)('hr.biometric.edit'), fingerprintController_1.syncAllDevices);
+router.get('/fingerprint/devices/:id/sync-history', (0, authMiddleware_1.requirePermission)('hr.biometric.view'), fingerprintController_1.getSyncHistory);
 // ==========================================
 // HR Documents & Contracts
 // ==========================================
@@ -213,19 +248,58 @@ router.delete('/documents/:id/attachment', (0, authMiddleware_1.requirePermissio
 // ==========================================
 // Employee self-service punch (any authenticated user with employee link)
 router.post('/smart-attendance/punch', smartAttendanceController_1.punchCheckIn);
+router.post('/smart-attendance/punch-bulk', smartAttendanceController_1.punchBulkCheckIn);
 router.get('/smart-attendance/my-status', smartAttendanceController_1.getMyStatus);
-// HR review queue
-router.get('/smart-attendance/pending-reviews', (0, authMiddleware_1.requirePermission)('hr.attendance'), smartAttendanceController_1.listPendingReviews);
-router.post('/smart-attendance/review/:punchId', (0, authMiddleware_1.requirePermission)('hr.attendance'), smartAttendanceController_1.reviewPunchAction);
+// HR review & audit queue
+router.get('/smart-attendance/audit', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getAudit);
+router.get('/smart-attendance/pending-reviews', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.listPendingReviews);
+router.post('/smart-attendance/review/:punchId', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.reviewPunchAction);
+router.put('/smart-attendance/reset-device/:employeeId', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.resetEmployeeDevice);
 // Analytics
-router.get('/smart-attendance/stats', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.getStats);
+router.get('/smart-attendance/stats', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getStats);
+router.get('/smart-attendance/branch-qr/:branchId', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.generateBranchQr);
 // Geofence locations (admin only)
-router.get('/smart-attendance/locations', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.listLocations);
-router.get('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.getLocation);
-router.post('/smart-attendance/locations', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.addLocation);
-router.put('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.editLocation);
-router.delete('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.removeLocation);
+router.get('/smart-attendance/locations', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.listLocations);
+router.get('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getLocation);
+router.post('/smart-attendance/locations', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.addLocation);
+router.put('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.editLocation);
+router.delete('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.removeLocation);
 // User↔Employee linking (admin only)
-router.get('/smart-attendance/user-employee-links', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.getUserEmployeeLinks);
-router.put('/smart-attendance/link-employee', (0, authMiddleware_1.requirePermission)('hr.manage'), smartAttendanceController_1.linkUserToEmployee);
+router.get('/smart-attendance/user-employee-links', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getUserEmployeeLinks);
+router.put('/smart-attendance/link-employee', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.linkUserToEmployee);
+router.post('/smart-attendance/auto-match', (0, authMiddleware_1.requirePermission)('hr.smart_register.edit'), smartAttendanceController_1.autoMatchUsersAndEmployees);
+// ==========================================
+// Training Module (المنهج التدريبي)
+// ==========================================
+// Programs
+router.get('/training/programs', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.getTrainingPrograms);
+router.get('/training/programs/:id', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.getTrainingProgram);
+router.post('/training/programs', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.createTrainingProgram);
+router.put('/training/programs/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.updateTrainingProgram);
+router.delete('/training/programs/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.deleteTrainingProgram);
+// Chapters
+router.post('/training/chapters', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.createTrainingChapter);
+router.put('/training/chapters/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.updateTrainingChapter);
+router.delete('/training/chapters/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.deleteTrainingChapter);
+// Topics
+router.post('/training/topics', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.createTrainingTopic);
+router.put('/training/topics/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.updateTrainingTopic);
+router.delete('/training/topics/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.deleteTrainingTopic);
+// Questions
+router.post('/training/questions', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.createTrainingQuestion);
+router.put('/training/questions/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.updateTrainingQuestion);
+router.delete('/training/questions/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.deleteTrainingQuestion);
+// Enrollments
+router.post('/training/enroll', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.enrollEmployee);
+router.post('/training/enroll/bulk', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.bulkEnrollEmployees);
+router.get('/training/employee/:employeeId/enrollments', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.getEmployeeEnrollments);
+router.get('/training/programs/:programId/enrollments', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.getProgramEnrollments);
+router.delete('/training/enrollments/:id', (0, authMiddleware_1.requirePermission)('hr.training.manage'), trainingController_1.removeEnrollment);
+// Progress
+router.post('/training/progress', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.markTopicComplete);
+router.get('/training/progress/:enrollmentId', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.getEnrollmentProgress);
+// Quiz
+router.post('/training/quiz/submit', (0, authMiddleware_1.requirePermission)('hr.training'), trainingController_1.submitQuizAnswers);
+// Dashboard / Reports
+router.get('/training/dashboard', (0, authMiddleware_1.requirePermission)('hr.training.report'), trainingController_1.getTrainingDashboard);
 exports.default = router;

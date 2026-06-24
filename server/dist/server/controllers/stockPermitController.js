@@ -52,7 +52,7 @@ const getDispatchPermitByInvoice = (req, res) => __awaiter(void 0, void 0, void 
             return res.status(404).json({ message: 'إذن الصرف غير موجود' });
         }
         const permit = permits[0];
-        const [items] = yield conn.query('SELECT productId, productName, quantity, cost FROM stock_permit_items WHERE permitId = ?', [permitId]);
+        const [items] = yield conn.query('SELECT productId, productName, quantity, cost, variantId, variantLabel FROM stock_permit_items WHERE permitId = ?', [permitId]);
         permit.items = items;
         conn.release();
         res.json(permit);
@@ -120,8 +120,20 @@ const getStockPermits = (req, res) => __awaiter(void 0, void 0, void 0, function
         // Get total count
         const [countResult] = yield conn.query(`SELECT COUNT(*) as total FROM stock_permits ${whereClause}`, params);
         const total = countResult[0].total;
+        // Dynamic Sorting Support
+        const sortBy = req.query.sortBy;
+        const sortOrder = req.query.sortOrder;
+        const allowedSortCols = {
+            number: 'id',
+            date: 'date',
+            warehouse: 'COALESCE(sourceWarehouseId, destWarehouseId)',
+            description: 'description',
+            createdBy: 'createdBy'
+        };
+        const sortCol = allowedSortCols[sortBy] || 'date';
+        const sortDir = (sortOrder === null || sortOrder === void 0 ? void 0 : sortOrder.toUpperCase()) === 'ASC' ? 'ASC' : 'DESC';
         // Get paginated permits
-        const [permits] = yield conn.query(`SELECT * FROM stock_permits ${whereClause} ORDER BY date DESC, createdAt DESC LIMIT ? OFFSET ?`, [...params, limit, offset]);
+        const [permits] = yield conn.query(`SELECT * FROM stock_permits ${whereClause} ORDER BY ${sortCol} ${sortDir}, createdAt ${sortDir} LIMIT ? OFFSET ?`, [...params, limit, offset]);
         // Get items for each permit (batch query for better performance)
         if (permits.length > 0) {
             const permitIds = permits.map(p => p.id);
@@ -196,10 +208,27 @@ const getStockPermitById = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.getStockPermitById = getStockPermitById;
 // Create new stock permit
 const createStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
-    const { id, date, type, sourceWarehouseId, destWarehouseId, description, items } = req.body;
+    var _a, _b, _c, _d;
+    const { id, date, type, sourceWarehouseId, destWarehouseId, description, posShiftId, items } = req.body;
     if (!date || !type || !items || items.length === 0) {
         return res.status(400).json({ message: 'Missing required fields' });
+    }
+    // === ITEM QUANTITY GUARDS ===
+    for (const item of items) {
+        const qty = Number(item.quantity);
+        if (!isFinite(qty) || qty <= 0) {
+            return res.status(400).json({
+                code: 'INVALID_QUANTITY',
+                message: `الكمية يجب أن تكون أكبر من صفر لكل بند`,
+            });
+        }
+    }
+    // === SAME-WAREHOUSE TRANSFER GUARD ===
+    if (type === 'STOCK_TRANSFER' && sourceWarehouseId && destWarehouseId && sourceWarehouseId === destWarehouseId) {
+        return res.status(400).json({
+            code: 'SAME_WAREHOUSE_TRANSFER',
+            message: 'لا يمكن تحويل المخزون من مستودع إلى نفسه',
+        });
     }
     // === TIMEZONE-SAFE DATE NORMALIZATION ===
     // The frontend sends YYYY-MM-DD but MySQL may interpret it as UTC midnight,
@@ -238,6 +267,53 @@ const createStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 return res.status(403).json({ message: validationResult.error, errorCode: validationResult.errorCode });
             }
         }
+        // === PRODUCT EXISTENCE CHECK ===
+        for (const item of items) {
+            if (!item.productId) {
+                yield conn.rollback();
+                conn.release();
+                return res.status(400).json({ code: 'MISSING_PRODUCT_ID', message: 'معرّف المنتج مطلوب لكل بند' });
+            }
+            const [prodRows] = yield conn.query('SELECT id FROM products WHERE id = ? LIMIT 1', [item.productId]);
+            if (prodRows.length === 0) {
+                yield conn.rollback();
+                conn.release();
+                return res.status(404).json({ code: 'PRODUCT_NOT_FOUND', message: `المنتج غير موجود: ${item.productId}` });
+            }
+        }
+        // === DESTINATION WAREHOUSE EXISTENCE CHECK (for transfers) ===
+        if (type === 'STOCK_TRANSFER' && destWarehouseId) {
+            const [whRows] = yield conn.query('SELECT id FROM warehouses WHERE id = ? LIMIT 1', [destWarehouseId]);
+            if (whRows.length === 0) {
+                yield conn.rollback();
+                conn.release();
+                return res.status(404).json({ code: 'WAREHOUSE_NOT_FOUND', message: `المستودع الوجهة غير موجود: ${destWarehouseId}` });
+            }
+        }
+        // === STOCK SUFFICIENCY GUARD (PERMIT_OUT and TRANSFER) ===
+        // Hard invariant: rejects any outbound permit that would push global stock negative.
+        // Respects systemConfig.allowNegativeStock when set (real server path).
+        // policyEnforcement also enforces this when systemConfig is present, but we guard
+        // here too so the check fires even when systemConfig is absent (e.g. tests).
+        const isNegativeStockAllowed = systemConfig ? Number(systemConfig.allowNegativeStock) === 1 : false;
+        if ((type === 'STOCK_PERMIT_OUT' || type === 'STOCK_TRANSFER') && !isNegativeStockAllowed) {
+            for (const item of items) {
+                const qty = Number(item.quantity);
+                // FOR UPDATE: locks the product row for the duration of this transaction.
+                // This prevents concurrent permit-out operations from both reading the same
+                // stock value and both passing the check (race condition / double-spend).
+                const [stockRows] = yield conn.query('SELECT stock FROM products WHERE id = ? LIMIT 1 FOR UPDATE', [item.productId]);
+                const currentStock = Number((_b = (_a = stockRows[0]) === null || _a === void 0 ? void 0 : _a.stock) !== null && _b !== void 0 ? _b : 0);
+                if (currentStock - qty < 0) {
+                    yield conn.rollback();
+                    conn.release();
+                    return res.status(403).json({
+                        code: 'INSUFFICIENT_STOCK',
+                        message: `الكمية المطلوبة (${qty}) تتجاوز المخزون المتاح (${currentStock}) للمنتج: ${item.productId}`,
+                    });
+                }
+            }
+        }
         // === SERVER-SIDE SEQUENTIAL ID GENERATION ===
         // Always generate IDs server-side for clean, sequential numbering.
         // Frontend-generated IDs (random suffixes like STO-624179) are ignored.
@@ -247,7 +323,18 @@ const createStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const permitId = yield (0, invoiceNumberGenerator_1.generateNextSequentialNumber)(conn, prefix, 'stock_permits', 'id');
         // PERF: console.log(`🔢 [createStockPermit] Generated sequential ID: ${permitId}`);
         const branchId = (0, branchFilter_1.resolveBranchIdForWrite)(req);
-        yield conn.query('INSERT INTO stock_permits (id, date, type, sourceWarehouseId, destWarehouseId, description, createdBy, branchId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [permitId, safeDate, type, sourceWarehouseId || null, destWarehouseId || null, description, createdBy, branchId]);
+        try {
+            yield conn.query('INSERT INTO stock_permits (id, date, type, sourceWarehouseId, destWarehouseId, description, posShiftId, createdBy, branchId) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [permitId, safeDate, type, sourceWarehouseId || null, destWarehouseId || null, description, posShiftId || null, createdBy, branchId]);
+        }
+        catch (insertErr) {
+            // Fallback: client DB may not have posShiftId column (migration 058 not applied)
+            if (insertErr.errno === 1054) {
+                yield conn.query('INSERT INTO stock_permits (id, date, type, sourceWarehouseId, destWarehouseId, description, createdBy, branchId) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [permitId, safeDate, type, sourceWarehouseId || null, destWarehouseId || null, description, createdBy, branchId]);
+            }
+            else {
+                throw insertErr;
+            }
+        }
         // === PERF: BATCH INSERT items (1 query instead of N) ===
         const itemValues = items.map((item) => {
             const qty = Number(Number(item.quantity).toFixed(5));
@@ -494,7 +581,7 @@ const createStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
         }
         yield conn.commit();
         // Log audit trail
-        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || ((_b = req.user) === null || _b === void 0 ? void 0 : _b.username) || req.body.user || 'System';
+        const user = ((_c = req.user) === null || _c === void 0 ? void 0 : _c.name) || ((_d = req.user) === null || _d === void 0 ? void 0 : _d.username) || req.body.user || 'System';
         const itemCount = items.length;
         yield (0, auditController_1.logAction)(user, 'INVENTORY', 'CREATE_PERMIT', `Created ${type} Permit #${permitId} `, `Items: ${itemCount}, Desc: ${description || 'N/A'} `);
         // Fetch the created permit with items
@@ -572,7 +659,7 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
             }
         }
         // Get old items to reverse stock
-        const [oldItems] = yield conn.query('SELECT productId, quantity, source_warehouse_id as sourceWarehouseId, dest_warehouse_id as destWarehouseId FROM stock_permit_items WHERE permitId = ?', [id]);
+        const [oldItems] = yield conn.query('SELECT productId, variantId, quantity, source_warehouse_id as sourceWarehouseId, dest_warehouse_id as destWarehouseId FROM stock_permit_items WHERE permitId = ?', [id]);
         // STEP 1: Reverse OLD Stock Updates (warehouse-level + global)
         for (const item of oldItems) {
             const qty = Number(item.quantity) || 0;
@@ -581,12 +668,20 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock - ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, permit.destWarehouseId]);
                 // Reverse global stock
                 yield conn.query('UPDATE products SET stock = ROUND(stock - ?, 5) WHERE id = ?', [qty, item.productId]);
+                if (item.variantId) {
+                    yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock - ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, permit.destWarehouseId]);
+                    yield conn.query('UPDATE product_variants SET stock = ROUND(stock - ?, 5) WHERE id = ?', [qty, item.variantId]);
+                }
             }
             else if (permit.type === 'STOCK_PERMIT_OUT' && permit.sourceWarehouseId) {
                 // Was OUT, so increase stock in source
                 yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock + ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, permit.sourceWarehouseId]);
                 // Reverse global stock
                 yield conn.query('UPDATE products SET stock = ROUND(stock + ?, 5) WHERE id = ?', [qty, item.productId]);
+                if (item.variantId) {
+                    yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock + ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, permit.sourceWarehouseId]);
+                    yield conn.query('UPDATE product_variants SET stock = ROUND(stock + ?, 5) WHERE id = ?', [qty, item.variantId]);
+                }
             }
             else if (permit.type === 'STOCK_TRANSFER') {
                 // Was TRANSFER - reverse both (net-zero globally, no products.stock change)
@@ -595,9 +690,15 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 const oldItemDest = item.destWarehouseId || permit.destWarehouseId;
                 if (oldItemSrc) {
                     yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock + ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, oldItemSrc]);
+                    if (item.variantId) {
+                        yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock + ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, oldItemSrc]);
+                    }
                 }
                 if (oldItemDest) {
                     yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock - ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, oldItemDest]);
+                    if (item.variantId) {
+                        yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock - ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, oldItemDest]);
+                    }
                 }
             }
         }
@@ -607,7 +708,10 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
         // STEP 3: Update permit header
         const newSourceWH = sourceWarehouseId !== undefined ? sourceWarehouseId : permit.sourceWarehouseId;
         const newDestWH = destWarehouseId !== undefined ? destWarehouseId : permit.destWarehouseId;
-        yield conn.query('UPDATE stock_permits SET date = ?, description = ?, sourceWarehouseId = ?, destWarehouseId = ?, updatedAt = NOW() WHERE id = ?', [date || permit.date, description !== undefined ? description : permit.description, newSourceWH, newDestWH, id]);
+        // === TIMEZONE-SAFE DATE NORMALIZATION (same as createStockPermit) ===
+        const rawDate = date || permit.date;
+        const safeUpdateDate = typeof rawDate === 'string' ? rawDate.split('T')[0] : new Date(rawDate).toISOString().split('T')[0];
+        yield conn.query('UPDATE stock_permits SET date = ?, description = ?, sourceWarehouseId = ?, destWarehouseId = ?, updatedAt = NOW() WHERE id = ?', [safeUpdateDate, description !== undefined ? description : permit.description, newSourceWH, newDestWH, id]);
         // Remove old journal entry
         const [oldJournals] = yield conn.query('SELECT id FROM journal_entries WHERE referenceId = ?', [id]);
         for (const je of oldJournals) {
@@ -620,9 +724,9 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
             const itemValues = items.map((item) => {
                 const qty = Number(Number(item.quantity).toFixed(5));
                 const cost = Number(Number(item.cost || 0).toFixed(2));
-                return [id, item.productId, item.productName || item.name, qty, cost, item.sourceWarehouseId || null, item.destWarehouseId || null];
+                return [id, item.productId, item.productName || item.name, qty, cost, item.sourceWarehouseId || null, item.destWarehouseId || null, item.variantId || null, item.variantLabel || null];
             });
-            yield conn.query('INSERT INTO stock_permit_items (permitId, productId, productName, quantity, cost, source_warehouse_id, dest_warehouse_id) VALUES ?', [itemValues]);
+            yield conn.query('INSERT INTO stock_permit_items (permitId, productId, productName, quantity, cost, source_warehouse_id, dest_warehouse_id, variantId, variantLabel) VALUES ?', [itemValues]);
             // === PERF: BATCH warehouse stock updates (product_stocks) ===
             const productStockValues = [];
             for (const item of items) {
@@ -648,6 +752,36 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                      VALUES(?, ?, ?, ?) 
                      ON DUPLICATE KEY UPDATE stock = ROUND(stock ${sign} ?, 5)`, row);
             }
+            // === VARIANT STOCK: Update product_variant_stocks per warehouse ===
+            for (const item of items) {
+                if (!item.variantId)
+                    continue;
+                const qty = Number(Number(item.quantity).toFixed(5));
+                if (permit.type === 'STOCK_PERMIT_IN' && newDestWH) {
+                    yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), item.variantId, item.productId, newDestWH, qty, qty]);
+                }
+                else if (permit.type === 'STOCK_PERMIT_OUT' && newSourceWH) {
+                    yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                         VALUES (?, ?, ?, ?, ?)
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), item.variantId, item.productId, newSourceWH, -qty, qty]);
+                }
+                else if (permit.type === 'STOCK_TRANSFER') {
+                    const itemSrc = item.sourceWarehouseId || newSourceWH;
+                    const itemDest = item.destWarehouseId || newDestWH;
+                    if (itemSrc) {
+                        yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                             VALUES (?, ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), item.variantId, item.productId, itemSrc, -qty, qty]);
+                    }
+                    if (itemDest) {
+                        yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                             VALUES (?, ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), item.variantId, item.productId, itemDest, qty, qty]);
+                    }
+                }
+            }
             // === PERF: BATCH global products.stock update (CASE WHEN) ===
             if (permit.type !== 'STOCK_TRANSFER') {
                 const stockSign = permit.type === 'STOCK_PERMIT_IN' ? 1 : -1;
@@ -667,28 +801,48 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                     }
                     yield conn.query(`UPDATE products SET stock = CASE ${cases.join(' ')} ELSE stock END WHERE id IN (?)`, [...caseParams, productIds]);
                 }
+                // Also update product_variants.stock (global variant stock)
+                const variantStockMap = new Map();
+                for (const item of items) {
+                    if (!item.variantId)
+                        continue;
+                    const qty = Number(Number(item.quantity).toFixed(5));
+                    variantStockMap.set(item.variantId, (variantStockMap.get(item.variantId) || 0) + qty * stockSign);
+                }
+                if (variantStockMap.size > 0) {
+                    const vCases = [];
+                    const vParams = [];
+                    const variantIds = [];
+                    for (const [variantId, change] of variantStockMap) {
+                        vCases.push('WHEN id = ? THEN ROUND(COALESCE(stock, 0) + ?, 5)');
+                        vParams.push(variantId, change);
+                        variantIds.push(variantId);
+                    }
+                    yield conn.query(`UPDATE product_variants SET stock = CASE ${vCases.join(' ')} ELSE stock END WHERE id IN (?)`, [...vParams, variantIds]);
+                }
             }
             // === PERF: BATCH stock_movements INSERT ===
             const movementValues = [];
             for (const item of items) {
                 const qty = Number(Number(item.quantity).toFixed(5));
+                const variantId = item.variantId || null;
                 if (permit.type === 'STOCK_PERMIT_IN') {
-                    movementValues.push([item.productId, newDestWH, qty, 'ADJUSTMENT', permit.type, id, `Stock Permit #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date]);
+                    movementValues.push([item.productId, newDestWH, qty, 'ADJUSTMENT', permit.type, id, `Stock Permit #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date, variantId]);
                 }
                 else if (permit.type === 'STOCK_PERMIT_OUT') {
-                    movementValues.push([item.productId, newSourceWH, -qty, 'ADJUSTMENT', permit.type, id, `Stock Permit #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date]);
+                    movementValues.push([item.productId, newSourceWH, -qty, 'ADJUSTMENT', permit.type, id, `Stock Permit #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date, variantId]);
                 }
                 else if (permit.type === 'STOCK_TRANSFER') {
                     const itemSrc = item.sourceWarehouseId || newSourceWH;
                     const itemDest = item.destWarehouseId || newDestWH;
                     if (itemSrc)
-                        movementValues.push([item.productId, itemSrc, -qty, 'TRANSFER_OUT', 'STOCK_TRANSFER', id, `Stock Transfer #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date]);
+                        movementValues.push([item.productId, itemSrc, -qty, 'TRANSFER_OUT', 'STOCK_TRANSFER', id, `Stock Transfer #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date, variantId]);
                     if (itemDest)
-                        movementValues.push([item.productId, itemDest, qty, 'TRANSFER_IN', 'STOCK_TRANSFER', id, `Stock Transfer #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date]);
+                        movementValues.push([item.productId, itemDest, qty, 'TRANSFER_IN', 'STOCK_TRANSFER', id, `Stock Transfer #${id.substring(0, 8)} - ${item.productName || 'Item'}`, permit.date, variantId]);
                 }
             }
             if (movementValues.length > 0) {
-                yield conn.query('INSERT INTO stock_movements (product_id, warehouse_id, qty_change, movement_type, reference_type, reference_id, notes, movement_date) VALUES ?', [movementValues]);
+                yield conn.query('INSERT INTO stock_movements (product_id, warehouse_id, qty_change, movement_type, reference_type, reference_id, notes, movement_date, variant_id) VALUES ?', [movementValues]);
             }
         }
         // === AUTO-POST JOURNAL ENTRY FOR UPDATED STOCK PERMIT ===
@@ -778,7 +932,7 @@ const deleteStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
         }
         const permit = permits[0];
         // Get items to reverse stock
-        const [items] = yield conn.query('SELECT productId, quantity, source_warehouse_id as sourceWarehouseId, dest_warehouse_id as destWarehouseId FROM stock_permit_items WHERE permitId = ?', [id]);
+        const [items] = yield conn.query('SELECT productId, variantId, quantity, source_warehouse_id as sourceWarehouseId, dest_warehouse_id as destWarehouseId FROM stock_permit_items WHERE permitId = ?', [id]);
         // Reverse Stock Updates (warehouse-level + global)
         for (const item of items) {
             const qty = Number(item.quantity) || 0;
@@ -787,12 +941,22 @@ const deleteStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock - ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, permit.destWarehouseId]);
                 // Reverse global stock
                 yield conn.query('UPDATE products SET stock = ROUND(stock - ?, 5) WHERE id = ?', [qty, item.productId]);
+                // Reverse variant stock
+                if (item.variantId) {
+                    yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock - ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, permit.destWarehouseId]);
+                    yield conn.query('UPDATE product_variants SET stock = ROUND(stock - ?, 5) WHERE id = ?', [qty, item.variantId]);
+                }
             }
             else if (permit.type === 'STOCK_PERMIT_OUT' && permit.sourceWarehouseId) {
                 // Was OUT, so increase stock in source
                 yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock + ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, permit.sourceWarehouseId]);
                 // Reverse global stock
                 yield conn.query('UPDATE products SET stock = ROUND(stock + ?, 5) WHERE id = ?', [qty, item.productId]);
+                // Reverse variant stock
+                if (item.variantId) {
+                    yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock + ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, permit.sourceWarehouseId]);
+                    yield conn.query('UPDATE product_variants SET stock = ROUND(stock + ?, 5) WHERE id = ?', [qty, item.variantId]);
+                }
             }
             else if (permit.type === 'STOCK_TRANSFER') {
                 // Was TRANSFER (net-zero globally, no products.stock change)
@@ -802,10 +966,16 @@ const deleteStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 // 1. Increase stock in source (Reverse OUT)
                 if (itemSrc) {
                     yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock + ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, itemSrc]);
+                    if (item.variantId) {
+                        yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock + ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, itemSrc]);
+                    }
                 }
                 // 2. Decrease stock in destination (Reverse IN)
                 if (itemDest) {
                     yield conn.query(`UPDATE product_stocks SET stock = ROUND(stock - ?, 5) WHERE productId = ? AND warehouseId = ? `, [qty, item.productId, itemDest]);
+                    if (item.variantId) {
+                        yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock - ?, 5) WHERE variantId = ? AND warehouseId = ? `, [qty, item.variantId, itemDest]);
+                    }
                 }
             }
         }

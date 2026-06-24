@@ -41,37 +41,56 @@ const crypto_1 = require("crypto");
  * @returns      - Full formatted invoice number, e.g. 'INV-00003'
  */
 function generateNextSequentialNumber(conn_1, prefix_1) {
-    return __awaiter(this, arguments, void 0, function* (conn, prefix, tableName = 'invoices', columnName = 'number') {
+    return __awaiter(this, arguments, void 0, function* (conn, prefix, tableName = 'invoices', columnName = 'number', branchId = null) {
         const PAD = 5; // e.g. 00001
         const expectedLength = prefix.length + PAD; // e.g. 'INV-' (4) + 5 = 9
         let candidate = 1;
-        try {
-            // PERF v2: Use LIKE + LENGTH instead of REGEXP for index-friendly queries.
-            // LIKE 'INV-%' uses the B-tree prefix of idx_invoices_number_unique.
-            // LENGTH = expectedLength filters out trash records like 'INV-TRASH-xyz' or 'INV-00021-abc123'.
-            // SUBSTRING extracts the numeric part after the prefix.
-            const likePattern = `${prefix}%`;
-            const prefixLen = prefix.length;
-            const [rows] = yield conn.query(`SELECT MAX(CAST(SUBSTRING(??, ${prefixLen + 1}) AS UNSIGNED)) AS maxNum
-             FROM ??
-             WHERE ?? LIKE ? AND LENGTH(??) = ?`, [
-                columnName,
-                tableName,
-                columnName,
-                likePattern,
-                columnName,
-                expectedLength
-            ]);
-            if (rows.length > 0 && rows[0].maxNum != null) {
-                candidate = Number(rows[0].maxNum) + 1;
-                console.log(`🔢 [SeqGen] MAX for "${prefix}" in ${tableName}: ${rows[0].maxNum} → candidate: ${candidate}`);
+        const likePattern = `${prefix}%`;
+        const prefixLen = prefix.length;
+        // Step 1: Lock the branch row (or fallback to system_config row/table limits)
+        // to strictly serialize concurrent requests even when the table is empty.
+        if (branchId) {
+            try {
+                yield conn.query('SELECT id FROM branches WHERE id = ? FOR UPDATE', [branchId]);
+            }
+            catch (lockErr) {
+                console.warn(`⚠️ Branch lock failed (non-fatal):`, lockErr.message);
+                try {
+                    yield conn.query('SELECT config FROM system_config LIMIT 1 FOR UPDATE');
+                }
+                catch (_a) {
+                    yield conn.query(`SELECT ?? FROM ?? LIMIT 1 FOR UPDATE`, [columnName, tableName]).catch(() => { });
+                }
             }
         }
-        catch (err) {
-            console.warn(`[SeqGen] MAX query failed for "${prefix}" in ${tableName}, falling back to candidate=1.`, err);
+        else {
+            try {
+                yield conn.query('SELECT config FROM system_config LIMIT 1 FOR UPDATE');
+            }
+            catch (_b) {
+                yield conn.query(`SELECT ?? FROM ?? LIMIT 1 FOR UPDATE`, [columnName, tableName]).catch(() => { });
+            }
         }
-        // Guard loop: confirm candidate is truly free (handles concurrent inserts)
-        // MAX+1 almost always succeeds on first try, so this rarely loops.
+        // Step 2: Lock the highest existing row for this prefix to serialize concurrent reads.
+        // If no rows exist yet, this returns nothing and candidate stays at 1.
+        yield conn.query(`SELECT ?? FROM ?? WHERE ?? LIKE ? AND LENGTH(??) = ? ORDER BY ?? DESC LIMIT 1 FOR UPDATE`, [columnName, tableName, columnName, likePattern, columnName, expectedLength, columnName]);
+        // Step 2: Now that we hold the lock, read MAX safely.
+        const [rows] = yield conn.query(`SELECT MAX(CAST(SUBSTRING(??, ${prefixLen + 1}) AS UNSIGNED)) AS maxNum
+         FROM ??
+         WHERE ?? LIKE ? AND LENGTH(??) = ?`, [
+            columnName,
+            tableName,
+            columnName,
+            likePattern,
+            columnName,
+            expectedLength
+        ]);
+        if (rows.length > 0 && rows[0].maxNum != null) {
+            candidate = Number(rows[0].maxNum) + 1;
+            console.log(`🔢 [SeqGen] MAX for "${prefix}" in ${tableName}: ${rows[0].maxNum} → candidate: ${candidate}`);
+        }
+        // Guard loop: confirm candidate is truly free (handles edge cases where FOR UPDATE
+        // couldn't lock a row because the table was empty or prefix had no matches).
         let attempts = 0;
         const MAX_ATTEMPTS = 20;
         while (attempts < MAX_ATTEMPTS) {

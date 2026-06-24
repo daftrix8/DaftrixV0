@@ -1022,10 +1022,10 @@ const REALTIME_BALANCE_EXPR = `ROUND(
     COALESCE(p.openingBalance, 0) +
     CASE WHEN p.isSupplier = 0 OR p.isCustomer = 1 THEN COALESCE((
         SELECT SUM(CASE
-            WHEN i.type = 'INVOICE_SALE' AND COALESCE(i.paymentMethod,'') != 'CASH' THEN i.total
-            WHEN i.type = 'RETURN_SALE' AND COALESCE(i.paymentMethod,'') != 'CASH' THEN -(i.total)
-            WHEN i.type IN ('RECEIPT','DISCOUNT_ALLOWED','CHEQUE_DEPOSIT','CHEQUE_COLLECT') AND COALESCE(i.voucherCategory,'') != 'supplier' THEN -(i.total)
-            WHEN i.type = 'PAYMENT' AND i.voucherCategory = 'customer' THEN i.total
+            WHEN i.type = 'INVOICE_SALE' AND COALESCE(i.paymentMethod,'') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') != 'DEFERRED') THEN i.total
+            WHEN i.type = 'RETURN_SALE' AND COALESCE(i.paymentMethod,'') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') != 'DEFERRED') THEN -(i.total)
+            WHEN i.type IN ('RECEIPT','DISCOUNT_ALLOWED','CHEQUE_DEPOSIT','CHEQUE_COLLECT') AND (COALESCE(p.isSupplier, 0) = 0 OR COALESCE(i.voucherCategory,'') NOT IN ('supplier','supplier_refund')) THEN -(i.total)
+            WHEN i.type = 'PAYMENT' AND (COALESCE(p.isSupplier, 0) = 0 OR i.voucherCategory IN ('customer','labour')) THEN i.total
             ELSE 0 END)
         FROM invoices i WHERE i.partnerId = p.id AND i.status IN ('POSTED','COMPLETED','PARTIAL')
     ), 0) + COALESCE((
@@ -1034,10 +1034,10 @@ const REALTIME_BALANCE_EXPR = `ROUND(
     ), 0) ELSE 0 END +
     CASE WHEN p.isSupplier = 1 THEN COALESCE((
         SELECT SUM(CASE
-            WHEN i.type = 'INVOICE_PURCHASE' AND COALESCE(i.paymentMethod,'') != 'CASH' THEN -(i.total)
-            WHEN i.type = 'RETURN_PURCHASE' AND COALESCE(i.paymentMethod,'') != 'CASH' THEN i.total
-            WHEN i.type IN ('PAYMENT','DISCOUNT_EARNED','CHEQUE_CASHED') AND COALESCE(i.voucherCategory,'') != 'customer' THEN i.total
-            WHEN i.type = 'RECEIPT' AND i.voucherCategory = 'supplier' THEN -(i.total)
+            WHEN i.type = 'INVOICE_PURCHASE' AND COALESCE(i.paymentMethod,'') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') != 'DEFERRED') THEN -(i.total)
+            WHEN i.type = 'RETURN_PURCHASE' AND COALESCE(i.paymentMethod,'') != 'CASH' AND NOT (COALESCE(i.isPOSSale, 0) = 1 AND COALESCE(i.paymentMethod, '') != 'DEFERRED') THEN i.total
+            WHEN i.type IN ('PAYMENT','DISCOUNT_EARNED','CHEQUE_CASHED') AND (COALESCE(p.isCustomer, 0) = 0 OR COALESCE(i.voucherCategory,'') NOT IN ('customer','labour')) THEN i.total
+            WHEN i.type = 'RECEIPT' AND (COALESCE(p.isCustomer, 0) = 0 OR i.voucherCategory IN ('supplier','supplier_refund')) THEN -(i.total)
             ELSE 0 END)
         FROM invoices i WHERE i.partnerId = p.id AND i.status IN ('POSTED','COMPLETED','PARTIAL')
     ), 0) - COALESCE((
@@ -1669,7 +1669,7 @@ function getCustomerStatementContext(message, uiContext) {
                 for (const line of invoiceLines) {
                     const debit = Number(line.debit || 0);
                     const credit = Number(line.credit || 0);
-                    runningBalance += debit - credit;
+                    runningBalance = Math.round((runningBalance + debit - credit) * 100) / 100;
                     const dateStr = new Date(line.date).toLocaleDateString('ar-EG');
                     const desc = (line.description || line.reference || 'حركة').substring(0, 40);
                     result += `${dateStr} | ${desc} | ${debit > 0 ? debit.toLocaleString('ar-EG') : '-'} | ${credit > 0 ? credit.toLocaleString('ar-EG') : '-'} | ${runningBalance.toLocaleString('ar-EG')}\n`;
@@ -1784,7 +1784,7 @@ function getSupplierStatementContext(message, uiContext) {
                 let rb = ob;
                 for (const line of invoiceLines) {
                     const d = Number(line.debit || 0), c = Number(line.credit || 0);
-                    rb += d - c;
+                    rb = Math.round((rb + d - c) * 100) / 100;
                     result += `${new Date(line.date).toLocaleDateString('ar-EG')} | ${(line.description || line.reference || 'حركة').substring(0, 40)} | ${d > 0 ? d.toLocaleString('ar-EG') : '-'} | ${c > 0 ? c.toLocaleString('ar-EG') : '-'} | ${rb.toLocaleString('ar-EG')}\n`;
                 }
                 if (invoiceLines.length === 150) {

@@ -51,7 +51,9 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.updatePOSInvoice = exports.exportPOSReport = exports.getProductProfitabilityReport = exports.getCategoryProfitabilityReport = exports.getShiftProfitabilityReport = exports.getShiftMovementDetail = exports.getShiftSalesReport = exports.getProductSalesSummary = exports.getCategorySalesSummary = exports.getEmbeddedVariants = exports.processPOSRefund = exports.getPOSInvoice = exports.getPOSCustomerSummary = exports.getRecentPOSSales = exports.recallHeldOrder = exports.getHeldOrders = exports.holdOrder = exports.getProductByBarcode = exports.getPOSProductDetail = exports.getCustomerLastOrder = exports.deleteVariantGroup = exports.getVariantGroupProducts = exports.assignProductToVariantGroup = exports.updateVariantGroup = exports.createVariantGroup = exports.getVariantGroups = exports.getPOSProducts = exports.getShifts = exports.getHourlySales = exports.getReportSummary = exports.getShiftReport = exports.processPOSSale = exports.getShiftMovements = exports.addCashMovement = exports.deleteShift = exports.reopenShift = exports.unvalidateShift = exports.validateShift = exports.closeShift = exports.getCurrentShift = exports.openShift = exports.verifyAdminPassword = exports.updatePOSSettings = exports.getPOSSettings = exports.getTreasuryPreviousBalance = exports.getPOSTreasuries = exports.getPaymentAccounts = void 0;
+exports.syncQueue = exports.updatePOSInvoicePayment = exports.updatePOSInvoice = exports.exportPOSReport = exports.getProductProfitabilityReport = exports.getCategoryProfitabilityReport = exports.getShiftProfitabilityReport = exports.getShiftMovementDetail = exports.getShiftSalesReport = exports.getProductSalesSummary = exports.getCategorySalesSummary = exports.getEmbeddedVariants = exports.processPOSRefund = exports.getPOSInvoice = exports.getPOSCustomerSummary = exports.getRecentPOSSales = exports.recallHeldOrder = exports.getHeldOrders = exports.holdOrder = exports.getProductByBarcode = exports.getPOSProductDetail = exports.getCustomerLastOrder = exports.deleteVariantGroup = exports.getVariantGroupProducts = exports.assignProductToVariantGroup = exports.updateVariantGroup = exports.createVariantGroup = exports.getVariantGroups = exports.getPOSProducts = exports.getShifts = exports.getHourlySales = exports.getReportSummary = exports.getShiftReport = exports.processPOSSale = exports.getShiftMovements = exports.addCashMovement = exports.cleanupOrphanedPOSInvoices = exports.deleteShift = exports.reopenShift = exports.unvalidateShift = exports.validateShift = exports.closeShift = exports.getCurrentShift = exports.openShift = exports.verifyAdminPassword = exports.updatePOSSettings = exports.getPOSSettings = exports.getTreasuryPreviousBalance = exports.getPOSTreasuries = exports.getPaymentAccounts = void 0;
+exports.requestStockTransfer = void 0;
+exports.recalculateShiftTotals = recalculateShiftTotals;
 const crypto_1 = require("crypto");
 const db_1 = require("../db");
 const dateUtils_1 = require("../../utils/dateUtils");
@@ -60,17 +62,98 @@ const branchFilter_1 = require("../utils/branchFilter");
 const invoiceController_1 = require("./invoiceController");
 const accountBalanceUtils_1 = require("../utils/accountBalanceUtils");
 const loyaltyController_1 = require("./loyaltyController");
+const promotionController_1 = require("./promotionController");
 const posConfigController_1 = require("./posConfigController");
 const invoiceNumberGenerator_1 = require("../utils/invoiceNumberGenerator");
+const eventBus_1 = require("../utils/eventBus");
 function getOrCreatePosSurplusAccount(conn) {
     return __awaiter(this, void 0, void 0, function* () {
-        const [rows] = yield conn.query(`SELECT id FROM accounts WHERE name = 'فائض النقدية (نقطة البيع)' LIMIT 1`);
+        const [rows] = yield conn.query(`SELECT id FROM accounts WHERE name IN ('فائض النقدية (نقطة البيع)', 'فائض ورديات (نقاط بيع)') LIMIT 1`);
         if (rows.length > 0)
             return rows[0].id;
+        let code = `REV-POS-${Math.floor(Math.random() * 10000)}`;
+        const [existing] = yield conn.query(`SELECT id FROM accounts WHERE code = ? LIMIT 1`, [code]);
+        if (existing.length > 0) {
+            code = `${code}-${Math.floor(Math.random() * 100)}`;
+        }
         const id = (0, crypto_1.randomUUID)();
-        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance)
-         VALUES (?, ?, 'فائض النقدية (نقطة البيع)', 'REVENUE', 'OTHER_REVENUE', 0, 0)`, [id, `REV-POS-${Math.floor(Math.random() * 10000)}`]);
+        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode)
+         VALUES (?, ?, 'فائض النقدية (نقطة البيع)', 'REVENUE', 'OTHER_REVENUE', 0, 0, 'EGP')`, [id, code]);
         return id;
+    });
+}
+/**
+ * Recalculates shift expectedCash and variance from the source of truth
+ * (pos_cash_movements + pos_expenses). Called after any invoice edit to
+ * keep the shift's reconciliation numbers accurate.
+ *
+ * If the shift was VALIDATED/approved, automatically downgrades it to
+ * PENDING_VALIDATION so the admin must re-approve with current numbers.
+ */
+function recalculateShiftTotals(conn, shiftId, editedBy) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a, _b;
+        if (!shiftId)
+            return;
+        const [shiftRows] = yield conn.query(`SELECT id, status, approvalStatus, openingCash, closingCash FROM pos_shifts WHERE id = ?`, [shiftId]);
+        const shift = shiftRows[0];
+        if (!shift)
+            return;
+        // Recalculate totals and counts from active invoices
+        const [invoiceTotals] = yield conn.query(`SELECT 
+            COALESCE(SUM(CASE WHEN type = 'INVOICE_SALE' THEN total ELSE 0 END), 0) as totalSales,
+            SUM(CASE WHEN type = 'INVOICE_SALE' THEN 1 ELSE 0 END) as salesCount,
+            COALESCE(SUM(CASE WHEN type = 'RETURN_SALE' THEN total ELSE 0 END), 0) as totalRefunds,
+            SUM(CASE WHEN type = 'RETURN_SALE' THEN 1 ELSE 0 END) as refundsCount,
+            COALESCE(SUM(CASE WHEN type = 'INVOICE_PURCHASE' THEN total ELSE 0 END), 0) as totalPurchases,
+            SUM(CASE WHEN type = 'INVOICE_PURCHASE' THEN 1 ELSE 0 END) as purchasesCount
+         FROM invoices
+         WHERE posShiftId = ? AND status != 'VOID'`, [shiftId]);
+        const inv = invoiceTotals[0];
+        // Recalculate expectedCash from pos_cash_movements (same formula as closeShift)
+        const [movements] = yield conn.query(`SELECT 
+            SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
+            SUM(CASE WHEN type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals,
+            SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
+            SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
+            SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashPurchases
+         FROM pos_cash_movements
+         WHERE shiftId = ?`, [shiftId]);
+        const m = movements[0];
+        const [expenseRows] = yield conn.query(`SELECT COALESCE(SUM(amount), 0) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shiftId]);
+        const shiftExpenses = parseFloat(((_a = expenseRows[0]) === null || _a === void 0 ? void 0 : _a.totalExpenses) || 0);
+        const expectedCash = parseFloat(shift.openingCash || 0) +
+            parseFloat((m === null || m === void 0 ? void 0 : m.deposits) || 0) +
+            parseFloat((m === null || m === void 0 ? void 0 : m.cashSales) || 0) -
+            parseFloat((m === null || m === void 0 ? void 0 : m.withdrawals) || 0) -
+            parseFloat((m === null || m === void 0 ? void 0 : m.cashRefunds) || 0) -
+            parseFloat((m === null || m === void 0 ? void 0 : m.cashPurchases) || 0) - shiftExpenses;
+        const closingCash = shift.closingCash !== null ? parseFloat(shift.closingCash) : null;
+        const variance = closingCash !== null ? closingCash - expectedCash : null;
+        // Update shift totals, expectedCash and variance
+        yield conn.query(`UPDATE pos_shifts 
+         SET totalSales = ?, salesCount = ?,
+             totalRefunds = ?, refundsCount = ?,
+             totalPurchases = ?, purchasesCount = ?,
+             expectedCash = ?, variance = ?,
+             updatedAt = NOW() 
+         WHERE id = ?`, [
+            parseFloat((inv === null || inv === void 0 ? void 0 : inv.totalSales) || 0), parseInt((inv === null || inv === void 0 ? void 0 : inv.salesCount) || 0),
+            parseFloat((inv === null || inv === void 0 ? void 0 : inv.totalRefunds) || 0), parseInt((inv === null || inv === void 0 ? void 0 : inv.refundsCount) || 0),
+            parseFloat((inv === null || inv === void 0 ? void 0 : inv.totalPurchases) || 0), parseInt((inv === null || inv === void 0 ? void 0 : inv.purchasesCount) || 0),
+            expectedCash, variance, shiftId
+        ]);
+        // Auto-downgrade validated shifts — the admin approved on stale numbers
+        const isValidated = shift.status === 'VALIDATED' || shift.approvalStatus === 'approved';
+        if (isValidated) {
+            yield conn.query(`UPDATE pos_shifts 
+             SET status = 'PENDING_VALIDATION', approvalStatus = 'pending',
+                 actualCashReceived = NULL, discrepancyAmount = NULL,
+                 updatedAt = NOW()
+             WHERE id = ?`, [shiftId]);
+            console.log(`⚠️ [POS] Shift ${shiftId.substring(0, 8)} auto-downgraded to PENDING_VALIDATION after invoice edit${editedBy ? ` by ${editedBy}` : ''}`);
+        }
+        console.log(`🔄 [POS] Shift ${shiftId.substring(0, 8)} recalculated: expectedCash=${expectedCash.toFixed(2)}, variance=${(_b = variance === null || variance === void 0 ? void 0 : variance.toFixed(2)) !== null && _b !== void 0 ? _b : 'N/A'}`);
     });
 }
 function getOrCreateExpenseAccount(conn, entityType) {
@@ -94,9 +177,14 @@ function getOrCreateExpenseAccount(conn, entityType) {
         const [rows] = yield conn.query(`SELECT id FROM accounts WHERE name = ? LIMIT 1`, [name]);
         if (rows.length > 0)
             return rows[0].id;
+        let code = `${codePrefix}${Math.floor(Math.random() * 10000)}`;
+        const [existing] = yield conn.query(`SELECT id FROM accounts WHERE code = ? LIMIT 1`, [code]);
+        if (existing.length > 0) {
+            code = `${code}-${Math.floor(Math.random() * 100)}`;
+        }
         const id = (0, crypto_1.randomUUID)();
-        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance)
-         VALUES (?, ?, ?, ?, ?, 0, 0)`, [id, `${codePrefix}${Math.floor(Math.random() * 10000)}`, name, accountType, subType]);
+        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode)
+         VALUES (?, ?, ?, ?, ?, 0, 0, 'EGP')`, [id, code, name, accountType, subType]);
         return id;
     });
 }
@@ -182,14 +270,16 @@ const getPaymentAccounts = (req, res) => __awaiter(void 0, void 0, void 0, funct
 exports.getPaymentAccounts = getPaymentAccounts;
 function getBranchBanks(conn, branchId) {
     return __awaiter(this, void 0, void 0, function* () {
-        // Base query — no isActive filter (column does not exist on banks table)
+        // Base query — only fetch active banks (or those with missing isActive flag for backward compatibility)
         const baseQuery = `
-        SELECT b.accountId, a.name, a.code, 'BANK' AS type,
+        SELECT b.accountId, a.name, a.code, 
+               CASE WHEN b.bankType = 'TREASURY' THEN 'CASH' ELSE 'BANK' END AS type,
                b.id AS bankId, b.name AS bankName,
                b.feeEnabled, b.feeType, b.feePercentage, b.feeFixedAmount, b.feeMinAmount, b.feeTaxRate
         FROM banks b
         JOIN accounts a ON b.accountId = a.id
-        WHERE b.accountId IS NOT NULL`;
+        WHERE b.accountId IS NOT NULL
+          AND (b.isActive = 1 OR b.isActive IS NULL)`;
         // Branch-scoped: return banks belonging to this branch + shared banks (branchId IS NULL)
         if (branchId) {
             try {
@@ -228,17 +318,23 @@ const getPOSTreasuries = (req, res) => __awaiter(void 0, void 0, void 0, functio
     const conn = yield (0, db_1.getConnection)();
     try {
         const userCtx = req.user;
-        const userRole = ((userCtx === null || userCtx === void 0 ? void 0 : userCtx.role) || '').toUpperCase();
-        const userBranchId = (userCtx === null || userCtx === void 0 ? void 0 : userCtx.branchId) || null;
-        const isPrivileged = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN'].includes(userRole);
+        const defaultTreasuryId = (userCtx === null || userCtx === void 0 ? void 0 : userCtx.defaultTreasuryId) || null;
+        const { branchId: userBranchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
         // Non-admin users with a branch: only see treasuries tied to their branch
         // via the banks table (banks.branchId), plus unlinked cash accounts (branchId IS NULL)
         let branchFilter = '';
         const params = [];
-        if (!isPrivileged && userBranchId) {
-            // Only return treasuries EXACTLY matching the user's branch
-            branchFilter = `AND b.branchId = ?`;
-            params.push(userBranchId);
+        if (!isPrivileged) {
+            if (defaultTreasuryId) {
+                // Only return the user's explicitly linked treasury
+                branchFilter = `AND (b.id = ? OR a.id = ?)`;
+                params.push(defaultTreasuryId, defaultTreasuryId);
+            }
+            else if (userBranchId) {
+                // Only return treasuries EXACTLY matching the user's branch
+                branchFilter = `AND b.branchId = ?`;
+                params.push(userBranchId);
+            }
         }
         const [rows] = yield conn.query(`
             SELECT DISTINCT a.id, a.name, a.code
@@ -315,9 +411,10 @@ const getPOSSettings = (_req, res) => __awaiter(void 0, void 0, void 0, function
     const conn = yield (0, db_1.getConnection)();
     try {
         const [rows] = yield conn.query(`SELECT discountLockEnabled, discountFreeLimit,
-                    perInvoiceAccounting, printAfterConfirm, useNumpad, allowedCategories,
+                    perInvoiceAccounting, printAfterConfirm, useNumpad, allowedCategories, warrantyCategories,
                     (adminPassword IS NOT NULL AND adminPassword != '') AS adminPasswordConfigured,
-                    autoCloseEnabled, autoCloseTime, editCutoffDate, editCutoffDays
+                    autoCloseEnabled, autoCloseTime, editCutoffDate, editCutoffDays,
+                    cashierMaxDiscountPercent
              FROM pos_settings LIMIT 1`);
         const rawSettings = rows[0] || {};
         let parsedCategories = [];
@@ -330,6 +427,16 @@ const getPOSSettings = (_req, res) => __awaiter(void 0, void 0, void 0, function
         else if (Array.isArray(rawSettings.allowedCategories)) {
             parsedCategories = rawSettings.allowedCategories;
         }
+        let parsedWarrantyCategories = [];
+        if (typeof rawSettings.warrantyCategories === 'string') {
+            try {
+                parsedWarrantyCategories = JSON.parse(rawSettings.warrantyCategories);
+            }
+            catch (_j) { }
+        }
+        else if (Array.isArray(rawSettings.warrantyCategories)) {
+            parsedWarrantyCategories = rawSettings.warrantyCategories;
+        }
         const settings = {
             discountLockEnabled: Boolean((_a = rawSettings.discountLockEnabled) !== null && _a !== void 0 ? _a : 1),
             discountFreeLimit: Number((_b = rawSettings.discountFreeLimit) !== null && _b !== void 0 ? _b : 5),
@@ -337,11 +444,13 @@ const getPOSSettings = (_req, res) => __awaiter(void 0, void 0, void 0, function
             printAfterConfirm: Boolean((_d = rawSettings.printAfterConfirm) !== null && _d !== void 0 ? _d : 1),
             useNumpad: Boolean((_e = rawSettings.useNumpad) !== null && _e !== void 0 ? _e : 1),
             allowedCategories: parsedCategories,
+            warrantyCategories: parsedWarrantyCategories,
             adminPasswordConfigured: Boolean((_f = rawSettings.adminPasswordConfigured) !== null && _f !== void 0 ? _f : 0),
             autoCloseEnabled: Boolean((_g = rawSettings.autoCloseEnabled) !== null && _g !== void 0 ? _g : 0),
             autoCloseTime: rawSettings.autoCloseTime || '23:59',
             editCutoffDate: rawSettings.editCutoffDate || null,
             editCutoffDays: Number(rawSettings.editCutoffDays || 0),
+            cashierMaxDiscountPercent: Number(rawSettings.cashierMaxDiscountPercent || 0),
         };
         res.json({ settings });
     }
@@ -363,7 +472,7 @@ exports.getPOSSettings = getPOSSettings;
 const updatePOSSettings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { discountLockEnabled, discountFreeLimit, adminPassword, perInvoiceAccounting, printAfterConfirm, useNumpad, allowedCategories, autoCloseEnabled, autoCloseTime, editCutoffDate, editCutoffDays, } = req.body;
+        const { discountLockEnabled, discountFreeLimit, adminPassword, perInvoiceAccounting, printAfterConfirm, useNumpad, allowedCategories, warrantyCategories, autoCloseEnabled, autoCloseTime, editCutoffDate, editCutoffDays, cashierMaxDiscountPercent, } = req.body;
         const updates = [];
         const params = [];
         if (discountLockEnabled !== undefined) {
@@ -394,6 +503,10 @@ const updatePOSSettings = (req, res) => __awaiter(void 0, void 0, void 0, functi
             updates.push('allowedCategories = ?');
             params.push(allowedCategories ? JSON.stringify(allowedCategories) : null);
         }
+        if (warrantyCategories !== undefined) {
+            updates.push('warrantyCategories = ?');
+            params.push(warrantyCategories ? JSON.stringify(warrantyCategories) : null);
+        }
         if (autoCloseEnabled !== undefined) {
             updates.push('autoCloseEnabled = ?');
             params.push(autoCloseEnabled ? 1 : 0);
@@ -415,6 +528,14 @@ const updatePOSSettings = (req, res) => __awaiter(void 0, void 0, void 0, functi
         if (editCutoffDays !== undefined) {
             updates.push('editCutoffDays = ?');
             params.push(parseInt(editCutoffDays) || 0);
+        }
+        if (cashierMaxDiscountPercent !== undefined) {
+            const cap = parseFloat(cashierMaxDiscountPercent);
+            if (isNaN(cap) || cap < 0 || cap > 100) {
+                return res.status(400).json({ error: 'حد خصم الكاشير يجب أن يكون بين 0 و 100' });
+            }
+            updates.push('cashierMaxDiscountPercent = ?');
+            params.push(cap);
         }
         if (updates.length === 0) {
             return res.status(400).json({ error: 'لا توجد بيانات للتحديث' });
@@ -480,10 +601,10 @@ exports.verifyAdminPassword = verifyAdminPassword;
  * POST /api/pos/shift/open
  */
 const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c;
+    var _a, _b, _c, _d, _e;
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { openingCash = 0, terminalName, shiftDefinitionId: reqShiftDefId, deviceId: reqDeviceId, treasuryId, } = req.body;
+        const { openingCash = 0, terminalName, shiftDefinitionId: reqShiftDefId, deviceId: reqDeviceId, treasuryId, branchId: reqBranchId, } = req.body;
         const userCtx = req.user;
         const userId = userCtx === null || userCtx === void 0 ? void 0 : userCtx.id;
         const userName = (userCtx === null || userCtx === void 0 ? void 0 : userCtx.name) || 'Unknown';
@@ -495,8 +616,12 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             return res.status(400).json({ error: 'يجب اختيار الخزينة لفتح الوردية' });
         }
         // ── Branch isolation: derive warehouseId from JWT branch context ──
-        // ADMIN / SUPER_ADMIN / MASTER_ADMIN may override via request body.
-        const isPrivileged = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN'].includes(userRole);
+        // Privileged roles may override via request body.
+        const { isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
+        // Verify non-privileged users cannot open a shift in another branch
+        if (reqBranchId && !isPrivileged && reqBranchId !== (userCtx === null || userCtx === void 0 ? void 0 : userCtx.branchId)) {
+            return res.status(403).json({ error: 'ليس لديك صلاحية لفتح وردية في فرع آخر' });
+        }
         let resolvedWarehouseId = isPrivileged && req.body.warehouseId
             ? req.body.warehouseId
             : ((userCtx === null || userCtx === void 0 ? void 0 : userCtx.defaultWarehouseId) || req.body.warehouseId || null);
@@ -522,6 +647,8 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         const shiftDefinitionId = reqShiftDefId || defaults.shiftDefinitionId;
         const deviceId = reqDeviceId || defaults.deviceId;
         const shiftId = (0, crypto_1.randomUUID)();
+        // Resolve branchId: explicit body value > JWT branchContext > null
+        const resolvedBranchId = (0, branchFilter_1.resolveBranchIdForWrite)(req, reqBranchId || undefined);
         // Both INSERTs must succeed atomically — shift without its opening
         // movement would produce a 0-balance expectedCash calculation
         yield conn.query('START TRANSACTION');
@@ -533,7 +660,7 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'OPEN', ?, ?, ?, ?, ?)`, [
                 shiftId, userId, resolvedWarehouseId, shiftDefinitionId, deviceId,
                 terminalName || null, now, openingCash,
-                (0, branchFilter_1.resolveBranchIdForWrite)(req),
+                resolvedBranchId,
                 treasuryId,
                 parsedAdminAmount,
                 adminOpeningAmountSetBy,
@@ -542,6 +669,38 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             // Record opening cash movement
             yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, description, createdAt)
                  VALUES (?, ?, 'OPENING', ?, 'CASH', 'رصيد افتتاحي', ?)`, [(0, crypto_1.randomUUID)(), shiftId, openingCash, now]);
+            // Only journalize the difference between the declared openingCash and the actual
+            // GL balance already in the drawer. This prevents double-counting cash left in the
+            // drawer from previous shifts, while still recording any new float added or withdrawn.
+            const floatDiff = openingCash - parsedAdminAmount;
+            if (Math.abs(floatDiff) > 0.01) {
+                const parentTreasury = yield (0, branchFilter_1.resolveBranchCashAccount)(conn, req);
+                if (parentTreasury && parentTreasury.id !== treasuryId) {
+                    const journalId = (0, crypto_1.randomUUID)();
+                    const [treasuryAccRows] = yield conn.query(`SELECT name FROM accounts WHERE id = ? LIMIT 1`, [treasuryId]);
+                    const treasuryAccountName = ((_b = treasuryAccRows[0]) === null || _b === void 0 ? void 0 : _b.name) || 'خزينة نقطة البيع';
+                    if (floatDiff > 0.01) {
+                        const journalDescription = `رصيد افتتاحي وردية نقطة البيع ${shiftId}`;
+                        yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                             VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [journalId, now, journalDescription, shiftId, userId, resolvedBranchId]);
+                        yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
+                                [journalId, treasuryId, treasuryAccountName, floatDiff, 0, 'EGP', 1, floatDiff, 0],
+                                [journalId, parentTreasury.id, parentTreasury.name, 0, floatDiff, 'EGP', 1, 0, floatDiff]
+                            ]]);
+                    }
+                    else {
+                        const journalDescription = `سحب عهدة زائدة عند فتح الوردية ${shiftId}`;
+                        const absDiff = Math.abs(floatDiff);
+                        yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                             VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [journalId, now, journalDescription, shiftId, userId, resolvedBranchId]);
+                        yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
+                                [journalId, parentTreasury.id, parentTreasury.name, absDiff, 0, 'EGP', 1, absDiff, 0],
+                                [journalId, treasuryId, treasuryAccountName, 0, absDiff, 'EGP', 1, 0, absDiff]
+                            ]]);
+                    }
+                    yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, [treasuryId, parentTreasury.id]);
+                }
+            }
             yield conn.query('COMMIT');
         }
         catch (txError) {
@@ -552,12 +711,18 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         let warehouseName = null;
         if (resolvedWarehouseId) {
             const [warehouses] = yield conn.query(`SELECT name FROM warehouses WHERE id = ?`, [resolvedWarehouseId]);
-            warehouseName = (_b = warehouses[0]) === null || _b === void 0 ? void 0 : _b.name;
+            warehouseName = (_c = warehouses[0]) === null || _c === void 0 ? void 0 : _c.name;
         }
         let treasuryName = null;
         if (treasuryId) {
             const [treasuryRows] = yield conn.query(`SELECT name FROM accounts WHERE id = ?`, [treasuryId]);
-            treasuryName = (_c = treasuryRows[0]) === null || _c === void 0 ? void 0 : _c.name;
+            treasuryName = (_d = treasuryRows[0]) === null || _d === void 0 ? void 0 : _d.name;
+        }
+        // Resolve branch name for the echoed shift response
+        let branchName = (userCtx === null || userCtx === void 0 ? void 0 : userCtx.branchName) || null;
+        if (resolvedBranchId && !branchName) {
+            const [branchRows] = yield conn.query('SELECT name FROM branches WHERE id = ? LIMIT 1', [resolvedBranchId]);
+            branchName = ((_e = branchRows[0]) === null || _e === void 0 ? void 0 : _e.name) || null;
         }
         const shift = {
             id: shiftId,
@@ -578,12 +743,12 @@ const openShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             totalRefunds: 0,
             salesCount: 0,
             refundCount: 0,
-            // Branch context echoed back to frontend
-            branchId: (userCtx === null || userCtx === void 0 ? void 0 : userCtx.branchId) || null,
-            branchName: (userCtx === null || userCtx === void 0 ? void 0 : userCtx.branchName) || null,
+            // Branch context echoed back to frontend — uses explicitly resolved value
+            branchId: resolvedBranchId,
+            branchName,
         };
         // Emit real-time update (when socket is available)
-        // emitEntityChanged('pos-shift', shift, userName);
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'pos-shift', updatedBy: userName });
         res.json({
             success: true,
             shift,
@@ -646,21 +811,26 @@ const getCurrentShift = (req, res) => __awaiter(void 0, void 0, void 0, function
                     SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
                     SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
                     SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
-                    SUM(CASE WHEN type = 'SALE' THEN amount ELSE 0 END) as totalSales
+                    SUM(CASE WHEN type = 'SALE' THEN amount ELSE 0 END) as totalSales,
+                    SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashPurchases,
+                    SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankPurchases
                  FROM pos_cash_movements
                  WHERE shiftId = ?`, [shift.id]);
             const movementData = movements[0];
             const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shift.id]);
             const shiftExpenses = parseFloat(((_b = expenseRows[0]) === null || _b === void 0 ? void 0 : _b.totalExpenses) || 0);
-            // Cash drawer = opening + adminOpening + deposits + cash sales − withdrawals − cash refunds - expenses
-            shift.expectedCash = parseFloat(shift.adminOpeningAmount || 0) +
+            // Cash drawer = opening + deposits + cash sales − withdrawals − cash refunds - cash purchases - expenses
+            shift.expectedCash = parseFloat(shift.openingCash || 0) +
                 parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.deposits) || 0) +
                 parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashSales) || 0) -
                 parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.withdrawals) || 0) -
-                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashRefunds) || 0) - shiftExpenses;
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashRefunds) || 0) -
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashPurchases) || 0) - shiftExpenses;
             shift.cashSales = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashSales) || 0);
             shift.bankSales = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankSales) || 0);
             shift.totalSales = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.totalSales) || 0);
+            shift.cashPurchases = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashPurchases) || 0);
+            shift.bankPurchases = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankPurchases) || 0);
         }
         res.json({ shift });
     }
@@ -682,7 +852,7 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
     var _a, _b, _c, _d;
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { shiftId, closingCash, closingCard, notes, closingRecipientType, closingRecipientId, shortageEmployeeId } = req.body;
+        const { shiftId, closingCash, closingCard, notes, closingRecipientType, closingRecipientId, shortageEmployeeId, closingBankDetails } = req.body;
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
         const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'Unknown';
         if (!shiftId) {
@@ -695,57 +865,77 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
         if (!closingRecipientType || !closingRecipientId) {
             return res.status(400).json({ error: 'يجب اختيار وجهة تسليم العهدة (خزينة أو موظف)' });
         }
-        // Verify shift belongs to user and is open
-        const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? AND userId = ? AND status = 'OPEN'`, [shiftId, userId]);
-        if (shifts.length === 0) {
-            return res.status(404).json({ error: 'الوردية غير موجودة أو مغلقة بالفعل' });
-        }
-        const shift = shifts[0];
-        // Calculate expected cash and card
-        const [movements] = yield conn.query(`SELECT 
-                SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
-                SUM(CASE WHEN type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals,
-                SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
-                SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
-                SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
-                SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankRefunds
-             FROM pos_cash_movements
-             WHERE shiftId = ?`, [shiftId]);
-        const movementData = movements[0];
-        const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shiftId]);
-        const shiftExpenses = parseFloat(((_c = expenseRows[0]) === null || _c === void 0 ? void 0 : _c.totalExpenses) || 0);
-        const expectedCash = parseFloat(shift.adminOpeningAmount || 0) +
-            parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.deposits) || 0) +
-            parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashSales) || 0) -
-            parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.withdrawals) || 0) -
-            parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashRefunds) || 0) - shiftExpenses;
-        const variance = closingCash - expectedCash;
-        const expectedCard = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankSales) || 0) - parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankRefunds) || 0);
-        // Fallback to expectedCard if the client did not send closingCard (e.g. old client app)
-        const parsedClosingCard = closingCard !== undefined ? parseFloat(closingCard) : expectedCard;
-        const varianceCard = parsedClosingCard - expectedCard;
-        const now = (0, dateUtils_1.getEgyptianISOString)();
-        // Check system configuration for session validation requirement + variance threshold
-        const [configRows] = yield conn.query(`SELECT config FROM system_config LIMIT 1`);
-        let posValidationRequired = false;
-        let posVarianceThreshold = null;
-        if (configRows.length > 0) {
-            try {
-                const settings = JSON.parse(configRows[0].config);
-                posValidationRequired = !!settings.posSessionValidationRequired;
-                posVarianceThreshold = typeof settings.posVarianceThreshold === 'number' ? settings.posVarianceThreshold : null;
-            }
-            catch (e) {
-                console.error('Error parsing system config for POS validation check', e);
-            }
-        }
-        // Auto-escalate to PENDING_VALIDATION if variance exceeds threshold
-        const isOverThreshold = posVarianceThreshold !== null && Math.abs(variance) > posVarianceThreshold;
-        let newStatus = (posValidationRequired || isOverThreshold) ? 'PENDING_VALIDATION' : 'CLOSED';
         // === BEGIN TRANSACTION ===
-        // Held order cleanup + shift status update must succeed or fail atomically
+        // Lock the shift row first to prevent concurrent double-close race conditions.
         yield conn.query('START TRANSACTION');
         try {
+            // Verify shift belongs to user and is open
+            const [shifts] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ? AND userId = ? AND status = 'OPEN' FOR UPDATE`, [shiftId, userId]);
+            if (shifts.length === 0) {
+                yield conn.query('ROLLBACK');
+                return res.status(404).json({ error: 'الوردية غير موجودة أو مغلقة بالفعل' });
+            }
+            const shift = shifts[0];
+            // Calculate expected cash and card
+            const [movements] = yield conn.query(`SELECT 
+                    SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
+                    SUM(CASE WHEN type = 'WITHDRAWAL' THEN amount ELSE 0 END) as withdrawals,
+                    SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
+                    SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
+                    SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
+                    SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankRefunds,
+                    SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashPurchases,
+                    SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankPurchases
+                 FROM pos_cash_movements
+                 WHERE shiftId = ?`, [shiftId]);
+            const movementData = movements[0];
+            const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shiftId]);
+            const shiftExpenses = parseFloat(((_c = expenseRows[0]) === null || _c === void 0 ? void 0 : _c.totalExpenses) || 0);
+            const expectedCash = parseFloat(shift.openingCash || 0) +
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.deposits) || 0) +
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashSales) || 0) -
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.withdrawals) || 0) -
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashRefunds) || 0) -
+                parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.cashPurchases) || 0) - shiftExpenses;
+            const variance = closingCash - expectedCash;
+            const expectedCard = parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankSales) || 0) - parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankRefunds) || 0) - parseFloat((movementData === null || movementData === void 0 ? void 0 : movementData.bankPurchases) || 0);
+            // Fallback to expectedCard if the client did not send closingCard (e.g. old client app)
+            let parsedClosingCard = closingCard !== undefined ? parseFloat(closingCard) : expectedCard;
+            let stringifiedBankDetails = null;
+            if (closingBankDetails) {
+                try {
+                    const parsedDetails = typeof closingBankDetails === 'string'
+                        ? JSON.parse(closingBankDetails)
+                        : closingBankDetails;
+                    if (Array.isArray(parsedDetails)) {
+                        const sumActual = parsedDetails.reduce((sum, b) => sum + (parseFloat(b.actual) || 0), 0);
+                        parsedClosingCard = sumActual;
+                        stringifiedBankDetails = JSON.stringify(parsedDetails);
+                    }
+                }
+                catch (e) {
+                    console.error('Failed to parse closingBankDetails in closeShift:', e);
+                }
+            }
+            const varianceCard = parsedClosingCard - expectedCard;
+            const now = (0, dateUtils_1.getEgyptianISOString)();
+            // Check system configuration for session validation requirement + variance threshold
+            const [configRows] = yield conn.query(`SELECT config FROM system_config LIMIT 1`);
+            let posValidationRequired = false;
+            let posVarianceThreshold = null;
+            if (configRows.length > 0) {
+                try {
+                    const settings = JSON.parse(configRows[0].config);
+                    posValidationRequired = !!settings.posSessionValidationRequired;
+                    posVarianceThreshold = typeof settings.posVarianceThreshold === 'number' ? settings.posVarianceThreshold : null;
+                }
+                catch (e) {
+                    console.error('Error parsing system config for POS validation check', e);
+                }
+            }
+            // Auto-escalate to PENDING_VALIDATION if variance exceeds threshold
+            const isOverThreshold = posVarianceThreshold !== null && Math.abs(variance) > posVarianceThreshold;
+            let newStatus = (posValidationRequired || isOverThreshold) ? 'PENDING_VALIDATION' : 'CLOSED';
             // Cleanup held orders — these are just saved carts with no financial impact
             let heldOrdersPurged = 0;
             try {
@@ -766,11 +956,13 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                      closingCard = ?, expectedCard = ?, varianceCard = ?,
                      status = ?, notes = ?,
                      closingRecipientType = ?, closingRecipientId = ?, shortageEmployeeId = ?,
+                     closingBankDetails = ?,
                      updatedAt = ?
                  WHERE id = ?`, [now, closingCash, expectedCash, variance,
                 parsedClosingCard, expectedCard, varianceCard,
                 newStatus, notes || null,
                 closingRecipientType || null, closingRecipientId || null, shortageEmployeeId || null,
+                stringifiedBankDetails,
                 now, shiftId]);
             // ==============================================
             // Create Journal Entry for the Shift Closing
@@ -799,67 +991,79 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                 }
                 if (targetAccountId) {
                     const journalId = (0, crypto_1.randomUUID)();
-                    const journalDescription = `إغلاق وردية نقطة البيع ${shiftId}`;
+                    const journalDescription = `إغلاق وردية نقطة البيع ${shiftId} ${Number(shift.adminOpeningAmount || 0)}`;
                     yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
                          VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [journalId, now, journalDescription, shiftId, userId, shift.branchId || null]);
                     const journalLines = [];
                     const actualCash = closingCash;
-                    let posCredit = actualCash;
                     let surplusAccountId = null;
                     let surplusAmount = 0;
-                    // Debit Target Treasury/Employee
+                    // Debit Target Treasury/Employee (represents physical cash delivered)
                     if (actualCash > 0) {
                         journalLines.push([
                             journalId, targetAccountId, 'تسليم نقدية الوردية', actualCash, 0, 'EGP', 1, actualCash, 0
                         ]);
                     }
-                    // Debit Shortage Employee
+                    // Debit Shortage Employee (if actual < expected)
                     if (variance < 0 && shortageAccountId) {
                         const shortageAmount = Math.abs(variance);
                         journalLines.push([
                             journalId, shortageAccountId, 'عجز وردية - موظف', shortageAmount, 0, 'EGP', 1, shortageAmount, 0
                         ]);
-                        posCredit += shortageAmount; // Equals expectedCash
                     }
-                    // Debit POS Expenses (from pos_expenses table)
-                    let expensesList = [];
-                    try {
-                        const [expRows] = yield conn.query(`SELECT id, amount, entityType, description FROM pos_expenses WHERE shiftId = ?`, [shift.id]);
-                        expensesList = expRows;
-                    }
-                    catch (_e) {
-                        // Table might not exist or be empty
-                    }
-                    const expenseAccountIds = new Set();
-                    for (const exp of expensesList) {
-                        const expAmount = parseFloat(exp.amount) || 0;
-                        if (expAmount > 0) {
-                            const expAccountId = yield getOrCreateExpenseAccount(conn, exp.entityType);
-                            const expDesc = exp.description || 'مصروف وردية نقطة بيع';
-                            journalLines.push([
-                                journalId, expAccountId, expDesc, expAmount, 0, 'EGP', 1, expAmount, 0
-                            ]);
-                            expenseAccountIds.add(expAccountId);
-                            posCredit += expAmount; // Adding expenses so POS Treasury gets properly credited for them too
-                        }
-                    }
-                    // Credit Surplus Account
+                    // Credit Surplus Account (if actual > expected)
                     if (variance > 0) {
                         surplusAmount = variance;
                         surplusAccountId = yield getOrCreatePosSurplusAccount(conn);
                         journalLines.push([
                             journalId, surplusAccountId, 'فائض إغلاق وردية', 0, surplusAmount, 'EGP', 1, 0, surplusAmount
                         ]);
-                        posCredit -= surplusAmount; // Equals expectedCash
                     }
-                    // Credit POS Treasury (should exactly equal expectedCash if accounted properly)
-                    if (posCredit > 0) {
+                    // Credit POS Treasury (clears expected cash from drawer)
+                    const posCredit = expectedCash;
+                    if (Math.abs(posCredit) > 0.001) {
                         journalLines.push([
                             journalId, shift.treasuryId, 'خزينة نقطة البيع', 0, posCredit, 'EGP', 1, 0, posCredit
                         ]);
                     }
-                    if (journalLines.length > 0 && (posCredit > 0 || surplusAmount > 0)) {
-                        yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [journalLines]);
+                    // Consolidate lines to prevent double counting in ledger UI when Target Treasury == POS Treasury
+                    const consolidatedMap = new Map();
+                    for (const line of journalLines) {
+                        const accId = line[1];
+                        if (!consolidatedMap.has(accId)) {
+                            consolidatedMap.set(accId, [...line]);
+                        }
+                        else {
+                            const existing = consolidatedMap.get(accId);
+                            existing[3] += line[3]; // debit
+                            existing[4] += line[4]; // credit
+                            existing[7] += line[7]; // foreignDebit
+                            existing[8] += line[8]; // foreignCredit
+                        }
+                    }
+                    const finalJournalLines = [];
+                    for (const [accId, line] of consolidatedMap.entries()) {
+                        let debit = Number(line[3].toFixed(2));
+                        let credit = Number(line[4].toFixed(2));
+                        if (debit > credit) {
+                            debit = Number((debit - credit).toFixed(2));
+                            credit = 0;
+                        }
+                        else if (credit > debit) {
+                            credit = Number((credit - debit).toFixed(2));
+                            debit = 0;
+                        }
+                        else {
+                            continue; // Cancels out entirely
+                        }
+                        line[3] = debit;
+                        line[4] = credit;
+                        line[7] = debit;
+                        line[8] = credit;
+                        finalJournalLines.push(line);
+                    }
+                    if (finalJournalLines.length > 0) {
+                        yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [finalJournalLines]);
                         const affectedAccountIds = new Set();
                         if (targetAccountId)
                             affectedAccountIds.add(targetAccountId);
@@ -869,8 +1073,6 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                             affectedAccountIds.add(surplusAccountId);
                         if (shift.treasuryId)
                             affectedAccountIds.add(shift.treasuryId);
-                        for (const expAccId of expenseAccountIds)
-                            affectedAccountIds.add(expAccId);
                         yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, Array.from(affectedAccountIds));
                     }
                 }
@@ -886,7 +1088,7 @@ const closeShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () 
                  LEFT JOIN warehouses w ON s.warehouseId = w.id
                  WHERE s.id = ?`, [shiftId]);
             const closedShift = closedShifts[0];
-            // emitEntityChanged('pos-shift', closedShift, userName);
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'pos-shift', updatedBy: userName });
             res.json({
                 success: true,
                 shift: closedShift,
@@ -1041,10 +1243,11 @@ const unvalidateShift = (req, res) => __awaiter(void 0, void 0, void 0, function
         const [oldJournals] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ? AND description LIKE ?`, [shiftId, '%إغلاق وردية%']);
         if (oldJournals.length > 0) {
             const oldJournalIds = oldJournals.map((j) => j.id);
-            const [oldLines] = yield conn.query(`SELECT accountId FROM journal_lines WHERE journalId IN (?)`, [oldJournalIds]);
+            const ph = oldJournalIds.map(() => '?').join(',');
+            const [oldLines] = yield conn.query(`SELECT accountId FROM journal_lines WHERE journalId IN (${ph})`, oldJournalIds);
             const oldAccountIds = oldLines.map((r) => r.accountId).filter((id) => id);
-            yield conn.query(`DELETE FROM journal_lines WHERE journalId IN (?)`, [oldJournalIds]);
-            yield conn.query(`DELETE FROM journal_entries WHERE id IN (?)`, [oldJournalIds]);
+            yield conn.query(`DELETE FROM journal_lines WHERE journalId IN (${ph})`, oldJournalIds);
+            yield conn.query(`DELETE FROM journal_entries WHERE id IN (${ph})`, oldJournalIds);
             if (oldAccountIds.length > 0) {
                 yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, Array.from(new Set(oldAccountIds)));
             }
@@ -1116,10 +1319,11 @@ const reopenShift = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
         const [oldJournals] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ? AND description LIKE ?`, [shiftId, '%إغلاق وردية%']);
         if (oldJournals.length > 0) {
             const oldJournalIds = oldJournals.map((j) => j.id);
-            const [oldLines] = yield conn.query(`SELECT accountId FROM journal_lines WHERE journalId IN (?)`, [oldJournalIds]);
+            const ph = oldJournalIds.map(() => '?').join(',');
+            const [oldLines] = yield conn.query(`SELECT accountId FROM journal_lines WHERE journalId IN (${ph})`, oldJournalIds);
             const oldAccountIds = oldLines.map((r) => r.accountId).filter((id) => id);
-            yield conn.query(`DELETE FROM journal_lines WHERE journalId IN (?)`, [oldJournalIds]);
-            yield conn.query(`DELETE FROM journal_entries WHERE id IN (?)`, [oldJournalIds]);
+            yield conn.query(`DELETE FROM journal_lines WHERE journalId IN (${ph})`, oldJournalIds);
+            yield conn.query(`DELETE FROM journal_entries WHERE id IN (${ph})`, oldJournalIds);
             if (oldAccountIds.length > 0) {
                 yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, Array.from(new Set(oldAccountIds)));
             }
@@ -1148,21 +1352,114 @@ exports.reopenShift = reopenShift;
  * DELETE /api/pos/sessions/:id
  */
 const deleteShift = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { id } = req.params;
-        // Check if there are any cash movements
-        const [movements] = yield conn.query(`SELECT COUNT(*) as cnt FROM pos_cash_movements WHERE shiftId = ?`, [id]);
-        if (movements[0].cnt > 0) {
-            return res.status(400).json({
-                error: 'لا يمكن حذف وردية تحتوي على حركات مالية'
+        const userId = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || 'admin';
+        // Verify the shift exists
+        const [shiftRows] = yield conn.query(`SELECT * FROM pos_shifts WHERE id = ?`, [id]);
+        const shift = shiftRows[0];
+        if (!shift) {
+            return res.status(404).json({ error: 'الوردية غير موجودة' });
+        }
+        yield conn.query('START TRANSACTION');
+        try {
+            const { deleteInvoiceWithCascade } = require('../utils/invoiceCascadeDelete');
+            const { updateAccountBalancesFromJournal } = require('../utils/accountBalanceUtils');
+            const allAffectedAccountIds = new Set();
+            // 1. Find all invoices linked to this shift
+            const [shiftInvoices] = yield conn.query(`SELECT id FROM invoices WHERE posShiftId = ? COLLATE utf8mb4_unicode_ci`, [id]);
+            const shiftInvoiceIds = shiftInvoices.map((inv) => inv.id);
+            // 1b. Find return invoices (RET-POS) linked to any shift invoice via referenceInvoiceId
+            let returnInvoiceIds = [];
+            if (shiftInvoiceIds.length > 0) {
+                const ph = shiftInvoiceIds.map(() => '?').join(',');
+                const [returns] = yield conn.query(`SELECT id FROM invoices WHERE referenceInvoiceId IN (${ph}) AND type = 'RETURN_SALE'`, shiftInvoiceIds);
+                returnInvoiceIds = returns.map((r) => r.id);
+            }
+            // 1c. Delete returns first (they reference the original invoices)
+            for (const retId of returnInvoiceIds) {
+                const result = yield deleteInvoiceWithCascade(conn, retId, userId);
+                if (!result.success) {
+                    console.warn(`⚠️ [DeleteShift] Return invoice cascade failed for ${retId}: ${result.error}`);
+                }
+            }
+            // 1d. Delete the main shift invoices
+            for (const invId of shiftInvoiceIds) {
+                const result = yield deleteInvoiceWithCascade(conn, invId, userId);
+                if (!result.success) {
+                    console.warn(`⚠️ [DeleteShift] Invoice cascade failed for ${invId}: ${result.error}`);
+                }
+            }
+            // 2. Delete expense journal entries (created by addExpense)
+            const [expenses] = yield conn.query(`SELECT id, entityType, entityId, amount, createdAt FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [id]);
+            for (const exp of expenses) {
+                // Delete linked employee advance
+                if (exp.entityType === 'EMPLOYEE' && exp.entityId) {
+                    const dateStr = exp.createdAt instanceof Date
+                        ? exp.createdAt.toISOString().split('T')[0]
+                        : String(exp.createdAt).split('T')[0];
+                    const [advances] = yield conn.query(`SELECT id FROM employee_advances
+                         WHERE employeeId = ? AND amount = ? AND status = 'ACTIVE'
+                           AND (issueDate = ? OR ABS(DATEDIFF(issueDate, ?)) <= 1)`, [exp.entityId, exp.amount, dateStr, dateStr]);
+                    if (advances.length > 0) {
+                        const advanceIds = advances.map((a) => a.id);
+                        const ph = advanceIds.map(() => '?').join(',');
+                        yield conn.query(`DELETE FROM employee_advances WHERE id IN (${ph})`, advanceIds);
+                    }
+                }
+                const [expJournals] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ? COLLATE utf8mb4_unicode_ci`, [exp.id]);
+                for (const j of expJournals) {
+                    const [affAccts] = yield conn.query(`SELECT DISTINCT accountId FROM journal_lines WHERE journalId = ?`, [j.id]);
+                    for (const a of affAccts) {
+                        allAffectedAccountIds.add(a.accountId);
+                    }
+                    yield conn.query(`DELETE FROM journal_lines WHERE journalId = ?`, [j.id]);
+                    yield conn.query(`DELETE FROM journal_entries WHERE id = ?`, [j.id]);
+                }
+            }
+            // 3. Delete shift-level journal entries (closing + approval journals)
+            const [shiftJournals] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ? COLLATE utf8mb4_unicode_ci`, [id]);
+            for (const j of shiftJournals) {
+                const [affAccts] = yield conn.query(`SELECT DISTINCT accountId FROM journal_lines WHERE journalId = ?`, [j.id]);
+                for (const a of affAccts) {
+                    allAffectedAccountIds.add(a.accountId);
+                }
+                yield conn.query(`DELETE FROM journal_lines WHERE journalId = ?`, [j.id]);
+                yield conn.query(`DELETE FROM journal_entries WHERE id = ?`, [j.id]);
+            }
+            // 4. Recalculate balances for all affected accounts
+            if (allAffectedAccountIds.size > 0) {
+                yield updateAccountBalancesFromJournal(conn, Array.from(allAffectedAccountIds));
+            }
+            // 5. Delete child tables (some may have ON DELETE CASCADE, but be explicit)
+            yield conn.query(`DELETE FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [id]);
+            yield conn.query(`DELETE FROM pos_cash_movements WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [id]);
+            yield conn.query(`DELETE FROM pos_held_orders WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [id]).catch(() => { });
+            // 6. Delete cashier sub-sessions (pos_cashier_shifts has FK → pos_shifts)
+            try {
+                yield conn.query(`DELETE FROM pos_cashier_shifts WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [id]);
+            }
+            catch ( /* table may not exist */_b) { /* table may not exist */ }
+            // 7. Delete the shift itself
+            yield conn.query(`DELETE FROM pos_shifts WHERE id = ?`, [id]);
+            yield conn.query('COMMIT');
+            console.log(`🗑️ [DeleteShift] Cascade-deleted shift ${id} with ${shiftInvoices.length} invoices, ${expenses.length} expenses`);
+            res.json({
+                success: true,
+                message: 'تم حذف الوردية وجميع بياناتها بنجاح',
+                deleted: {
+                    invoices: shiftInvoices.length,
+                    expenses: expenses.length,
+                    journals: shiftJournals.length,
+                },
             });
         }
-        yield conn.query(`DELETE FROM pos_shifts WHERE id = ?`, [id]);
-        res.json({
-            success: true,
-            message: 'تم حذف الوردية بنجاح'
-        });
+        catch (txErr) {
+            yield conn.query('ROLLBACK');
+            throw txErr;
+        }
     }
     catch (error) {
         console.error('Error deleting shift:', error);
@@ -1174,6 +1471,72 @@ const deleteShift = (req, res) => __awaiter(void 0, void 0, void 0, function* ()
     }
 });
 exports.deleteShift = deleteShift;
+/**
+ * Delete orphaned POS invoices whose shift no longer exists.
+ * POST /api/pos/cleanup-orphaned
+ * Use this after shifts were deleted by the old non-cascading deleteShift.
+ */
+const cleanupOrphanedPOSInvoices = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const userId = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || 'admin';
+        const { deleteInvoiceWithCascade } = require('../utils/invoiceCascadeDelete');
+        // Find POS invoices whose posShiftId references a shift that no longer exists
+        const [orphaned] = yield conn.query(`
+            SELECT i.id FROM invoices i
+            WHERE i.isPOSSale = 1
+              AND i.posShiftId IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM pos_shifts ps WHERE ps.id = i.posShiftId)
+        `);
+        const orphanedIds = orphaned.map((r) => r.id);
+        // Also find returns referencing those orphaned invoices
+        let returnIds = [];
+        if (orphanedIds.length > 0) {
+            const ph = orphanedIds.map(() => '?').join(',');
+            const [returns] = yield conn.query(`SELECT id FROM invoices WHERE referenceInvoiceId IN (${ph}) AND type = 'RETURN_SALE'`, orphanedIds);
+            returnIds = returns.map((r) => r.id);
+        }
+        const allIds = [...returnIds, ...orphanedIds];
+        let deletedCount = 0;
+        let failedCount = 0;
+        yield conn.query('START TRANSACTION');
+        try {
+            for (const invId of allIds) {
+                const result = yield deleteInvoiceWithCascade(conn, invId, userId);
+                if (result.success) {
+                    deletedCount++;
+                }
+                else {
+                    failedCount++;
+                    console.warn(`⚠️ [Cleanup] Failed to delete orphaned invoice ${invId}: ${result.error}`);
+                }
+            }
+            yield conn.query('COMMIT');
+        }
+        catch (txErr) {
+            yield conn.query('ROLLBACK');
+            throw txErr;
+        }
+        console.log(`🧹 [Cleanup] Deleted ${deletedCount} orphaned POS invoices (${failedCount} failed)`);
+        res.json({
+            success: true,
+            message: `تم حذف ${deletedCount} فاتورة يتيمة بنجاح`,
+            deleted: deletedCount,
+            failed: failedCount,
+            total: allIds.length,
+        });
+    }
+    catch (error) {
+        console.error('Error cleaning up orphaned invoices:', error);
+        res.status(500).json({ error: error.message || 'حدث خطأ أثناء التنظيف' });
+    }
+    finally {
+        if (conn)
+            conn.release();
+    }
+});
+exports.cleanupOrphanedPOSInvoices = cleanupOrphanedPOSInvoices;
 // ============================================
 // CASH DRAWER OPERATIONS
 // ============================================
@@ -1193,6 +1556,11 @@ const addCashMovement = (req, res) => __awaiter(void 0, void 0, void 0, function
         }
         if (!['DEPOSIT', 'WITHDRAWAL'].includes(type)) {
             return res.status(400).json({ error: 'نوع الحركة غير صالح' });
+        }
+        // Reject zero or negative amounts — financial integrity guard
+        const numericAmount = Number(amount);
+        if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+            return res.status(400).json({ error: 'المبلغ يجب أن يكون أكبر من صفر' });
         }
         // Verify shift is open
         const [shifts] = yield conn.query(`SELECT id FROM pos_shifts WHERE id = ? AND status = 'OPEN'`, [shiftId]);
@@ -1214,7 +1582,7 @@ const addCashMovement = (req, res) => __awaiter(void 0, void 0, void 0, function
             approvedByName: userName,
             createdAt: now
         };
-        // emitEntityChanged('pos-cash-movement', movement, userName);
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'pos-cash-movement', updatedBy: userName });
         res.json({
             success: true,
             movement,
@@ -1239,9 +1607,20 @@ const getShiftMovements = (req, res) => __awaiter(void 0, void 0, void 0, functi
     const conn = yield (0, db_1.getConnection)();
     try {
         const { shiftId } = req.params;
-        const [movements] = yield conn.query(`SELECT m.*, u.name as approvedByName
+        const [movements] = yield conn.query(`SELECT m.*, u.name as approvedByName,
+                    COALESCE(i.bankName, a.name, 
+                        CASE m.paymentMethod 
+                            WHEN 'CASH' THEN 'نقدي'
+                            WHEN 'TREASURY' THEN 'خزينة'
+                            WHEN 'DEFERRED' THEN 'آجل'
+                            WHEN 'CHEQUE' THEN 'شيك'
+                            ELSE m.paymentMethod 
+                        END
+                    ) as paymentMethodName
              FROM pos_cash_movements m
              LEFT JOIN users u ON m.approvedBy = u.id
+             LEFT JOIN invoices i ON m.referenceType = 'INVOICE' AND m.referenceId COLLATE utf8mb4_unicode_ci = i.id COLLATE utf8mb4_unicode_ci
+             LEFT JOIN accounts a ON i.bankAccountId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
              WHERE m.shiftId = ?`, [shiftId]);
         const combinedMovements = [...movements].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
         res.json({ movements: combinedMovements });
@@ -1264,21 +1643,45 @@ exports.getShiftMovements = getShiftMovements;
  * POST /api/pos/sale
  */
 const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p, _q, _r;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { shiftId, customerId, customerName, items, subtotal, discount, discountType, taxAmount, total, paymentMethod, payments, // Split payment: Array<{ method, amount }>
         cashTendered, bankAccountId, salesmanId, notes, printReceipt, loyaltyRedeem, // { pointsToRedeem, discountAmount } from loyalty widget
         shippingFee, // Sum of shipping charges (مصاريف شحن)
         adminToken, // For trade-ins and discount overrides
-        globalDiscount, globalDiscountType, } = req.body;
+        globalDiscount, globalDiscountType, type = 'INVOICE_SALE', } = req.body;
+        const isPurchase = type === 'INVOICE_PURCHASE';
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
-        const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'Unknown';
+        const currentUserRole = (((_b = req.user) === null || _b === void 0 ? void 0 : _b.role) || '').toUpperCase();
+        const userName = ((_c = req.user) === null || _c === void 0 ? void 0 : _c.username) || ((_d = req.user) === null || _d === void 0 ? void 0 : _d.name) || 'Unknown';
         if (!shiftId || !items || items.length === 0 || total === undefined || total === null) {
             console.error('POS Sale validation failed:', { shiftId, itemsLength: items === null || items === void 0 ? void 0 : items.length, total });
             return res.status(400).json({
                 error: 'البيانات غير مكتملة',
                 details: !shiftId ? 'Missing shiftId' : !items ? 'Missing items' : items.length === 0 ? 'Empty items' : 'Missing total'
+            });
+        }
+        // Reject negative totals — negative prices on non-trade-in items are invalid.
+        // Trade-ins use negative quantity (not negative price); a negative total is data corruption.
+        const hasNegativePriceItem = items.some((i) => Number(i.quantity) > 0 && Number(i.price) < 0);
+        if (hasNegativePriceItem || Number(total) < 0) {
+            return res.status(400).json({
+                error: 'لا يمكن إنشاء فاتورة بإجمالي سالب',
+                errorCode: 'NEGATIVE_TOTAL',
+            });
+        }
+        // Guard: DEFERRED payment requires a real customer.
+        // A DEFERRED sale with no partnerId creates an accounts-receivable entry
+        // that can never be matched to a partner statement or collected.
+        const hasDeferred = Array.isArray(payments)
+            ? payments.some((p) => p.method === 'DEFERRED')
+            : paymentMethod === 'DEFERRED';
+        if (hasDeferred && !customerId) {
+            conn.release();
+            return res.status(400).json({
+                error: 'البيع الآجل يتطلب تحديد عميل. لا يمكن إنشاء مطلوبات بدون عميل.',
+                errorCode: 'DEFERRED_NO_CUSTOMER',
             });
         }
         // Validate admin token if there are negative quantities (trade-ins)
@@ -1304,19 +1707,69 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             return res.status(400).json({ error: 'الوردية غير مفتوحة' });
         }
         const shift = shifts[0];
+        // Enforce shift ownership (cashiers can only post sales to their own shifts)
+        if (currentUserRole !== 'MASTER_ADMIN' && currentUserRole !== 'ADMIN' && shift.userId !== userId) {
+            conn.release();
+            return res.status(403).json({ error: 'لا يمكن تسجيل مبيعات في وردية مستخدم آخر' });
+        }
         const now = (0, dateUtils_1.getEgyptianISOString)();
+        // === FISCAL YEAR PERIOD LOCKING ===
+        const { validateFiscalYearOpen } = yield Promise.resolve().then(() => __importStar(require('../utils/fiscalYearUtils')));
+        const fyCheck = yield validateFiscalYearOpen(now);
+        if (!fyCheck.allowed) {
+            conn.release();
+            return res.status(403).json({
+                error: fyCheck.error,
+                errorCode: fyCheck.errorCode
+            });
+        }
+        // === CASHIER DISCOUNT LIMIT ENFORCEMENT ===
+        // Non-admin users are subject to cashierMaxDiscountPercent from pos_settings.
+        // This prevents cashiers from giving excessive discounts without admin override.
+        const userRole = (((_e = req.user) === null || _e === void 0 ? void 0 : _e.role) || '').toUpperCase();
+        const isAdmin = ['ADMIN', 'MASTER_ADMIN'].includes(userRole);
+        if (!isAdmin && !adminToken) {
+            try {
+                const [settingsRows] = yield conn.query(`SELECT cashierMaxDiscountPercent FROM pos_settings LIMIT 1`);
+                const maxPct = Number((_f = settingsRows === null || settingsRows === void 0 ? void 0 : settingsRows[0]) === null || _f === void 0 ? void 0 : _f.cashierMaxDiscountPercent);
+                // Only enforce if the setting exists and is > 0
+                if (maxPct > 0 && maxPct < 100) {
+                    for (const item of items) {
+                        const linePrice = Number(item.price) || 0;
+                        const lineDiscount = Number(item.discount) || 0;
+                        if (linePrice > 0 && lineDiscount > 0) {
+                            const discountPct = (lineDiscount / linePrice) * 100;
+                            if (discountPct > maxPct) {
+                                conn.release();
+                                return res.status(403).json({
+                                    error: `الخصم ${discountPct.toFixed(0)}% يتجاوز الحد المسموح (${maxPct}%). يرجى طلب إذن مدير.`,
+                                    errorCode: 'DISCOUNT_LIMIT_EXCEEDED',
+                                    maxAllowed: maxPct,
+                                    attempted: discountPct
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            catch (e) {
+                // Column may not exist yet — skip enforcement gracefully
+                if (e.code !== 'ER_BAD_FIELD_ERROR') {
+                    console.warn('⚠️ Cashier discount check failed:', e.message);
+                }
+            }
+        }
         // Get effective warehouseId - use shift's warehouse or fallback to first available
         let effectiveWarehouseId = shift.warehouseId;
         if (!effectiveWarehouseId) {
             const [defaultWh] = yield conn.query('SELECT id FROM warehouses ORDER BY name LIMIT 1');
-            effectiveWarehouseId = ((_c = defaultWh[0]) === null || _c === void 0 ? void 0 : _c.id) || null;
+            effectiveWarehouseId = ((_g = defaultWh[0]) === null || _g === void 0 ? void 0 : _g.id) || null;
             if (effectiveWarehouseId) {
                 console.log(`⚠️ POS shift has no warehouse - using default: ${effectiveWarehouseId}`);
             }
         }
         // === SYSTEM POLICY VALIDATION (PRE-TRANSACTION) ===
         const authReq = req;
-        const currentUserRole = authReq.user ? authReq.user.role : undefined;
         const systemConfig = authReq.systemConfig;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
             const context = {
@@ -1329,7 +1782,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 createdBy: userName,
                 currentUser: userName,
                 currentUserRole,
-                lines: items.map((i) => ({
+                lines: items.filter((i) => i.tradeInAction !== 'CUSTOM_TRADE_IN').map((i) => ({
                     productId: i.productId,
                     quantity: i.quantity,
                     cost: i.cost
@@ -1350,24 +1803,50 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             // Create the invoice via the existing invoice system
             // This integrates with the ERP's accounting and inventory
             const invoiceId = (0, crypto_1.randomUUID)();
-            // Generate robust sequential POS invoice number (e.g. POS-00001)
-            const invoiceNumber = yield (0, invoiceNumberGenerator_1.generateNextSequentialNumber)(conn, 'POS-');
+            // Generate robust sequential POS invoice number (e.g. POS-00001 or POS-PUR-00001)
+            const invoiceNumber = yield (0, invoiceNumberGenerator_1.generateNextSequentialNumber)(conn, isPurchase ? 'POS-PUR-' : 'POS-');
+            // Pre-fetch trackInventory metadata
+            const productIds = items.map((i) => i.productId).filter(Boolean);
+            const productsMeta = {};
+            if (productIds.length > 0) {
+                const [metaRows] = yield conn.query('SELECT id, trackInventory, type FROM products WHERE id IN (?)', [productIds]);
+                for (const row of metaRows) {
+                    productsMeta[row.id] = (row.trackInventory !== 0 && row.trackInventory !== false) && (row.type !== 'SERVICE' && row.type !== 'خدمة');
+                }
+            }
             // Prepare invoice lines — SERVER-SIDE RECOMPUTATION
             // Never trust frontend totals. Recompute every line using integer piasters.
             const toPiasters = (n) => Math.round((n || 0) * 100);
             const fromPiasters = (p) => p / 100;
-            const invoiceLines = items.map((item) => {
+            // Filter out zero-quantity lines before any processing.
+            // A qty=0 line has no financial or inventory impact; silently persisting
+            // it pollutes invoice_lines and can confuse refund quantity checks.
+            // Negative-qty items (trade-ins/returns) are intentional and kept.
+            const filteredItems = items.filter((i) => Number(i.quantity) !== 0);
+            if (filteredItems.length === 0) {
+                yield conn.query('ROLLBACK');
+                return res.status(400).json({
+                    error: 'لا يوجد بنود صالحة في الفاتورة بعد حذف الكميات الصفرية',
+                    errorCode: 'NO_VALID_LINES',
+                });
+            }
+            const invoiceLines = filteredItems.map((item) => {
+                var _a;
                 const qty = Number(item.quantity) || 0;
                 const price = Number(item.price) || 0;
                 // The frontend sends the discount value (either fixed amount or percentage) in `item.discount`
                 const discountVal = Number(item.discount) || 0;
                 const discountType = item.discountType || 'FIXED';
-                // Recompute line total in piasters
-                const grossP = Math.round(toPiasters(price) * qty);
-                const discountP = discountType === 'PERCENT'
-                    ? Math.round((grossP * discountVal) / 100)
-                    : toPiasters(discountVal);
-                const recomputedTotalP = Math.max(0, grossP - discountP);
+                // Recompute line total in piasters (preserving sign for returns/trade-ins)
+                const isNegative = qty < 0;
+                const absQty = Math.abs(qty);
+                const absGrossP = Math.round(toPiasters(price) * absQty);
+                const isPercent = discountType === 'PERCENT' || discountType === 'PERCENTAGE';
+                const discountP = isPercent
+                    ? Math.round((absGrossP * discountVal) / 100)
+                    : Math.round(toPiasters(discountVal) * absQty);
+                const absNetP = Math.max(0, absGrossP - discountP);
+                const recomputedTotalP = isNegative ? -absNetP : absNetP;
                 const recomputedTotal = fromPiasters(recomputedTotalP);
                 return {
                     productId: item.productId,
@@ -1376,8 +1855,8 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     quantity: qty,
                     price,
                     cost: Number(item.cost) || 0,
-                    discount: discountType === 'PERCENT' ? fromPiasters(discountP) : discountVal,
-                    discountValue: discountType === 'PERCENT' ? discountVal : 0,
+                    discount: fromPiasters(discountP),
+                    discountValue: isPercent ? discountVal : 0,
                     discountType,
                     total: recomputedTotal,
                     unitId: item.unitId,
@@ -1385,32 +1864,47 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     conversionFactor: item.conversionFactor || 1,
                     baseQuantity: item.baseQuantity || (qty * (item.conversionFactor || 1)),
                     warrantyMonths: item.warrantyMonths || 0,
+                    trackInventory: (_a = productsMeta[item.productId]) !== null && _a !== void 0 ? _a : true,
+                    hasWarranty: item.hasWarranty ? 1 : 0,
+                    inBranchInstallation: item.inBranchInstallation ? 1 : 0,
                 };
             });
-            // Recompute invoice total from recomputed line totals
-            const recomputedSubtotalP = invoiceLines.reduce((s, l) => s + toPiasters(l.total), 0);
-            const globalDiscountP = (globalDiscountType === 'PERCENT')
-                ? Math.round((recomputedSubtotalP * (globalDiscount || 0)) / 100)
+            // Separate new items and trade-ins to match frontend cart logic exactly
+            const newItemsLines = invoiceLines.filter((l) => l.total >= 0 && l.productId !== 'CUSTOM_TRADE_IN');
+            const tradeInLines = invoiceLines.filter((l) => l.total < 0 || l.productId === 'CUSTOM_TRADE_IN');
+            const newItemsSubtotalP = newItemsLines.reduce((s, l) => s + Math.max(0, toPiasters(l.total)), 0);
+            const isGlobalPercent = globalDiscountType === 'PERCENT' || globalDiscountType === 'PERCENTAGE';
+            const globalDiscountP = isGlobalPercent
+                ? Math.round((newItemsSubtotalP * (globalDiscount || 0)) / 100)
                 : toPiasters(globalDiscount || 0);
-            const afterDiscountP = Math.max(0, recomputedSubtotalP - globalDiscountP);
+            const afterDiscountP = Math.max(0, newItemsSubtotalP - globalDiscountP);
             // Shipping is added after discount, before tax (matches frontend cart engine)
             const shippingFeeP = toPiasters(shippingFee || 0);
             const afterShippingP = afterDiscountP + shippingFeeP;
             const recomputedTaxP = Math.round((afterShippingP * (taxAmount || 0)) / (afterShippingP > 0 ? (afterShippingP + (taxAmount ? toPiasters(taxAmount) : 0)) : 1) || 0);
-            const recomputedTotalP = afterShippingP + toPiasters(taxAmount || 0);
-            // Validate frontend total against server recomputation (1 piaster tolerance)
-            const frontendTotalP = toPiasters(total);
-            if (Math.abs(recomputedTotalP - frontendTotalP) > 1) {
-                console.warn(`⚠️ POS total mismatch: frontend=${fromPiasters(frontendTotalP)}, server=${fromPiasters(recomputedTotalP)}, diff=${fromPiasters(Math.abs(recomputedTotalP - frontendTotalP))}`);
-            }
-            // Use server-recomputed total as the authoritative value
-            const serverTotal = fromPiasters(recomputedTotalP);
-            const serverSubtotal = fromPiasters(recomputedSubtotalP);
+            const newItemsTotalP = afterShippingP + toPiasters(taxAmount || 0);
+            const tradeInCreditP = Math.abs(tradeInLines.reduce((s, l) => s + toPiasters(l.total), 0));
+            const recomputedTotalP = newItemsTotalP - tradeInCreditP;
+            const recomputedSubtotalP = newItemsSubtotalP;
             // Determine payment method(s)
             // Support both single paymentMethod and split payments array
             let resolvedPayments = payments && Array.isArray(payments)
                 ? payments
                 : [{ method: paymentMethod || 'CASH', amount: total }];
+            // Calculate bank fees charged to the client to add to the invoice total
+            const clientFeesTotal = resolvedPayments
+                .filter((p) => p.feeChargedTo === 'CLIENT' && p.feeTotal)
+                .reduce((sum, p) => sum + (Number(p.feeTotal) || 0), 0);
+            // Validate frontend total against server recomputation (1 piaster tolerance)
+            const clientFeesTotalP = toPiasters(clientFeesTotal);
+            const recomputedTotalWithFeesP = recomputedTotalP + clientFeesTotalP;
+            const frontendTotalP = toPiasters(total);
+            if (Math.abs(recomputedTotalWithFeesP - frontendTotalP) > 1) {
+                console.warn(`⚠️ POS total mismatch: frontend=${fromPiasters(frontendTotalP)}, server=${fromPiasters(recomputedTotalWithFeesP)}, diff=${fromPiasters(Math.abs(recomputedTotalWithFeesP - frontendTotalP))}`);
+            }
+            // Use server-recomputed total as the authoritative value
+            const serverTotal = fromPiasters(recomputedTotalWithFeesP);
+            const serverSubtotal = fromPiasters(recomputedSubtotalP);
             // Handle overpayment (change given)
             // Deduct change from the cash payment split so that the drawer balance matches reality
             const totalPaid = resolvedPayments.reduce((sum, p) => sum + p.amount, 0);
@@ -1429,54 +1923,119 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     });
                 }
             }
+            // Lock and validate loyalty points balance before checking splits to avoid underpayment
+            let expectedLoyaltyDiscount = 0;
+            if (loyaltyRedeem && customerId && loyaltyRedeem.pointsToRedeem > 0) {
+                const [balRows] = yield conn.query(`SELECT 
+                        COALESCE(SUM(CASE WHEN type = 'EARN' THEN points ELSE 0 END), 0) -
+                        COALESCE(SUM(CASE WHEN type IN ('REDEEM','REFUND_CLAWBACK','EXPIRE') THEN ABS(points) ELSE 0 END), 0) +
+                        COALESCE(SUM(CASE WHEN type = 'ADJUST' THEN points ELSE 0 END), 0) AS balance
+                     FROM loyalty_transactions
+                     WHERE customerId = ?
+                     FOR UPDATE`, [customerId]);
+                const currentBalance = Number((_h = balRows[0]) === null || _h === void 0 ? void 0 : _h.balance) || 0;
+                if (currentBalance >= loyaltyRedeem.pointsToRedeem) {
+                    expectedLoyaltyDiscount = Number(loyaltyRedeem.discountAmount) || 0;
+                }
+                else {
+                    yield conn.query('ROLLBACK');
+                    return res.status(400).json({
+                        error: `نقاط الولاء غير كافية: متوفر ${currentBalance}، المطلوب ${loyaltyRedeem.pointsToRedeem}`,
+                        errorCode: 'INSUFFICIENT_LOYALTY_POINTS',
+                    });
+                }
+            }
+            const requiredTotal = serverTotal - expectedLoyaltyDiscount;
+            // Guard: split payments total must cover the invoice (allowing 1-piaster rounding tolerance).
+            // If the total paid is less than the server total and there is no DEFERRED split to cover
+            // the gap, the sale would silently create a phantom receivable with no AR record.
+            const hasDeferredSplit = resolvedPayments.some(p => p.method === 'DEFERRED');
+            if (!hasDeferredSplit && totalPaid < requiredTotal - 0.01) {
+                yield conn.query('ROLLBACK');
+                return res.status(400).json({
+                    error: `مبلغ الدفع (${totalPaid.toFixed(2)}) أقل من المطلوب (${requiredTotal.toFixed(2)}) بعد خصم النقاط`,
+                    errorCode: 'UNDERPAYMENT',
+                    totalPaid,
+                    serverTotal: requiredTotal,
+                });
+            }
             // Primary payment method for the invoice record.
             // DEFERRED overrides all others: any deferred portion creates a receivable,
             // and buildInvAggSQL + PartnerStatement exclude CASH invoices from balance tracking.
             // Without this, a mixed payment (500 cash + 500 deferred) would store 'CASH'
             // when cash >= deferred, hiding the invoice from partner statements entirely.
-            const hasDeferredSplit = resolvedPayments.some(p => p.method === 'DEFERRED');
             const primaryPaymentMethod = hasDeferredSplit
                 ? 'DEFERRED'
                 : resolvedPayments.length > 0
                     ? resolvedPayments.reduce((a, b) => b.amount > a.amount ? b : a).method
                     : 'DEFERRED';
             // Insert invoice
+            const dominantPayment = resolvedPayments.length > 0
+                ? resolvedPayments.reduce((a, b) => Math.abs(b.amount) > Math.abs(a.amount) ? b : a)
+                : null;
+            const finalBankAccountId = (dominantPayment === null || dominantPayment === void 0 ? void 0 : dominantPayment.accountId) || bankAccountId || null;
+            const finalBankName = (dominantPayment === null || dominantPayment === void 0 ? void 0 : dominantPayment.accountName) || null;
+            const paymentBreakdownJson = resolvedPayments.map((p) => ({
+                method: p.method,
+                amount: Math.abs(p.amount),
+                accountId: p.accountId || null,
+                accountName: p.accountName || null,
+                reference: p.reference || null,
+                fee: p.fee || null,
+                feeTax: p.feeTax || null,
+                feeTotal: p.feeTotal || null,
+                applyFee: p.applyFee || null,
+                feeChargedTo: p.feeChargedTo || null
+            }));
             yield conn.query(`INSERT INTO invoices (
                     id, number, date, type, partnerId, partnerName, 
                     total, status, paymentMethod, posted, notes,
                     taxAmount, globalDiscount, globalDiscountType,
                     warehouseId, createdBy, posShiftId, isPOSSale,
-                    bankAccountId, salesmanId, shippingFee
-                ) VALUES (?, ?, ?, 'INVOICE_SALE', ?, ?, ?, 'POSTED', ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)`, [
+                    bankAccountId, bankName, paymentBreakdown, salesmanId, shippingFee, branchId
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'POSTED', ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)`, [
                 invoiceId, invoiceNumber, now,
-                customerId || null, customerName || 'عميل نقدي',
+                type,
+                customerId || null, customerName || (isPurchase ? 'مورد نقدي' : 'عميل نقدي'),
                 serverTotal, primaryPaymentMethod, notes || null,
                 taxAmount || 0, globalDiscount || 0, globalDiscountType || 'FIXED',
                 shift.warehouseId, userName, shiftId,
-                bankAccountId || null, salesmanId || null,
-                shippingFee || 0
+                finalBankAccountId, finalBankName, JSON.stringify(paymentBreakdownJson),
+                salesmanId || null, shippingFee || 0, shift.branchId || null
             ]);
             // Insert invoice lines
             // (effectiveWarehouseId has been determined above Policy Validation)
             // === PERF: BATCH STOCK VALIDATION (1 query instead of N) ===
-            // Only validate if negative stock is NOT allowed globally
-            if (effectiveWarehouseId && (!systemConfig || !systemConfig.allowNegativeStock)) {
-                // Bypass stock validation for CUSTOM_TRADE_IN
-                const normalLines = invoiceLines.filter((l) => !l.variantId && l.tradeInAction !== 'CUSTOM_TRADE_IN');
-                const variantLines = invoiceLines.filter((l) => l.variantId && l.tradeInAction !== 'CUSTOM_TRADE_IN');
+            // Only validate if negative stock is NOT allowed globally. Bypass entirely in Purchase Mode.
+            if (!isPurchase && effectiveWarehouseId && (!systemConfig || !systemConfig.allowNegativeStock)) {
+                // Bypass stock validation for CUSTOM_TRADE_IN and services
+                const normalLines = invoiceLines.filter((l) => !l.variantId && l.tradeInAction !== 'CUSTOM_TRADE_IN' && l.trackInventory !== false);
+                const variantLines = invoiceLines.filter((l) => l.variantId && l.tradeInAction !== 'CUSTOM_TRADE_IN' && l.trackInventory !== false);
                 const insufficientItems = [];
                 if (normalLines.length > 0) {
                     const productIds = normalLines.map((l) => l.productId);
-                    const [stockRows] = yield conn.query(`SELECT productId, stock FROM product_stocks WHERE productId IN (?) AND warehouseId = ?`, [productIds, effectiveWarehouseId]);
+                    const [stockRows] = yield conn.query(
+                    // FOR UPDATE locks these rows so concurrent sales cannot
+                    // pass this check simultaneously and both deduct past zero.
+                    `SELECT productId, stock FROM product_stocks WHERE productId IN (?) AND warehouseId = ? FOR UPDATE`, [productIds, effectiveWarehouseId]);
                     const stockMap = new Map(stockRows.map(r => [r.productId, Number(r.stock)]));
+                    // Aggregate requested quantities per product BEFORE checking.
+                    // Without this, two lines of the same product (qty=5 + qty=5, stock=6)
+                    // both pass individually even though 10 > 6.
+                    const aggregatedQtyMap = new Map();
                     for (const line of normalLines) {
                         if (line.baseQuantity <= 0)
-                            continue; // Skip returns
-                        const currentStock = stockMap.get(line.productId) || 0;
-                        if (currentStock < line.baseQuantity) {
+                            continue;
+                        aggregatedQtyMap.set(line.productId, (aggregatedQtyMap.get(line.productId) || 0) + line.baseQuantity);
+                    }
+                    for (const [productId, totalQty] of aggregatedQtyMap) {
+                        const currentStock = stockMap.get(productId) || 0;
+                        if (currentStock < totalQty) {
+                            // Find any matching line for the product name
+                            const refLine = normalLines.find((l) => l.productId === productId);
                             insufficientItems.push({
-                                productName: line.productName,
-                                requested: line.baseQuantity,
+                                productName: (refLine === null || refLine === void 0 ? void 0 : refLine.productName) || productId,
+                                requested: totalQty,
                                 available: currentStock
                             });
                         }
@@ -1484,6 +2043,8 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 }
                 if (variantLines.length > 0) {
                     const variantIds = variantLines.map((l) => l.variantId);
+                    // Lock product_variant_stocks rows for update to prevent concurrent oversell
+                    const [lockRows] = yield conn.query(`SELECT variantId FROM product_variant_stocks WHERE variantId IN (?) AND warehouseId = ? FOR UPDATE`, [variantIds, effectiveWarehouseId]);
                     const [vStockRows] = yield conn.query(`
                         SELECT 
                           pv.id AS variantId,
@@ -1498,14 +2059,20 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                         WHERE pv.id IN (?)
                     `, [effectiveWarehouseId, variantIds]);
                     const vStockMap = new Map(vStockRows.map(r => [r.variantId, Number(r.stock)]));
+                    // Same aggregation fix: accumulate quantities per variant before checking
+                    const aggregatedVQtyMap = new Map();
                     for (const line of variantLines) {
                         if (line.baseQuantity <= 0)
-                            continue; // Skip returns
-                        const currentStock = vStockMap.get(line.variantId) || 0;
-                        if (currentStock < line.baseQuantity) {
+                            continue;
+                        aggregatedVQtyMap.set(line.variantId, (aggregatedVQtyMap.get(line.variantId) || 0) + line.baseQuantity);
+                    }
+                    for (const [variantId, totalQty] of aggregatedVQtyMap) {
+                        const currentStock = vStockMap.get(variantId) || 0;
+                        if (currentStock < totalQty) {
+                            const refLine = variantLines.find((l) => l.variantId === variantId);
                             insufficientItems.push({
-                                productName: line.productName,
-                                requested: line.baseQuantity,
+                                productName: (refLine === null || refLine === void 0 ? void 0 : refLine.productName) || variantId,
+                                requested: totalQty,
                                 available: currentStock
                             });
                         }
@@ -1527,32 +2094,67 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 line.unitId || null, line.unitName || null,
                 line.conversionFactor, line.baseQuantity,
                 effectiveWarehouseId, line.variantId || null,
-                line.serials && line.serials.length > 0 ? JSON.stringify(line.serials) : null
+                line.serials && line.serials.length > 0 ? JSON.stringify(line.serials) : null,
+                line.hasWarranty || 0,
+                line.inBranchInstallation || 0,
+                line.warrantyMonths || 0
             ]);
             yield conn.query(`INSERT INTO invoice_lines (
                     invoiceId, productId, productName, quantity, price, cost,
-                    discount, discountType, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, variantId, serials
+                    discount, discountType, total, unitId, unitName, conversionFactor, baseQuantity, warehouseId, variantId, serials,
+                    hasWarranty, inBranchInstallation, warrantyMonths
                 ) VALUES ?`, [lineValues]);
             // === PERF: BATCH stock updates ===
             if (effectiveWarehouseId) {
                 // 1. Update warehouse-level stock (sequential due to WHERE clause)
-                const stockUpdateLines = invoiceLines.filter((l) => l.tradeInAction !== 'CUSTOM_TRADE_IN');
+                const stockUpdateLines = invoiceLines.filter((l) => l.tradeInAction !== 'CUSTOM_TRADE_IN' && l.tradeInAction !== 'WRITE_OFF' && l.trackInventory !== false);
                 // SORT BY PRODUCT ID TO PREVENT DEADLOCKS
                 const sortedLines = [...stockUpdateLines].sort((a, b) => String(a.productId).localeCompare(String(b.productId)));
                 for (const line of sortedLines) {
-                    yield conn.query(`UPDATE product_stocks 
-                         SET stock = stock - ?
-                         WHERE productId = ? AND warehouseId = ?`, [line.baseQuantity, line.productId, effectiveWarehouseId]);
+                    if (isPurchase) {
+                        // ON DUPLICATE KEY UPDATE to handle unstocked products
+                        yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                             VALUES (?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), line.productId, effectiveWarehouseId, line.baseQuantity, line.baseQuantity]);
+                    }
+                    else {
+                        if (line.baseQuantity < 0) {
+                            // Trade-in (adding to stock) — insert if not exists
+                            yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                                 VALUES (?, ?, ?, ?)
+                                 ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), line.productId, effectiveWarehouseId, -line.baseQuantity, -line.baseQuantity]);
+                        }
+                        else {
+                            // Use UPSERT (INSERT ... ON DUPLICATE KEY UPDATE) to ensure the row exists
+                            // and stock is updated correctly even if no stock record was initialized.
+                            yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                                 VALUES (?, ?, ?, ?)
+                                 ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), line.productId, effectiveWarehouseId, -line.baseQuantity, line.baseQuantity]);
+                        }
+                    }
                     // Update variant-specific warehouse stock and global stock if it's a variant
                     if (line.variantId) {
-                        // Only UPDATE existing rows — don't INSERT new ones with negative values.
-                        // If no pvs row exists, the stock query falls back to product_variants.stock (global),
-                        // which we deduct below.
-                        yield conn.query(`UPDATE product_variant_stocks 
-                             SET stock = stock - ?
-                             WHERE variantId = ? AND warehouseId = ?`, [line.baseQuantity, line.variantId, effectiveWarehouseId]);
+                        if (isPurchase) {
+                            yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                                 VALUES (?, ?, ?, ?, ?)
+                                 ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), line.variantId, line.productId, effectiveWarehouseId, line.baseQuantity, line.baseQuantity]);
+                        }
+                        else {
+                            if (line.baseQuantity < 0) {
+                                yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                                     VALUES (?, ?, ?, ?, ?)
+                                     ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), line.variantId, line.productId, effectiveWarehouseId, -line.baseQuantity, -line.baseQuantity]);
+                            }
+                            else {
+                                // Use UPSERT (INSERT ... ON DUPLICATE KEY UPDATE) to ensure the row exists
+                                // and stock is updated correctly even if no variant stock record was initialized.
+                                yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                                     VALUES (?, ?, ?, ?, ?)
+                                     ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), line.variantId, line.productId, effectiveWarehouseId, -line.baseQuantity, line.baseQuantity]);
+                            }
+                        }
                         yield conn.query(`UPDATE product_variants 
-                             SET stock = stock - ?
+                             SET stock = stock ${isPurchase ? '+' : '-'} ?
                              WHERE id = ?`, [line.baseQuantity, line.variantId]);
                     }
                 }
@@ -1566,7 +2168,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     const caseParams = [];
                     const productIds = [];
                     for (const [productId, totalQty] of productStockMap) {
-                        cases.push('WHEN id = ? THEN ROUND(stock - ?, 5)');
+                        cases.push(`WHEN id = ? THEN ROUND(stock ${isPurchase ? '+' : '-'} ?, 5)`);
                         caseParams.push(productId, totalQty);
                         productIds.push(productId);
                     }
@@ -1578,11 +2180,12 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 const saleMovementValues = stockUpdateLines.map((line) => [
                     line.productId,
                     effectiveWarehouseId,
-                    -(line.baseQuantity),
-                    'SALE', 'INVOICE_SALE',
+                    isPurchase ? line.baseQuantity : -(line.baseQuantity),
+                    isPurchase ? 'PURCHASE' : 'SALE',
+                    isPurchase ? 'INVOICE_PURCHASE' : 'INVOICE_SALE',
                     invoiceId,
                     line.cost, // Include unit_cost for audit parity
-                    `POS Sale ${invoiceNumber}`,
+                    isPurchase ? `POS Purchase ${invoiceNumber}` : `POS Sale ${invoiceNumber}`,
                     now,
                     line.variantId || null
                 ]);
@@ -1599,12 +2202,19 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             for (const payment of resolvedPayments) {
                 const movementId = (0, crypto_1.randomUUID)();
                 yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, description, referenceId, referenceType, createdAt)
-                     VALUES (?, ?, 'SALE', ?, ?, ?, ?, 'INVOICE', ?)`, [movementId, shiftId, payment.amount, payment.method, payment.reference || null, invoiceId, now]);
+                     VALUES (?, ?, ?, ?, ?, ?, ?, 'INVOICE', ?)`, [movementId, shiftId, isPurchase ? 'PURCHASE' : 'SALE', payment.amount, payment.method, payment.reference || null, invoiceId, now]);
             }
             // Update shift totals
-            yield conn.query(`UPDATE pos_shifts 
-                 SET totalSales = totalSales + ?, salesCount = salesCount + 1, updatedAt = ?
-                 WHERE id = ?`, [serverTotal, now, shiftId]);
+            if (isPurchase) {
+                yield conn.query(`UPDATE pos_shifts 
+                     SET totalPurchases = totalPurchases + ?, purchasesCount = purchasesCount + 1, updatedAt = ?
+                     WHERE id = ?`, [serverTotal, now, shiftId]);
+            }
+            else {
+                yield conn.query(`UPDATE pos_shifts 
+                     SET totalSales = totalSales + ?, salesCount = salesCount + 1, updatedAt = ?
+                     WHERE id = ?`, [serverTotal, now, shiftId]);
+            }
             // ═══════════════════════════════════════════════════════════════════
             // AUTO-POST REVENUE/COGS JOURNAL ENTRY (ATOMIC — failure rolls back sale)
             // POS sales bypass createInvoice, so we must call this directly.
@@ -1615,7 +2225,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             const customTradeInLines = invoiceLines.filter((l) => l.tradeInAction === 'CUSTOM_TRADE_IN');
             const customTradeInTotal = Math.abs(customTradeInLines.reduce((sum, l) => sum + l.total, 0));
             const revenueTotal = Number((serverTotal + customTradeInTotal).toFixed(2));
-            yield (0, invoiceController_1.syncRevenueCogsJournal)(conn, invoiceId, invoiceNumber, 'INVOICE_SALE', now, customerName || 'عميل نقدي', revenueTotal, invoiceLines, userName, false, isCashInvoice, 0, (0, branchFilter_1.resolveBranchIdForWrite)(req));
+            yield (0, invoiceController_1.syncRevenueCogsJournal)(conn, invoiceId, invoiceNumber, type, now, customerName || (isPurchase ? 'مورد نقدي' : 'عميل نقدي'), revenueTotal, invoiceLines, userName, false, isCashInvoice, 0, shift.branchId || null);
             console.log(`📒 [POS] Revenue/COGS journal created for POS invoice ${invoiceNumber}`);
             // ═══════════════════════════════════════════════════════════════════
             // TRADE-IN COMPENSATING JOURNAL ENTRY
@@ -1636,11 +2246,11 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 const partnerAccount = partnerAccRows[0];
                 if (expenseAccount && partnerAccount) {
                     const tradeInJournalId = (0, crypto_1.randomUUID)();
-                    yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate)
-                         VALUES (?, ?, ?, ?, ?, 'EGP', 1)`, [
+                    yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                         VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [
                         tradeInJournalId, now,
                         `تسوية مبادلة منتج (POS) #${invoiceNumber} - ${customerName || 'عميل نقدي'}`,
-                        invoiceId, userName
+                        invoiceId, userName, shift.branchId || null
                     ]);
                     yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
                             [tradeInJournalId, expenseAccount.id, expenseAccount.name, customTradeInTotal, 0, 'EGP', 1, customTradeInTotal, 0],
@@ -1657,14 +2267,38 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             // No try/catch: if this fails the entire TX is rolled back.
             // ═══════════════════════════════════════════════════════════════════
             const affectedAccountIds = [];
-            // Resolve partner (receivables) account once — same for all splits
-            let [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE '104%' LIMIT 1`);
+            // Resolve partner (receivables for sales, payables for purchases) account dynamically
+            // BUG FIX: Previously, if no 104%/عملاء% account existed, partnerAccount was null
+            // and ALL treasury journals were silently skipped via `continue`, causing payments
+            // to disappear from يومية الخزينة. Now uses broader fallback + auto-create.
+            let partnerAccountCodePattern = isPurchase ? '201%' : '104%';
+            let partnerAccountNamePattern = isPurchase ? '%موردين%' : '%عملاء%';
+            let [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [partnerAccountCodePattern]);
             if (partnerAccRows.length === 0) {
-                [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%عملاء%' LIMIT 1`);
+                [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1`, [partnerAccountNamePattern]);
+            }
+            // Broader fallback: any receivable/payable account
+            if (partnerAccRows.length === 0) {
+                const broadPattern = isPurchase ? '%دائنين%' : '%مدينين%';
+                [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE (name LIKE ? OR name LIKE '%ذمم%') AND type = 'ASSET' LIMIT 1`, [broadPattern]);
+            }
+            // Last resort: auto-create the receivable/payable account
+            if (partnerAccRows.length === 0) {
+                const autoAccId = (0, crypto_1.randomUUID)();
+                const autoCode = isPurchase ? '2010' : '1040';
+                const autoName = isPurchase ? 'موردين - ذمم دائنة' : 'عملاء - ذمم مدينة';
+                const autoType = isPurchase ? 'LIABILITY' : 'ASSET';
+                yield conn.query(`INSERT INTO accounts (id, code, name, type, balance, openingBalance) VALUES (?, ?, ?, ?, 0, 0)`, [autoAccId, autoCode, autoName, autoType]);
+                partnerAccRows = [{ id: autoAccId, name: autoName }];
+                console.log(`🔧 [POS] Auto-created ${autoType} account: ${autoName} (${autoCode}) — was missing from chart of accounts`);
             }
             const partnerAccount = partnerAccRows[0];
             for (const payment of resolvedPayments) {
                 if (payment.amount === 0)
+                    continue;
+                // DEFERRED payments don't create treasury journals — they're tracked
+                // as receivables on the invoice itself, not as cash movements.
+                if (payment.method === 'DEFERRED')
                     continue;
                 const treasuryJournalId = (0, crypto_1.randomUUID)();
                 // ── Resolve payment GL account ────────────────────────────
@@ -1703,27 +2337,37 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     }
                 }
                 if (!paymentAccount || !partnerAccount) {
-                    console.warn(`⚠️ [POS] Could not resolve GL account for payment split (${payment.method}, accountId=${payment.accountId})`);
-                    continue;
+                    // CRITICAL: Never silently skip treasury journals for real payments.
+                    // This was the root cause of missing يومية الخزينة entries.
+                    console.error(`🚨 [POS] CRITICAL: Could not resolve GL account for payment split — invoice=${invoiceNumber}, method=${payment.method}, accountId=${payment.accountId}, paymentAccount=${!!paymentAccount}, partnerAccount=${!!partnerAccount}`);
+                    throw new Error(`فشل في تحديد حساب الدفع للعملية ${invoiceNumber} (طريقة الدفع: ${payment.method}). يرجى التأكد من وجود حسابات الخزينة والعملاء في شجرة الحسابات.`);
                 }
                 // Use accountName from the modal if provided, else fall back to GL name
                 const methodLabel = payment.accountName || paymentAccount.name;
                 // Build description with reference if provided
                 const refSuffix = payment.reference ? ` [مرجع: ${payment.reference}]` : '';
                 const absAmount = Math.abs(payment.amount);
-                const isPayout = payment.amount < 0;
+                const isPayout = isPurchase ? payment.amount > 0 : payment.amount < 0;
                 // Journal Header
-                yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate)
-                     VALUES (?, ?, ?, ?, ?, 'EGP', 1)`, [
+                yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                     VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [
                     treasuryJournalId, now,
-                    isPayout
-                        ? `مدفوعات خارجة (Payout) #${invoiceNumber} - ${customerName || 'عميل نقدي'} (${methodLabel})${refSuffix}`
-                        : `متحصلات (POS) #${invoiceNumber} - ${customerName || 'عميل نقدي'} (${methodLabel})${refSuffix}`,
-                    invoiceId, userName
+                    isPurchase
+                        ? (isPayout
+                            ? `صرف لمورد (POS) #${invoiceNumber} - ${customerName || 'مورد نقدي'} (${methodLabel})${refSuffix}`
+                            : `مرتجع نقدي من مورد #${invoiceNumber} - ${customerName || 'مورد نقدي'} (${methodLabel})${refSuffix}`)
+                        : (isPayout
+                            ? `مدفوعات خارجة (Payout) #${invoiceNumber} - ${customerName || 'عميل نقدي'} (${methodLabel})${refSuffix}`
+                            : `متحصلات (POS) #${invoiceNumber} - ${customerName || 'عميل نقدي'} (${methodLabel})${refSuffix}`),
+                    invoiceId, userName, shift.branchId || null
                 ]);
                 const drAccount = isPayout ? partnerAccount : paymentAccount;
                 const crAccount = isPayout ? paymentAccount : partnerAccount;
-                const feePortion = (!isPayout && payment.applyFee) ? (Number(payment.feeTotal) || 0) : 0;
+                // Determine feePortion (legacy backward compatibility only)
+                // If feeChargedTo is CLIENT or BRANCH, the fee is handled in invoice totals or expenses.
+                // If feeChargedTo is missing, we fall back to legacy split logic.
+                const feeChargedTo = payment.feeChargedTo || (payment.applyFee ? 'CLIENT_LEGACY' : 'BRANCH');
+                const feePortion = (!isPayout && payment.applyFee && feeChargedTo === 'CLIENT_LEGACY') ? (Number(payment.feeTotal) || 0) : 0;
                 const principalPortion = absAmount - feePortion;
                 const journalLines = [
                     [treasuryJournalId, drAccount.id, drAccount.name, absAmount, 0, 'EGP', 1, absAmount, 0]
@@ -1734,9 +2378,13 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     let feeRevenueAccount = feeRevAccRows[0];
                     if (!feeRevenueAccount) {
                         const feeAccountId = (0, crypto_1.randomUUID)();
-                        const feeAccountCode = `4099${Math.floor(Math.random() * 1000)}`;
+                        let feeAccountCode = `4099${Math.floor(Math.random() * 1000)}`;
+                        const [existingCode] = yield conn.query(`SELECT id FROM accounts WHERE code = ? LIMIT 1`, [feeAccountCode]);
+                        if (existingCode.length > 0) {
+                            feeAccountCode = `${feeAccountCode}-${Math.floor(Math.random() * 100)}`;
+                        }
                         const feeAccountName = 'إيرادات رسوم بنكية وإضافية';
-                        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance) VALUES (?, ?, ?, 'REVENUE', 'OTHER_REVENUE', 0, 0)`, [feeAccountId, feeAccountCode, feeAccountName]);
+                        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode) VALUES (?, ?, ?, 'REVENUE', 'OTHER_REVENUE', 0, 0, 'EGP')`, [feeAccountId, feeAccountCode, feeAccountName]);
                         feeRevenueAccount = { id: feeAccountId, name: feeAccountName };
                     }
                     journalLines.push([treasuryJournalId, feeRevenueAccount.id, feeRevenueAccount.name, 0, feePortion, 'EGP', 1, 0, feePortion]);
@@ -1774,11 +2422,15 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 let bankChargesAccount = chargesAccRows[0];
                 if (!bankChargesAccount) {
                     // Auto-create the expense account
-                    const [maxCodeRows] = yield conn.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code REGEXP '^[0-9]+$' AND code LIKE '5%'");
-                    const maxCode = Number((_d = maxCodeRows[0]) === null || _d === void 0 ? void 0 : _d.maxCode) || 50100;
-                    const feeAccountCode = (maxCode + 1).toString();
+                    const [maxCodeRows] = yield conn.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code COLLATE utf8mb4_unicode_ci REGEXP '^[0-9]+$' AND code LIKE '5%'");
+                    const maxCode = Number((_j = maxCodeRows[0]) === null || _j === void 0 ? void 0 : _j.maxCode) || 50100;
+                    let feeAccountCode = (maxCode + 1).toString();
+                    const [existingCode] = yield conn.query(`SELECT id FROM accounts WHERE code = ? LIMIT 1`, [feeAccountCode]);
+                    if (existingCode.length > 0) {
+                        feeAccountCode = `${feeAccountCode}-${Math.floor(Math.random() * 100)}`;
+                    }
                     const feeAccountId = (0, crypto_1.randomUUID)();
-                    yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance) VALUES (?, ?, ?, 'EXPENSE', 'OPERATING_EXPENSE', 0, 0)`, [feeAccountId, feeAccountCode, 'مصاريف بنكية']);
+                    yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode) VALUES (?, ?, ?, 'EXPENSE', 'OPERATING_EXPENSE', 0, 0, 'EGP')`, [feeAccountId, feeAccountCode, 'مصاريف بنكية']);
                     bankChargesAccount = { id: feeAccountId, name: 'مصاريف بنكية' };
                     console.log(`🏦 [POS] Auto-created Bank Charges account: ${feeAccountCode}`);
                 }
@@ -1800,11 +2452,11 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                         continue;
                     const feeMethodLabel = payment.accountName || feePaymentAccount.name;
                     // Journal Header
-                    yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate)
-                         VALUES (?, ?, ?, ?, ?, 'EGP', 1)`, [
+                    yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                         VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [
                         feeJournalId, now,
                         `رسوم بنكية (POS) #${invoiceNumber} - ${feeMethodLabel} (${feeBeforeTax}${feeTax > 0 ? ` + ضريبة ${feeTax}` : ''})`,
-                        invoiceId, userName
+                        invoiceId, userName, shift.branchId || null
                     ]);
                     // Journal Lines: Dr Bank Charges Expense, Cr Payment Account (customer paid)
                     const feeLines = [
@@ -1844,20 +2496,30 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 let [scrapAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE (name LIKE '%خردة%' OR name LIKE '%إهلاك%' OR name LIKE '%تالف%') AND type = 'EXPENSE' LIMIT 1`);
                 let scrapAccount = scrapAccRows[0];
                 if (!scrapAccount) {
-                    const [maxCodeRows] = yield conn.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code REGEXP '^[0-9]+$' AND code LIKE '5%'");
-                    const maxCode = Number((_e = maxCodeRows[0]) === null || _e === void 0 ? void 0 : _e.maxCode) || 50100;
+                    const [maxCodeRows] = yield conn.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code COLLATE utf8mb4_unicode_ci REGEXP '^[0-9]+$' AND code LIKE '5%'");
+                    const maxCode = Number((_k = maxCodeRows[0]) === null || _k === void 0 ? void 0 : _k.maxCode) || 50100;
+                    let scrapAccountCode = (maxCode + 1).toString();
+                    const [existingCode] = yield conn.query(`SELECT id FROM accounts WHERE code = ? LIMIT 1`, [scrapAccountCode]);
+                    if (existingCode.length > 0) {
+                        scrapAccountCode = `${scrapAccountCode}-${Math.floor(Math.random() * 100)}`;
+                    }
                     const scrapAccountId = (0, crypto_1.randomUUID)();
-                    yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance) VALUES (?, ?, ?, 'EXPENSE', 'OPERATING_EXPENSE', 0, 0)`, [scrapAccountId, (maxCode + 1).toString(), 'إهلاك بضاعة']);
+                    yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode) VALUES (?, ?, ?, 'EXPENSE', 'OPERATING_EXPENSE', 0, 0, 'EGP')`, [scrapAccountId, scrapAccountCode, 'إهلاك بضاعة']);
                     scrapAccount = { id: scrapAccountId, name: 'إهلاك بضاعة' };
                 }
                 // 2. Resolve 'Inventory Asset' account
                 let [inventoryAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%مخزون%' AND type = 'ASSET' LIMIT 1`);
                 let inventoryAccount = inventoryAccRows[0];
                 if (!inventoryAccount) {
-                    const [maxCodeRows] = yield conn.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code REGEXP '^[0-9]+$' AND code LIKE '103%'");
-                    const maxCode = Number((_f = maxCodeRows[0]) === null || _f === void 0 ? void 0 : _f.maxCode) || 10300;
+                    const [maxCodeRows] = yield conn.query("SELECT MAX(CAST(code AS UNSIGNED)) as maxCode FROM accounts WHERE code COLLATE utf8mb4_unicode_ci REGEXP '^[0-9]+$' AND code LIKE '103%'");
+                    const maxCode = Number((_l = maxCodeRows[0]) === null || _l === void 0 ? void 0 : _l.maxCode) || 10300;
+                    let invAccountCode = (maxCode + 1).toString();
+                    const [existingCode] = yield conn.query(`SELECT id FROM accounts WHERE code = ? LIMIT 1`, [invAccountCode]);
+                    if (existingCode.length > 0) {
+                        invAccountCode = `${invAccountCode}-${Math.floor(Math.random() * 100)}`;
+                    }
                     const invAccountId = (0, crypto_1.randomUUID)();
-                    yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance) VALUES (?, ?, ?, 'ASSET', 'CURRENT_ASSET', 0, 0)`, [invAccountId, (maxCode + 1).toString(), 'مخزون بضاعة']);
+                    yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode) VALUES (?, ?, ?, 'ASSET', 'CURRENT_ASSET', 0, 0, 'EGP')`, [invAccountId, invAccountCode, 'مخزون بضاعة']);
                     inventoryAccount = { id: invAccountId, name: 'مخزون بضاعة' };
                 }
                 const scrapJournalId = (0, crypto_1.randomUUID)();
@@ -1868,7 +2530,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     const scrapQty = Math.abs(Number(item.quantity)); // Positive value for the deduction amount
                     // Average Cost logic
                     let [costRows] = yield conn.query(`SELECT avgCost, cost FROM products WHERE id = ?`, [item.productId]);
-                    let itemCost = Number((_g = costRows[0]) === null || _g === void 0 ? void 0 : _g.avgCost) || Number((_h = costRows[0]) === null || _h === void 0 ? void 0 : _h.cost) || 0;
+                    let itemCost = Number((_m = costRows[0]) === null || _m === void 0 ? void 0 : _m.avgCost) || Number((_o = costRows[0]) === null || _o === void 0 ? void 0 : _o.cost) || 0;
                     // Fall back to item.price if average cost is 0
                     if (itemCost <= 0)
                         itemCost = Number(item.price);
@@ -1877,11 +2539,15 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                     totalScrapCost += lineScrapCost;
                     // Deduct stock (it was added by POS generic logic, we deduct it here)
                     if (item.variantId) {
-                        yield conn.query(`UPDATE product_variant_stocks SET stock = stock - ? WHERE variantId = ? AND warehouseId = ?`, [baseScrapQty, item.variantId, effectiveWarehouseId]);
+                        yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                             VALUES (?, ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), item.variantId, item.productId, effectiveWarehouseId, -baseScrapQty, baseScrapQty]);
                         yield conn.query(`UPDATE product_variants SET stock = stock - ? WHERE id = ?`, [baseScrapQty, item.variantId]);
                     }
                     else {
-                        yield conn.query(`UPDATE product_stocks SET stock = stock - ? WHERE productId = ? AND warehouseId = ?`, [baseScrapQty, item.productId, effectiveWarehouseId]);
+                        yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                             VALUES (?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock - ?, 5)`, [(0, crypto_1.randomUUID)(), item.productId, effectiveWarehouseId, -baseScrapQty, baseScrapQty]);
                     }
                     // Deduct global product stock
                     yield conn.query(`UPDATE products SET stock = stock - ? WHERE id = ?`, [baseScrapQty, item.productId]);
@@ -1908,6 +2574,49 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
             let loyaltyRedeemSuccess = false;
             if (loyaltyRedeem && customerId && loyaltyRedeem.pointsToRedeem > 0) {
                 loyaltyRedeemSuccess = yield (0, loyaltyController_1.recordLoyaltyRedeem)(conn, customerId, invoiceId, loyaltyRedeem.pointsToRedeem, loyaltyRedeem.discountAmount, userName);
+                if (loyaltyRedeemSuccess && loyaltyRedeem.discountAmount > 0) {
+                    // Find or create Customer Loyalty Expense Account (GL-6102)
+                    let [loyaltyExpenseRows] = yield conn.query(`SELECT id, name FROM accounts WHERE code = '6102' LIMIT 1`);
+                    let loyaltyExpenseAccount = loyaltyExpenseRows[0];
+                    if (!loyaltyExpenseAccount) {
+                        const loyaltyExpenseAccountId = (0, crypto_1.randomUUID)();
+                        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode) 
+                             VALUES (?, '6102', 'مصاريف نقاط الولاء للعملاء', 'EXPENSE', 'OPERATING_EXPENSE', 0, 0, 'EGP')`, [loyaltyExpenseAccountId]);
+                        loyaltyExpenseAccount = { id: loyaltyExpenseAccountId, name: 'مصاريف نقاط الولاء للعملاء' };
+                    }
+                    // Find or create POS Revenue Adjustments / Discounts Allowed (GL-4105)
+                    let [posRevenueAdjRows] = yield conn.query(`SELECT id, name FROM accounts WHERE code = '4105' LIMIT 1`);
+                    let posRevenueAdjAccount = posRevenueAdjRows[0];
+                    if (!posRevenueAdjAccount) {
+                        const posRevenueAdjAccountId = (0, crypto_1.randomUUID)();
+                        yield conn.query(`INSERT INTO accounts (id, code, name, type, subType, balance, openingBalance, currencyCode) 
+                             VALUES (?, '4105', 'تسويات إيرادات نقاط البيع / خصم مسموح به', 'REVENUE', 'OPERATING_REVENUE', 0, 0, 'EGP')`, [posRevenueAdjAccountId]);
+                        posRevenueAdjAccount = { id: posRevenueAdjAccountId, name: 'تسويات إيرادات نقاط البيع / خصم مسموح به' };
+                    }
+                    const loyaltyJournalId = (0, crypto_1.randomUUID)();
+                    const discountVal = loyaltyRedeem.discountAmount;
+                    // Create journal entry: Debit Loyalty Expense (GL-6102), Credit POS Revenue Adjustments (GL-4105)
+                    yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                         VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [
+                        loyaltyJournalId, now,
+                        `تسوية استبدال نقاط ولاء #${invoiceNumber} - العميل ${customerName || 'عميل'} (نقاط: ${loyaltyRedeem.pointsToRedeem})`,
+                        invoiceId, userName, shift.branchId || null
+                    ]);
+                    yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
+                            [loyaltyJournalId, loyaltyExpenseAccount.id, loyaltyExpenseAccount.name, discountVal, 0, 'EGP', 1, discountVal, 0],
+                            [loyaltyJournalId, posRevenueAdjAccount.id, posRevenueAdjAccount.name, 0, discountVal, 'EGP', 1, 0, discountVal]
+                        ]]);
+                    yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, [loyaltyExpenseAccount.id, posRevenueAdjAccount.id]);
+                    console.log(`📒 [POS] Loyalty GL Sync: Discount ${discountVal} EGP debited to ${loyaltyExpenseAccount.name} and credited to ${posRevenueAdjAccount.name}`);
+                }
+            }
+            // Record applied promotions inside the transaction
+            if (Array.isArray(req.body.appliedPromotions)) {
+                for (const promo of req.body.appliedPromotions) {
+                    if (promo.promotionId && Number(promo.discountAmount) > 0) {
+                        yield (0, promotionController_1.recordPromoApplication)(conn, promo.promotionId, invoiceId, customerId || null, Number(promo.discountAmount), userName);
+                    }
+                }
             }
             // === COMMIT TRANSACTION ===
             yield conn.query('COMMIT');
@@ -1923,27 +2632,102 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 console.error('Non-fatal loyalty error:', loyaltyErr);
                 // DO NOT throw. Allow the response to send.
             }
+            // === REFERRAL: Reward Referrer on first purchase (non-fatal) ===
+            try {
+                if (customerId) {
+                    yield (0, loyaltyController_1.processReferralReward)(conn, customerId, invoiceId, userName);
+                }
+            }
+            catch (refErr) {
+                console.error('Non-fatal referral reward error:', refErr);
+            }
+            // === FRAUD SENTRY: Same Phone / Customer Check ===
+            try {
+                if (customerId) {
+                    const [checkoutCountRows] = yield conn.query(`SELECT count(*) AS count 
+                         FROM invoices 
+                         WHERE createdBy = ? AND partnerId = ? AND type = 'INVOICE_SALE' AND status != 'VOID'
+                           AND date >= DATE_SUB(NOW(), INTERVAL 24 HOUR)`, [userName, customerId]);
+                    const checkoutCount = Number((_p = checkoutCountRows[0]) === null || _p === void 0 ? void 0 : _p.count) || 0;
+                    if (checkoutCount >= 3) {
+                        const alertId = (0, crypto_1.randomUUID)();
+                        yield conn.query(`INSERT INTO pos_fraud_alerts (id, alert_type, severity, description, details, cashier_id, cashier_name, customer_id)
+                             VALUES (?, 'SAME_PHONE_MULTIPLE_CUSTOMERS', 'WARNING', ?, ?, ?, ?, ?)`, [
+                            alertId,
+                            `الكاشير "${userName}" قام بإسناد نقاط لنفس الهاتف/العميل (${customerName || customerId}) لأكثر من 3 عمليات شراء خلال 24 ساعة.`,
+                            JSON.stringify({ checkoutCount, customerName, customerId }),
+                            userId || 'system',
+                            userName,
+                            customerId
+                        ]);
+                        const { logAction } = yield Promise.resolve().then(() => __importStar(require('./auditController')));
+                        yield logAction(userName, 'POS_FRAUD', 'ALERT', `SAME_PHONE_MULTIPLE_CUSTOMERS: Cashier assigned points to same customer ${customerName} multiple times (${checkoutCount}) in 24 hours. AlertId: ${alertId}`, customerId);
+                    }
+                }
+            }
+            catch (fraudErr) {
+                console.error('Non-fatal same-phone fraud check error:', fraudErr.message);
+            }
+            // === FRAUD SENTRY: Redemption Exceeds Ticket Check ===
+            try {
+                if (loyaltyRedeemSuccess && loyaltyRedeem && loyaltyRedeem.discountAmount > 0 && customerId) {
+                    const [ticketRows] = yield conn.query(`SELECT AVG(total) AS avgTicket, COUNT(*) AS ticketCount 
+                         FROM invoices 
+                         WHERE partnerId = ? AND type = 'INVOICE_SALE' AND status != 'VOID'`, [customerId]);
+                    const avgTicket = Number((_q = ticketRows[0]) === null || _q === void 0 ? void 0 : _q.avgTicket) || 0;
+                    const ticketCount = Number((_r = ticketRows[0]) === null || _r === void 0 ? void 0 : _r.ticketCount) || 0;
+                    if (ticketCount >= 3 && loyaltyRedeem.discountAmount > avgTicket * 1.5) {
+                        const alertId = (0, crypto_1.randomUUID)();
+                        yield conn.query(`INSERT INTO pos_fraud_alerts (id, alert_type, severity, description, details, cashier_id, cashier_name, customer_id)
+                             VALUES (?, 'REDEEM_EXCEEDS_TICKET', 'WARNING', ?, ?, ?, ?, ?)`, [
+                            alertId,
+                            `طلب استبدال نقاط بقيمة (${loyaltyRedeem.discountAmount} ج.م) يتجاوز متوسط قيمة فواتير العميل (${avgTicket.toFixed(2)} ج.م).`,
+                            JSON.stringify({ redemptionAmount: loyaltyRedeem.discountAmount, avgTicket, ticketCount }),
+                            userId || 'system',
+                            userName,
+                            customerId
+                        ]);
+                        const { logAction } = yield Promise.resolve().then(() => __importStar(require('./auditController')));
+                        yield logAction(userName, 'POS_FRAUD', 'ALERT', `REDEEM_EXCEEDS_TICKET: Customer ${customerName} redemption ${loyaltyRedeem.discountAmount} EGP exceeds average ticket value ${avgTicket.toFixed(2)} EGP. AlertId: ${alertId}`, customerId);
+                    }
+                }
+            }
+            catch (fraudErr) {
+                console.error('Non-fatal redemption fraud check error:', fraudErr.message);
+            }
             // Calculate change (cash portion only)
             const cashPayment = resolvedPayments.find(p => p.method === 'CASH');
             const changeGiven = cashPayment && cashTendered
                 ? cashTendered - cashPayment.amount
                 : 0;
-            // Enrich lines with warranty expiry dates from product card
+            // Enrich lines with warranty expiry dates
             const enrichedLines = invoiceLines.map((line) => {
                 const wMonths = line.warrantyMonths || 0;
-                if (wMonths <= 0)
+                if (wMonths === 0)
                     return line;
                 const expiryDate = new Date(now);
-                expiryDate.setMonth(expiryDate.getMonth() + wMonths);
+                if (wMonths < 0) {
+                    expiryDate.setDate(expiryDate.getDate() + Math.abs(wMonths));
+                }
+                else {
+                    expiryDate.setMonth(expiryDate.getMonth() + wMonths);
+                }
                 return Object.assign(Object.assign({}, line), { warrantyMonths: wMonths, warrantyExpiry: expiryDate.toISOString().slice(0, 10) });
             });
+            let salesmanName = null;
+            if (salesmanId) {
+                const [salesmanRows] = yield conn.query('SELECT name FROM salesmen WHERE id = ?', [salesmanId]);
+                if (salesmanRows.length > 0) {
+                    salesmanName = salesmanRows[0].name;
+                }
+            }
             const invoice = {
                 id: invoiceId,
                 number: invoiceNumber,
                 date: now,
-                type: 'INVOICE_SALE',
+                type: type,
                 partnerId: customerId,
-                partnerName: customerName || 'عميل نقدي',
+                partnerName: customerName || (isPurchase ? 'مورد نقدي' : 'عميل نقدي'),
                 lines: enrichedLines,
                 total: serverTotal,
                 subtotal: serverSubtotal,
@@ -1955,9 +2739,11 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 posted: true,
                 isPOSSale: true,
                 posShiftId: shiftId,
-                shippingFee: shippingFee || 0
+                shippingFee: shippingFee || 0,
+                salesmanId: salesmanId || null,
+                salesmanName
             };
-            // emitEntityChanged('invoice', invoice, userName);
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: userName });
             res.json({
                 success: true,
                 invoice,
@@ -1996,25 +2782,42 @@ exports.processPOSSale = processPOSSale;
  * GET /api/pos/shift/:shiftId/report
  */
 const getShiftReport = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { shiftId } = req.params;
         // Get shift details
-        const [shifts] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName
+        const [shifts] = yield conn.query(`SELECT s.*, u.name as userName, w.name as warehouseName, a.name as treasuryName,
+                    TIMESTAMPDIFF(MINUTE, s.openedAt, COALESCE(s.closedAt, NOW())) AS computedDuration
              FROM pos_shifts s
-             LEFT JOIN users u ON s.userId = u.id
-             LEFT JOIN warehouses w ON s.warehouseId = w.id
-             WHERE s.id = ?`, [shiftId]);
+             LEFT JOIN users u ON s.userId COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
+             LEFT JOIN warehouses w ON s.warehouseId COLLATE utf8mb4_unicode_ci = w.id COLLATE utf8mb4_unicode_ci
+             LEFT JOIN accounts a ON s.treasuryId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
+             WHERE s.id = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
         if (shifts.length === 0) {
             return res.status(404).json({ error: 'الوردية غير موجودة' });
         }
         const shift = shifts[0];
+        const { branchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
+        if (!isPrivileged && branchId && shift.branchId && shift.branchId !== branchId) {
+            return res.status(403).json({ error: 'ليس لديك صلاحية للوصول إلى بيانات هذا الفرع' });
+        }
         // Get cash movements
-        const [movements] = yield conn.query(`SELECT m.*, u.name as approvedByName
+        const [movements] = yield conn.query(`SELECT m.*, u.name as approvedByName,
+                    COALESCE(i.bankName, a.name, 
+                        CASE m.paymentMethod 
+                            WHEN 'CASH' THEN 'نقدي'
+                            WHEN 'TREASURY' THEN 'خزينة'
+                            WHEN 'DEFERRED' THEN 'آجل'
+                            WHEN 'CHEQUE' THEN 'شيك'
+                            ELSE m.paymentMethod 
+                        END
+                    ) as paymentMethodName
              FROM pos_cash_movements m
-             LEFT JOIN users u ON m.approvedBy = u.id
-             WHERE m.shiftId = ?`, [shiftId]);
+             LEFT JOIN users u ON m.approvedBy COLLATE utf8mb4_unicode_ci = u.id COLLATE utf8mb4_unicode_ci
+             LEFT JOIN invoices i ON m.referenceType = 'INVOICE' AND m.referenceId COLLATE utf8mb4_unicode_ci = i.id COLLATE utf8mb4_unicode_ci
+             LEFT JOIN accounts a ON i.bankAccountId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
+             WHERE m.shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
         const combinedMovements = [...movements].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
         // Get sales by payment method
         const [salesByMethod] = yield conn.query(`SELECT 
@@ -2022,22 +2825,26 @@ const getShiftReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 SUM(amount) as total,
                 COUNT(*) as count
              FROM pos_cash_movements
-             WHERE shiftId = ? AND type = 'SALE'
+             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci AND type = 'SALE'
              GROUP BY paymentMethod`, [shiftId]);
         // Get top selling products
         const [topProducts] = yield conn.query(`SELECT 
                 il.productId,
-                il.productName,
+                MAX(il.productName) as productName,
                 SUM(il.quantity) as quantity,
                 SUM(il.total) as revenue
              FROM invoices i
-             JOIN invoice_lines il ON i.id = il.invoiceId
-             WHERE i.posShiftId = ? AND i.type = 'INVOICE_SALE'
-             GROUP BY il.productId, il.productName
+             JOIN invoice_lines il ON i.id COLLATE utf8mb4_unicode_ci = il.invoiceId COLLATE utf8mb4_unicode_ci
+             WHERE i.posShiftId = ? COLLATE utf8mb4_unicode_ci AND i.type = 'INVOICE_SALE'
+             GROUP BY il.productId
              ORDER BY revenue DESC
              LIMIT 10`, [shiftId]);
-        const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ?`, [shiftId]);
-        const shiftExpenses = parseFloat(((_a = expenseRows[0]) === null || _a === void 0 ? void 0 : _a.totalExpenses) || 0);
+        let shiftExpenses = 0;
+        try {
+            const [expenseRows] = yield conn.query(`SELECT SUM(amount) as totalExpenses FROM pos_expenses WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
+            shiftExpenses = parseFloat(((_a = expenseRows[0]) === null || _a === void 0 ? void 0 : _a.totalExpenses) || 0);
+        }
+        catch ( /* pos_expenses table may not exist */_m) { /* pos_expenses table may not exist */ }
         // Recalculate expected cash on the fly for the report
         const [expectedCashMovements] = yield conn.query(`SELECT 
                 SUM(CASE WHEN type = 'DEPOSIT' THEN amount ELSE 0 END) as deposits,
@@ -2045,31 +2852,235 @@ const getShiftReport = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashSales,
                 SUM(CASE WHEN type = 'SALE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankSales,
                 SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashRefunds,
-                SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankRefunds
+                SUM(CASE WHEN type = 'REFUND' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankRefunds,
+                SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('CASH', 'TREASURY') THEN amount ELSE 0 END) as cashPurchases,
+                SUM(CASE WHEN type = 'PURCHASE' AND paymentMethod IN ('BANK', 'BANK_ACCOUNT') THEN amount ELSE 0 END) as bankPurchases
              FROM pos_cash_movements
-             WHERE shiftId = ?`, [shiftId]);
+             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci`, [shiftId]);
         const movData = expectedCashMovements[0];
-        const computedExpectedCash = parseFloat(shift.adminOpeningAmount || 0) +
+        const computedExpectedCash = parseFloat(shift.openingCash || 0) +
             parseFloat((movData === null || movData === void 0 ? void 0 : movData.deposits) || 0) +
             parseFloat((movData === null || movData === void 0 ? void 0 : movData.cashSales) || 0) -
             parseFloat((movData === null || movData === void 0 ? void 0 : movData.withdrawals) || 0) -
-            parseFloat((movData === null || movData === void 0 ? void 0 : movData.cashRefunds) || 0) - shiftExpenses;
-        const computedExpectedCard = parseFloat((movData === null || movData === void 0 ? void 0 : movData.bankSales) || 0) - parseFloat((movData === null || movData === void 0 ? void 0 : movData.bankRefunds) || 0);
+            parseFloat((movData === null || movData === void 0 ? void 0 : movData.cashRefunds) || 0) -
+            parseFloat((movData === null || movData === void 0 ? void 0 : movData.cashPurchases) || 0) - shiftExpenses;
+        const computedExpectedCard = parseFloat((movData === null || movData === void 0 ? void 0 : movData.bankSales) || 0) - parseFloat((movData === null || movData === void 0 ? void 0 : movData.bankRefunds) || 0) - parseFloat((movData === null || movData === void 0 ? void 0 : movData.bankPurchases) || 0);
         // Calculate totals
         const cashSales = ((_b = salesByMethod.find(m => m.paymentMethod === 'CASH' || m.paymentMethod === 'TREASURY')) === null || _b === void 0 ? void 0 : _b.total) || 0;
         const bankSales = ((_c = salesByMethod.find(m => m.paymentMethod === 'BANK' || m.paymentMethod === 'BANK_ACCOUNT')) === null || _c === void 0 ? void 0 : _c.total) || 0;
         const chequeSales = ((_d = salesByMethod.find(m => m.paymentMethod === 'CHEQUE')) === null || _d === void 0 ? void 0 : _d.total) || 0;
+        const deferredSales = ((_e = salesByMethod.find(m => m.paymentMethod === 'DEFERRED')) === null || _e === void 0 ? void 0 : _e.total) || 0;
+        // Get purchases by payment method
+        const [purchasesByMethod] = yield conn.query(`SELECT 
+                paymentMethod,
+                SUM(amount) as total,
+                COUNT(*) as count
+             FROM pos_cash_movements
+             WHERE shiftId = ? COLLATE utf8mb4_unicode_ci AND type = 'PURCHASE'
+             GROUP BY paymentMethod`, [shiftId]);
+        const cashPurchases = ((_f = purchasesByMethod.find(m => m.paymentMethod === 'CASH' || m.paymentMethod === 'TREASURY')) === null || _f === void 0 ? void 0 : _f.total) || 0;
+        const bankPurchases = ((_g = purchasesByMethod.find(m => m.paymentMethod === 'BANK' || m.paymentMethod === 'BANK_ACCOUNT')) === null || _g === void 0 ? void 0 : _g.total) || 0;
+        const chequePurchases = ((_h = purchasesByMethod.find(m => m.paymentMethod === 'CHEQUE')) === null || _h === void 0 ? void 0 : _h.total) || 0;
+        const deferredPurchases = ((_j = purchasesByMethod.find(m => m.paymentMethod === 'DEFERRED')) === null || _j === void 0 ? void 0 : _j.total) || 0;
+        // Get number of sales invoices
+        const [invoiceCountRows] = yield conn.query(`SELECT COUNT(id) as count FROM invoices WHERE posShiftId = ? COLLATE utf8mb4_unicode_ci AND type = 'INVOICE_SALE' AND status != 'VOID'`, [shiftId]);
+        const invoiceCount = ((_k = invoiceCountRows[0]) === null || _k === void 0 ? void 0 : _k.count) || 0;
+        // Get number of purchase invoices
+        const [purchaseInvoiceCountRows] = yield conn.query(`SELECT COUNT(id) as count FROM invoices WHERE posShiftId = ? COLLATE utf8mb4_unicode_ci AND type = 'INVOICE_PURCHASE' AND status != 'VOID'`, [shiftId]);
+        const purchaseInvoiceCount = ((_l = purchaseInvoiceCountRows[0]) === null || _l === void 0 ? void 0 : _l.count) || 0;
+        // Detailed payment breakdown per bank/treasury account
+        let salesByAccount = [];
+        let purchasesByAccount = [];
+        const salesAccountMap = new Map();
+        const purchasesAccountMap = new Map();
+        try {
+            // Aggregate Sales Breakdown
+            const [salesForBreakdown] = yield conn.query(`SELECT id, total, type, paymentMethod, paymentBreakdown, bankAccountId, bankName
+                 FROM invoices
+                 WHERE posShiftId = ? COLLATE utf8mb4_unicode_ci 
+                   AND type IN ('INVOICE_SALE', 'RETURN_SALE') 
+                   AND status != 'VOID'`, [shiftId]);
+            for (const inv of salesForBreakdown) {
+                const isReturn = inv.type === 'RETURN_SALE';
+                const multiplier = isReturn ? -1 : 1;
+                let splits = [];
+                if (inv.paymentBreakdown) {
+                    try {
+                        const parsed = typeof inv.paymentBreakdown === 'string'
+                            ? JSON.parse(inv.paymentBreakdown)
+                            : inv.paymentBreakdown;
+                        if (Array.isArray(parsed)) {
+                            splits = parsed;
+                        }
+                    }
+                    catch (e) {
+                        console.error(`Failed to parse paymentBreakdown for invoice ${inv.id}:`, e);
+                    }
+                }
+                if (splits.length === 0) {
+                    const method = inv.paymentMethod || 'CASH';
+                    let accId = inv.bankAccountId || null;
+                    let accName = inv.bankName || '';
+                    if (method === 'CASH' || method === 'TREASURY') {
+                        accId = shift.treasuryId || null;
+                        accName = shift.treasuryName || 'نقدي';
+                    }
+                    else if (!accId) {
+                        accName = method === 'BANK' ? 'بنك' : method === 'CHEQUE' ? 'شيك' : 'آجل';
+                    }
+                    const key = `${method}-${accId || 'none'}`;
+                    const existing = salesAccountMap.get(key);
+                    if (existing) {
+                        existing.total += parseFloat(inv.total || 0) * multiplier;
+                        existing.invoiceCount += 1;
+                    }
+                    else {
+                        salesAccountMap.set(key, {
+                            paymentMethod: method,
+                            bankAccountId: accId,
+                            accountName: accName,
+                            invoiceCount: 1,
+                            total: parseFloat(inv.total || 0) * multiplier
+                        });
+                    }
+                }
+                else {
+                    for (const split of splits) {
+                        const method = split.method || 'CASH';
+                        let accId = split.accountId || null;
+                        let accName = split.accountName || '';
+                        if ((method === 'CASH' || method === 'TREASURY') && !accId) {
+                            accId = shift.treasuryId || null;
+                            accName = shift.treasuryName || 'نقدي';
+                        }
+                        else if (!accId) {
+                            accName = split.accountName || (method === 'BANK' ? 'بنك' : method === 'CHEQUE' ? 'شيك' : 'آجل');
+                        }
+                        const key = `${method}-${accId || 'none'}`;
+                        const existing = salesAccountMap.get(key);
+                        if (existing) {
+                            existing.total += parseFloat(split.amount || 0) * multiplier;
+                            existing.invoiceCount += 1;
+                        }
+                        else {
+                            salesAccountMap.set(key, {
+                                paymentMethod: method,
+                                bankAccountId: accId,
+                                accountName: accName,
+                                invoiceCount: 1,
+                                total: parseFloat(split.amount || 0) * multiplier
+                            });
+                        }
+                    }
+                }
+            }
+            salesByAccount = Array.from(salesAccountMap.values()).sort((a, b) => b.total - a.total);
+            // Aggregate Purchases Breakdown
+            const [purchasesForBreakdown] = yield conn.query(`SELECT id, total, type, paymentMethod, paymentBreakdown, bankAccountId, bankName
+                 FROM invoices
+                 WHERE posShiftId = ? COLLATE utf8mb4_unicode_ci 
+                   AND type IN ('INVOICE_PURCHASE', 'RETURN_PURCHASE') 
+                   AND status != 'VOID'`, [shiftId]);
+            for (const inv of purchasesForBreakdown) {
+                const isReturn = inv.type === 'RETURN_PURCHASE';
+                const multiplier = isReturn ? -1 : 1;
+                let splits = [];
+                if (inv.paymentBreakdown) {
+                    try {
+                        const parsed = typeof inv.paymentBreakdown === 'string'
+                            ? JSON.parse(inv.paymentBreakdown)
+                            : inv.paymentBreakdown;
+                        if (Array.isArray(parsed)) {
+                            splits = parsed;
+                        }
+                    }
+                    catch (e) {
+                        console.error(`Failed to parse paymentBreakdown for purchase invoice ${inv.id}:`, e);
+                    }
+                }
+                if (splits.length === 0) {
+                    const method = inv.paymentMethod || 'CASH';
+                    let accId = inv.bankAccountId || null;
+                    let accName = inv.bankName || '';
+                    if (method === 'CASH' || method === 'TREASURY') {
+                        accId = shift.treasuryId || null;
+                        accName = shift.treasuryName || 'نقدي';
+                    }
+                    else if (!accId) {
+                        accName = method === 'BANK' ? 'بنك' : method === 'CHEQUE' ? 'شيك' : 'آجل';
+                    }
+                    const key = `${method}-${accId || 'none'}`;
+                    const existing = purchasesAccountMap.get(key);
+                    if (existing) {
+                        existing.total += parseFloat(inv.total || 0) * multiplier;
+                        existing.invoiceCount += 1;
+                    }
+                    else {
+                        purchasesAccountMap.set(key, {
+                            paymentMethod: method,
+                            bankAccountId: accId,
+                            accountName: accName,
+                            invoiceCount: 1,
+                            total: parseFloat(inv.total || 0) * multiplier
+                        });
+                    }
+                }
+                else {
+                    for (const split of splits) {
+                        const method = split.method || 'CASH';
+                        let accId = split.accountId || null;
+                        let accName = split.accountName || '';
+                        if ((method === 'CASH' || method === 'TREASURY') && !accId) {
+                            accId = shift.treasuryId || null;
+                            accName = shift.treasuryName || 'نقدي';
+                        }
+                        else if (!accId) {
+                            accName = split.accountName || (method === 'BANK' ? 'بنك' : method === 'CHEQUE' ? 'شيك' : 'آجل');
+                        }
+                        const key = `${method}-${accId || 'none'}`;
+                        const existing = purchasesAccountMap.get(key);
+                        if (existing) {
+                            existing.total += parseFloat(split.amount || 0) * multiplier;
+                            existing.invoiceCount += 1;
+                        }
+                        else {
+                            purchasesAccountMap.set(key, {
+                                paymentMethod: method,
+                                bankAccountId: accId,
+                                accountName: accName,
+                                invoiceCount: 1,
+                                total: parseFloat(split.amount || 0) * multiplier
+                            });
+                        }
+                    }
+                }
+            }
+            purchasesByAccount = Array.from(purchasesAccountMap.values()).sort((a, b) => b.total - a.total);
+        }
+        catch (err) {
+            console.error('Error generating detailed shift report accounts breakdown:', err);
+        }
         const report = {
-            shift: Object.assign(Object.assign({}, shift), { expectedCash: computedExpectedCash, expectedCard: computedExpectedCard, closedAt: shift.closedAt || null, duration: shift.closedAt
-                    ? Math.round((new Date(shift.closedAt).getTime() - new Date(shift.openedAt).getTime()) / 60000)
-                    : Math.round((new Date().getTime() - new Date(shift.openedAt).getTime()) / 60000) }),
+            shift: Object.assign(Object.assign({}, shift), { expectedCash: computedExpectedCash, expectedCard: computedExpectedCard, closedAt: shift.closedAt || null, duration: Number(shift.computedDuration || 0) }),
             cashMovements: combinedMovements,
             salesByPaymentMethod: {
                 cash: parseFloat(cashSales),
                 bank: parseFloat(bankSales),
                 cheque: parseFloat(chequeSales),
-                total: parseFloat(cashSales) + parseFloat(bankSales) + parseFloat(chequeSales)
+                deferred: parseFloat(deferredSales),
+                total: parseFloat(cashSales) + parseFloat(bankSales) + parseFloat(chequeSales) + parseFloat(deferredSales)
             },
+            salesByAccount,
+            purchasesByPaymentMethod: {
+                cash: parseFloat(cashPurchases),
+                bank: parseFloat(bankPurchases),
+                cheque: parseFloat(chequePurchases),
+                deferred: parseFloat(deferredPurchases),
+                total: parseFloat(cashPurchases) + parseFloat(bankPurchases) + parseFloat(chequePurchases) + parseFloat(deferredPurchases)
+            },
+            purchasesByAccount,
+            invoiceCount,
+            purchaseInvoiceCount,
             topProducts
         };
         res.json(report);
@@ -2112,7 +3123,7 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 pcm.paymentMethod,
                 COALESCE(SUM(pcm.amount), 0) AS total
              FROM pos_cash_movements pcm
-             JOIN invoices i ON pcm.referenceId = i.id
+             JOIN invoices i ON pcm.referenceId COLLATE utf8mb4_unicode_ci = i.id COLLATE utf8mb4_unicode_ci
              WHERE pcm.type = 'SALE'
                AND ${baseWhere}
              GROUP BY pcm.paymentMethod`, dateParams);
@@ -2164,7 +3175,7 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 pcm.paymentMethod,
                 COALESCE(SUM(pcm.amount), 0) AS total
              FROM pos_cash_movements pcm
-             JOIN invoices i ON pcm.referenceId = i.id
+             JOIN invoices i ON pcm.referenceId COLLATE utf8mb4_unicode_ci = i.id COLLATE utf8mb4_unicode_ci
              WHERE pcm.type = 'SALE' AND ${baseWhere}
              GROUP BY DATE(i.date), pcm.paymentMethod`, dateParams);
         const dailyMap = new Map();
@@ -2242,6 +3253,36 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
             averageTicket: parseInt(c.transactionCount) > 0 ? parseFloat(c.totalSales) / parseInt(c.transactionCount) : 0,
             shifts: shiftCountMap.get(c.userId) || 0,
         }));
+        // 5.b POS cashier performance
+        const [posCashierRows] = yield conn.query(`SELECT
+                pcs.cashierId AS userId,
+                pc.name AS userName,
+                COUNT(i.id) AS transactionCount,
+                COALESCE(SUM(i.total), 0) AS totalSales
+             FROM invoices i
+             JOIN pos_cashier_shifts pcs ON i.posShiftId COLLATE utf8mb4_unicode_ci = pcs.shiftId COLLATE utf8mb4_unicode_ci
+             JOIN pos_cashiers pc ON pcs.cashierId COLLATE utf8mb4_unicode_ci = pc.id COLLATE utf8mb4_unicode_ci
+             WHERE ${baseWhere}
+               AND i.createdAt >= pcs.startedAt
+               AND i.createdAt <= COALESCE(pcs.endedAt, '2099-12-31 23:59:59')
+             GROUP BY pcs.cashierId, pc.name
+             ORDER BY totalSales DESC`, dateParams);
+        const [posShiftCountRows] = yield conn.query(`SELECT cashierId, COUNT(*) AS shiftCount
+             FROM pos_cashier_shifts
+             WHERE DATE(startedAt) BETWEEN ? AND ?
+             GROUP BY cashierId`, dateParams);
+        const posShiftCountMap = new Map();
+        for (const row of posShiftCountRows) {
+            posShiftCountMap.set(row.cashierId, parseInt(row.shiftCount));
+        }
+        const posCashierPerformance = posCashierRows.map((c) => ({
+            userId: c.userId,
+            userName: c.userName || c.userId || 'مستخدم',
+            totalSales: parseFloat(c.totalSales),
+            transactionCount: parseInt(c.transactionCount),
+            averageTicket: parseInt(c.transactionCount) > 0 ? parseFloat(c.totalSales) / parseInt(c.transactionCount) : 0,
+            shifts: posShiftCountMap.get(c.userId) || 0,
+        }));
         res.json({
             totals: {
                 totalSales,
@@ -2267,6 +3308,7 @@ const getReportSummary = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 revenue: parseFloat(p.totalRevenue),
             })),
             cashierPerformance,
+            posCashierPerformance,
         });
     }
     catch (error) {
@@ -2442,8 +3484,7 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
     try {
         const { categoryId, search, limit = 5000, priceListId } = req.query;
         const userCtx = req.user;
-        const userRole = ((userCtx === null || userCtx === void 0 ? void 0 : userCtx.role) || '').toUpperCase();
-        const isPrivileged = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN'].includes(userRole);
+        const { isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
         // ── Branch isolation: warehouse is derived from JWT, not client param ──
         // Privileged roles may still pass an explicit warehouseId to override.
         const warehouseId = isPrivileged && req.query.warehouseId
@@ -2451,6 +3492,13 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
             : ((userCtx === null || userCtx === void 0 ? void 0 : userCtx.defaultWarehouseId) || req.query.warehouseId);
         let whereClause = 'IFNULL(p.isActive, 1) = 1';
         const params = [];
+        let hasProductVariants = false;
+        try {
+            const [pvCheck] = yield conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'product_variants' AND TABLE_SCHEMA = DATABASE() LIMIT 1`);
+            if (pvCheck.length > 0)
+                hasProductVariants = true;
+        }
+        catch ( /* ignore */_a) { /* ignore */ }
         if (categoryId) {
             whereClause += ' AND p.categoryId = ?';
             params.push(categoryId);
@@ -2458,15 +3506,26 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
         if (search) {
             // Arabic-normalized tokenized search for POS products
             const arabicNorm = (col) => `REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(LOWER(${col}), 'أ','ا'), 'إ','ا'), 'آ','ا'), 'ة','ه'), 'ى','ي'), 'ؤ','و'), 'ئ','ي')`;
-            const tokens = String(search).trim().split(/\s+/).filter(Boolean);
+            let tokens = String(search).trim().split(/\s+/).filter(Boolean);
+            if (tokens.length > 5) {
+                tokens = tokens.slice(0, 5); // Prevent query DoS from excessive nested REPLACE functions
+            }
             if (tokens.length > 0) {
                 const tokenConditions = tokens.map(() => {
+                    if (hasProductVariants) {
+                        return `( ${arabicNorm('COALESCE(p.name, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(p.barcode, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(p.sku, "")')} LIKE ${arabicNorm('?')} OR EXISTS (SELECT 1 FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1 AND (${arabicNorm('COALESCE(pv.barcode, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(pv.sku, "")')} LIKE ${arabicNorm('?')})) )`;
+                    }
                     return `( ${arabicNorm('COALESCE(p.name, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(p.barcode, "")')} LIKE ${arabicNorm('?')} OR ${arabicNorm('COALESCE(p.sku, "")')} LIKE ${arabicNorm('?')} )`;
                 });
                 whereClause += ` AND (${tokenConditions.join(' AND ')})`;
                 tokens.forEach(token => {
                     const tokenParam = `%${token}%`;
-                    params.push(tokenParam, tokenParam, tokenParam);
+                    if (hasProductVariants) {
+                        params.push(tokenParam, tokenParam, tokenParam, tokenParam, tokenParam);
+                    }
+                    else {
+                        params.push(tokenParam, tokenParam, tokenParam);
+                    }
                 });
             }
         }
@@ -2490,16 +3549,23 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
             safeCol(productCols, 'hasMultipleUnits', 'hasMultipleUnits'),
             safeCol(productCols, 'baseUnit', 'baseUnit'),
         ].join(',\n                ');
+        const safeWarehouseId = warehouseId ? conn.escape(warehouseId) : 'NULL';
         // Build stock expression — single warehouse vs sum across all
         const stockExpr = warehouseId
-            ? `COALESCE(ps.stock, 0) as stock`
-            : `COALESCE((SELECT SUM(ps2.stock) FROM product_stocks ps2 WHERE ps2.productId = p.id), 0) as stock`;
+            ? (hasProductVariants
+                ? `CASE WHEN (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) > 0 THEN COALESCE((SELECT SUM(pvs.stock) FROM product_variant_stocks pvs JOIN product_variants pv ON pv.id = pvs.variantId WHERE pv.productId = p.id AND pvs.warehouseId = ${safeWarehouseId} AND pv.isActive = 1), 0) ELSE COALESCE(ps.stock, 0) END as stock`
+                : `COALESCE(ps.stock, 0) as stock`)
+            : (hasProductVariants
+                ? `CASE WHEN (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) > 0 THEN COALESCE((SELECT SUM(pvs.stock) FROM product_variant_stocks pvs JOIN product_variants pv ON pv.id = pvs.variantId WHERE pv.productId = p.id AND pv.isActive = 1), 0) ELSE COALESCE((SELECT SUM(ps2.stock) FROM product_stocks ps2 WHERE ps2.productId = p.id), 0) END as stock`
+                : `COALESCE((SELECT SUM(ps2.stock) FROM product_stocks ps2 WHERE ps2.productId = p.id), 0) as stock`);
         // Other-warehouse stock: how many units exist in warehouses OTHER than the current one
         const otherWarehouseStockExpr = warehouseId
-            ? `COALESCE((SELECT SUM(ps3.stock) FROM product_stocks ps3 WHERE ps3.productId = p.id AND ps3.warehouseId != ? AND ps3.stock > 0), 0) AS otherWarehouseStock`
+            ? (hasProductVariants
+                ? `CASE WHEN (SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) > 0 THEN COALESCE((SELECT SUM(pvs.stock) FROM product_variant_stocks pvs JOIN product_variants pv ON pv.id = pvs.variantId WHERE pv.productId = p.id AND pvs.warehouseId != ${safeWarehouseId} AND pv.isActive = 1 AND pvs.stock > 0), 0) ELSE COALESCE((SELECT SUM(ps3.stock) FROM product_stocks ps3 WHERE ps3.productId = p.id AND ps3.warehouseId != ${safeWarehouseId} AND ps3.stock > 0), 0) END AS otherWarehouseStock`
+                : `COALESCE((SELECT SUM(ps3.stock) FROM product_stocks ps3 WHERE ps3.productId = p.id AND ps3.warehouseId != ${safeWarehouseId} AND ps3.stock > 0), 0) AS otherWarehouseStock`)
             : `0 AS otherWarehouseStock`;
         const stockJoin = warehouseId
-            ? `LEFT JOIN product_stocks ps ON p.id = ps.productId AND ps.warehouseId = ?`
+            ? `LEFT JOIN product_stocks ps ON p.id = ps.productId AND ps.warehouseId = ${safeWarehouseId}`
             : '';
         // Detect embedded variants (product_variants table) — safe subquery
         let embeddedVariantExpr = '0 AS embeddedVariantCount';
@@ -2509,9 +3575,9 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 embeddedVariantExpr = '(SELECT COUNT(*) FROM product_variants pv WHERE pv.productId = p.id AND pv.isActive = 1) AS embeddedVariantCount';
             }
         }
-        catch ( /* table doesn't exist yet — fine */_a) { /* table doesn't exist yet — fine */ }
+        catch ( /* table doesn't exist yet — fine */_b) { /* table doesn't exist yet — fine */ }
         const [products] = yield conn.query(`SELECT
-                p.id, p.name, p.sku, p.barcode,
+                p.id, p.name, p.sku, p.barcode, p.type,
                 ${priceExpr},
                 p.cost,
                 p.categoryId, c.name as categoryName,
@@ -2528,7 +3594,7 @@ const getPOSProducts = (req, res) => __awaiter(void 0, void 0, void 0, function*
              WHERE ${whereClause}
              GROUP BY p.id
              ORDER BY p.name
-             LIMIT ?`, [...joinParams, ...warehouseParam, ...warehouseParam, ...params, Number(limit)]);
+             LIMIT ?`, [...joinParams, ...params, Number(limit)]);
         res.json({ products, priceListId: priceListId || null });
     }
     catch (error) {
@@ -2830,7 +3896,7 @@ const getProductByBarcode = (req, res) => __awaiter(void 0, void 0, void 0, func
         const { warehouseId } = req.query;
         // First check main product barcode
         let [products] = yield conn.query(`SELECT 
-                p.id, p.name, p.sku, p.barcode, p.price, p.cost,
+                p.id, p.name, p.sku, p.barcode, p.price, p.cost, p.type,
                 p.categoryId, p.hasMultipleUnits, p.baseUnit,
                 COALESCE(ps.stock, 0) as stock,
                 NULL as unitId, NULL as unitName, 1 as conversionFactor
@@ -2838,10 +3904,30 @@ const getProductByBarcode = (req, res) => __awaiter(void 0, void 0, void 0, func
              LEFT JOIN product_stocks ps ON p.id = ps.productId ${warehouseId ? 'AND ps.warehouseId = ?' : ''}
              WHERE p.barcode = ?
              LIMIT 1`, warehouseId ? [warehouseId, barcode] : [barcode]);
+        // If not found, check product_variants barcode (if table exists)
+        if (products.length === 0) {
+            try {
+                const [pvCheck] = yield conn.query(`SELECT 1 FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'product_variants' AND TABLE_SCHEMA = DATABASE() LIMIT 1`);
+                if (pvCheck.length > 0) {
+                    [products] = yield conn.query(`SELECT 
+                            p.id, p.name, p.sku, pv.barcode, pv.sellingPrice AS price, p.cost, p.type,
+                            p.categoryId, p.hasMultipleUnits, p.baseUnit,
+                            COALESCE(ps.stock, 0) as stock,
+                            NULL as unitId, NULL as unitName, 1 as conversionFactor,
+                            pv.id as variantId, pv.name as variantName
+                         FROM product_variants pv
+                         JOIN products p ON pv.productId = p.id
+                         LEFT JOIN product_stocks ps ON p.id = ps.productId ${warehouseId ? 'AND ps.warehouseId = ?' : ''}
+                         WHERE pv.barcode = ? AND pv.isActive = 1
+                         LIMIT 1`, warehouseId ? [warehouseId, barcode] : [barcode]);
+                }
+            }
+            catch ( /* ignore */_a) { /* ignore */ }
+        }
         // If not found, check product unit barcodes
         if (products.length === 0) {
             [products] = yield conn.query(`SELECT 
-                    p.id, p.name, p.sku, pu.barcode, pu.salePrice as price, p.cost,
+                    p.id, p.name, p.sku, pu.barcode, pu.salePrice as price, p.cost, p.type,
                     p.categoryId, p.hasMultipleUnits, p.baseUnit,
                     COALESCE(ps.stock, 0) as stock,
                     pu.id as unitId, pu.unitName, pu.conversionFactor
@@ -3130,14 +4216,35 @@ const getPOSCustomerSummary = (req, res) => __awaiter(void 0, void 0, void 0, fu
                                 : r.promoType, // Will retain CATEGORY_DISCOUNT, PRODUCT_DISCOUNT, etc
                         value: Number(r.value || 0),
                         targetIds: [],
-                        packageId: r.linkedMembershipId
+                        packageId: r.linkedMembershipId,
+                        maxDiscount: r.maxDiscount ? Number(r.maxDiscount) : 0,
+                        minQty: 0,
+                        minAmount: 0,
+                        daysOfWeek: null,
+                        startTime: '',
+                        endTime: '',
                     });
                 }
+                const benefit = promosMap.get(r.promoId);
                 if (r.ruleType === 'CATEGORY_IN_CART' || r.ruleType === 'PRODUCT_IN_CART') {
                     if (r.targetValue) {
                         const ids = r.targetValue.split(',').map((s) => s.trim());
-                        promosMap.get(r.promoId).targetIds.push(...ids);
+                        benefit.targetIds.push(...ids);
                     }
+                }
+                if (r.ruleType === 'MIN_QTY') {
+                    benefit.minQty = parseInt(r.targetValue) || 0;
+                }
+                if (r.ruleType === 'MIN_AMOUNT') {
+                    benefit.minAmount = parseFloat(r.targetValue) || 0;
+                }
+                if (r.ruleType === 'DAY_OF_WEEK') {
+                    benefit.daysOfWeek = r.targetValue.split(',').map(Number);
+                }
+                if (r.ruleType === 'TIME_RANGE') {
+                    const [start, end] = r.targetValue.split('-');
+                    benefit.startTime = start || '';
+                    benefit.endTime = end || '';
                 }
             }
             activeMembership.benefits = Array.from(promosMap.values());
@@ -3185,24 +4292,84 @@ exports.getPOSCustomerSummary = getPOSCustomerSummary;
  * Look up a POS invoice by number for refund
  */
 const getPOSInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { invoiceNumber } = req.params;
-        const [invoices] = yield conn.query(`SELECT i.*, 
+        const [invoices] = yield conn.query(`SELECT i.*, s.name as salesmanName,
                 (SELECT JSON_ARRAYAGG(JSON_OBJECT(
                     'id', il.id, 'productId', il.productId, 'productName', il.productName,
                     'quantity', il.quantity, 'price', il.price, 'total', il.total,
                     'discount', COALESCE(il.discount, 0), 'discountType', COALESCE(il.discountType, 'FIXED'),
                     'warehouseId', il.warehouseId, 'unitId', il.unitId, 'unitName', il.unitName,
-                    'conversionFactor', il.conversionFactor, 'baseQuantity', il.baseQuantity
+                    'conversionFactor', il.conversionFactor, 'baseQuantity', il.baseQuantity,
+                    'variantId', il.variantId,
+                    'hasWarranty', il.hasWarranty,
+                    'inBranchInstallation', il.inBranchInstallation,
+                    'warrantyMonths', COALESCE(il.warrantyMonths, 0)
                 )) FROM invoice_lines il WHERE il.invoiceId = i.id) as \`lines\`
              FROM invoices i 
+             LEFT JOIN salesmen s ON i.salesmanId = s.id
              WHERE i.number = ? AND i.isPOSSale = 1`, [invoiceNumber]);
         if (invoices.length === 0) {
+            conn.release();
             return res.status(404).json({ error: 'الفاتورة غير موجودة أو ليست فاتورة نقطة بيع' });
         }
         const invoice = invoices[0];
+        // === SECURITY: Enforce branch and user-level data isolation ===
+        const authReq = req;
+        const { user } = authReq;
+        const userRole = ((user === null || user === void 0 ? void 0 : user.role) || '').toUpperCase();
+        const PRIVILEGED_ROLES = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN', 'GENERAL_MANAGER', 'MANAGER', 'ACCOUNTANT'];
+        const isPrivileged = PRIVILEGED_ROLES.includes(userRole);
+        const userBranchId = ((_a = authReq.branchContext) === null || _a === void 0 ? void 0 : _a.branchId) || null;
+        if (!isPrivileged && userBranchId && invoice.branchId && invoice.branchId !== userBranchId) {
+            console.warn(`[getPOSInvoice] Branch isolation block: user branch=${userBranchId}, invoice branch=${invoice.branchId}`);
+            conn.release();
+            return res.status(403).json({ error: 'ACCESS_DENIED', message: 'ليس لديك صلاحية للوصول إلى فواتير الفروع الأخرى' });
+        }
+        if (authReq.userFilterOptions && authReq.systemConfig) {
+            const { canSeeAll, userName: filterUserName } = authReq.userFilterOptions;
+            if (!canSeeAll) {
+                const isOwner = invoice.createdBy === filterUserName || invoice.createdBy === (user === null || user === void 0 ? void 0 : user.name);
+                if (!isOwner) {
+                    console.warn(`[getPOSInvoice] User isolation block: username=${filterUserName}, name=${user === null || user === void 0 ? void 0 : user.name}, invoice createdBy=${invoice.createdBy}`);
+                    conn.release();
+                    return res.status(403).json({ error: 'ACCESS_DENIED', message: 'يمكنك فقط عرض واسترجاع الفواتير الخاصة بك' });
+                }
+            }
+        }
         invoice.lines = invoice.lines ? (typeof invoice.lines === 'string' ? JSON.parse(invoice.lines) : invoice.lines) : [];
+        // Compute already-returned quantities so the UI can show the correct max
+        if (invoice.id && invoice.lines.length > 0) {
+            const [prevReturnRows] = yield conn.query(`SELECT il.productId, il.variantId, il.unitId, SUM(il.quantity) as returnedQty
+                 FROM invoice_lines il
+                 JOIN invoices i ON il.invoiceId = i.id
+                 WHERE i.referenceInvoiceId = ? AND i.type = 'RETURN_SALE' AND i.status != 'VOID'
+                 GROUP BY il.productId, il.variantId, il.unitId`, [invoice.id]);
+            const returnedMap = new Map();
+            for (const row of prevReturnRows) {
+                const key = `${row.productId}-${row.variantId || 'null'}-${row.unitId || 'null'}`;
+                returnedMap.set(key, (returnedMap.get(key) || 0) + Number(row.returnedQty));
+            }
+            invoice.lines = invoice.lines.map((line) => {
+                const key = `${line.productId}-${line.variantId || 'null'}-${line.unitId || 'null'}`;
+                const alreadyReturned = returnedMap.get(key) || 0;
+                let warrantyExpiry = undefined;
+                const wMonths = Number(line.warrantyMonths) || 0;
+                if (wMonths !== 0 && invoice.date) {
+                    const expiryDate = new Date(invoice.date);
+                    if (wMonths < 0) {
+                        expiryDate.setDate(expiryDate.getDate() + Math.abs(wMonths));
+                    }
+                    else {
+                        expiryDate.setMonth(expiryDate.getMonth() + wMonths);
+                    }
+                    warrantyExpiry = expiryDate.toISOString().slice(0, 10);
+                }
+                return Object.assign(Object.assign({}, line), { refundableQuantity: Math.max(0, Number(line.quantity) - alreadyReturned), warrantyExpiry });
+            });
+        }
         res.json({ invoice });
     }
     catch (error) {
@@ -3219,14 +4386,15 @@ exports.getPOSInvoice = getPOSInvoice;
  * Process a POS refund/return
  */
 const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c, _d, _e, _f;
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { shiftId, originalInvoiceId, items, reason, refundPaymentMethod, refundAccountId, refundAccountName, globalDiscount, globalDiscountType } = req.body;
+        const { shiftId, originalInvoiceId, items, reason, payments, refundPaymentMethod, refundAccountId, refundAccountName, globalDiscount, globalDiscountType, partnerId, partnerName } = req.body;
         let { refundTotal } = req.body;
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
-        const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'Unknown';
-        if (!shiftId || !originalInvoiceId || !items || items.length === 0) {
+        const userRole = (((_b = req.user) === null || _b === void 0 ? void 0 : _b.role) || '').toUpperCase();
+        const userName = ((_c = req.user) === null || _c === void 0 ? void 0 : _c.username) || ((_d = req.user) === null || _d === void 0 ? void 0 : _d.name) || 'Unknown';
+        if (!shiftId || !items || items.length === 0) {
             return res.status(400).json({ error: 'البيانات غير مكتملة' });
         }
         // refundTotal must never reach the DB as NULL — recompute from items as fallback
@@ -3240,32 +4408,113 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
             return res.status(400).json({ error: 'الوردية غير مفتوحة' });
         }
         const shift = shifts[0];
-        // Verify original invoice exists
-        const [origInvoices] = yield conn.query(`SELECT * FROM invoices WHERE id = ? AND isPOSSale = 1`, [originalInvoiceId]);
-        if (origInvoices.length === 0) {
-            return res.status(404).json({ error: 'الفاتورة الأصلية غير موجودة' });
+        // Enforce shift ownership (cashiers can only post refunds to their own shifts)
+        const isAdmin = ['ADMIN', 'MASTER_ADMIN'].includes(userRole);
+        if (!isAdmin && shift.userId !== userId) {
+            conn.release();
+            return res.status(403).json({ error: 'لا يمكن تسجيل مرتجع في وردية مستخدم آخر' });
+        }
+        let origInvoices = [];
+        if (originalInvoiceId) {
+            // Verify original invoice exists
+            const [rows] = yield conn.query(`SELECT * FROM invoices WHERE id = ? AND isPOSSale = 1`, [originalInvoiceId]);
+            origInvoices = rows;
+            if (origInvoices.length === 0) {
+                conn.release();
+                return res.status(404).json({ error: 'الفاتورة الأصلية غير موجودة' });
+            }
+            // Enforce branch and user-level data isolation on the original invoice
+            const origInvoice = origInvoices[0];
+            const userBranchId = ((_e = req.branchContext) === null || _e === void 0 ? void 0 : _e.branchId) || null;
+            const PRIVILEGED_ROLES = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN', 'GENERAL_MANAGER', 'MANAGER', 'ACCOUNTANT'];
+            const isPrivileged = PRIVILEGED_ROLES.includes(userRole);
+            if (!isPrivileged && userBranchId && origInvoice.branchId && origInvoice.branchId !== userBranchId) {
+                conn.release();
+                return res.status(403).json({ error: 'ليس لديك صلاحية للوصول إلى فواتير الفروع الأخرى' });
+            }
+            const authReq = req;
+            if (authReq.userFilterOptions && authReq.systemConfig) {
+                const { canSeeAll, userName: filterUserName } = authReq.userFilterOptions;
+                if (!canSeeAll) {
+                    const isOwner = origInvoice.createdBy === filterUserName || origInvoice.createdBy === ((_f = req.user) === null || _f === void 0 ? void 0 : _f.name);
+                    if (!isOwner) {
+                        conn.release();
+                        return res.status(403).json({ error: 'يمكنك فقط إرجاع الفواتير الخاصة بك' });
+                    }
+                }
+            }
         }
         const now = (0, dateUtils_1.getEgyptianISOString)();
+        // --- VALIDATE RETURN QUANTITIES (inside transaction with row-level lock) ---
+        // We open the transaction FIRST, then lock the invoice rows with FOR UPDATE.
+        // This prevents the race condition where two concurrent refunds both pass
+        // the guard before either commits, yielding a net return > original qty.
         yield conn.query('START TRANSACTION');
+        if (originalInvoiceId) {
+            // Lock the original invoice and its lines to prevent concurrent over-refunds
+            yield conn.query(`SELECT id FROM invoices WHERE id = ? FOR UPDATE`, [originalInvoiceId]);
+            // 1. Get original quantities (inside lock)
+            const [origLinesRows] = yield conn.query(`SELECT productId, variantId, unitId, quantity as originalQty FROM invoice_lines WHERE invoiceId = ? FOR UPDATE`, [originalInvoiceId]);
+            const origQtyMap = new Map();
+            for (const row of origLinesRows) {
+                const key = `${row.productId}-${row.variantId || 'null'}-${row.unitId || 'null'}`;
+                origQtyMap.set(key, (origQtyMap.get(key) || 0) + Number(row.originalQty));
+            }
+            // 2. Get previously returned quantities (inside lock — sees committed data)
+            const [prevReturnRows] = yield conn.query(`SELECT il.productId, il.variantId, il.unitId, SUM(il.quantity) as returnedQty
+                 FROM invoice_lines il
+                 JOIN invoices i ON il.invoiceId = i.id
+                 WHERE i.referenceInvoiceId = ? AND i.type = 'RETURN_SALE' AND i.status != 'VOID'
+                 GROUP BY il.productId, il.variantId, il.unitId`, [originalInvoiceId]);
+            const returnedQtyMap = new Map();
+            for (const row of prevReturnRows) {
+                const key = `${row.productId}-${row.variantId || 'null'}-${row.unitId || 'null'}`;
+                returnedQtyMap.set(key, (returnedQtyMap.get(key) || 0) + Number(row.returnedQty));
+            }
+            // 3. Check requested items — reject over-refunds
+            const requestedQtyMap = new Map();
+            for (const item of items) {
+                const key = `${item.productId}-${item.variantId || 'null'}-${item.unitId || 'null'}`;
+                requestedQtyMap.set(key, (requestedQtyMap.get(key) || 0) + (Number(item.quantity) || 0));
+            }
+            for (const item of items) {
+                const key = `${item.productId}-${item.variantId || 'null'}-${item.unitId || 'null'}`;
+                const origQty = origQtyMap.get(key) || 0;
+                const alreadyReturned = returnedQtyMap.get(key) || 0;
+                const requestedReturn = requestedQtyMap.get(key) || 0;
+                if (requestedReturn + alreadyReturned > origQty) {
+                    yield conn.query('ROLLBACK');
+                    return res.status(400).json({
+                        error: `الكمية المرتجعة تتجاوز الكمية المتاحة للصنف: ${item.productName}`,
+                        errorCode: 'OVER_REFUND',
+                    });
+                }
+            }
+        }
+        // -----------------------------------
         try {
             // Create refund invoice (credit note)
             const refundId = (0, crypto_1.randomUUID)();
             const refundNumber = yield (0, invoiceNumberGenerator_1.generateNextSequentialNumber)(conn, 'RET-POS-');
             // Resolve the refund payment method (defaults to CASH for backward compat)
             const effectiveRefundMethod = refundPaymentMethod || 'CASH';
+            const resolvedPartnerId = originalInvoiceId ? origInvoices[0].partnerId : (partnerId || null);
+            const resolvedPartnerName = originalInvoiceId ? origInvoices[0].partnerName : (partnerName || 'عميل نقدي');
+            const resolvedReason = reason || (originalInvoiceId ? `مرتجع من فاتورة ${origInvoices[0].number}` : 'مرتجع يدوي (بدون فاتورة أصلية)');
             yield conn.query(`INSERT INTO invoices (
                     id, number, date, type, partnerId, partnerName,
                     total, status, paymentMethod, posted, notes,
                     warehouseId, createdBy, posShiftId, isPOSSale,
-                    globalDiscount, globalDiscountType
-                ) VALUES (?, ?, ?, 'RETURN_SALE', ?, ?, ?, 'POSTED', ?, 1, ?, ?, ?, ?, 1, ?, ?)`, [
+                    globalDiscount, globalDiscountType, referenceInvoiceId, branchId
+                ) VALUES (?, ?, ?, 'RETURN_SALE', ?, ?, ?, 'POSTED', ?, 1, ?, ?, ?, ?, 1, ?, ?, ?, ?)`, [
                 refundId, refundNumber, now,
-                origInvoices[0].partnerId, origInvoices[0].partnerName,
+                resolvedPartnerId, resolvedPartnerName,
                 refundTotal, effectiveRefundMethod,
-                reason || `مرتجع من فاتورة ${origInvoices[0].number}`,
+                resolvedReason,
                 shift.warehouseId, userId, shiftId,
                 globalDiscount || 0,
-                globalDiscountType || 'FIXED'
+                globalDiscountType || 'FIXED',
+                originalInvoiceId || null, shift.branchId || null
             ]);
             // === PERF: BATCH INSERT refund lines (1 query instead of N) ===
             const effectiveWarehouseId = shift.warehouseId;
@@ -3276,11 +4525,12 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 (item.quantity * item.price) - (item.discount || 0),
                 effectiveWarehouseId,
                 item.unitId || null, item.unitName || null,
-                item.conversionFactor || 1, item.baseQuantity || item.quantity
+                item.conversionFactor || 1, item.baseQuantity || item.quantity,
+                item.variantId || null
             ]);
             yield conn.query(`INSERT INTO invoice_lines (
                     invoiceId, productId, productName, quantity, price, cost, discount, discountType, total, warehouseId,
-                    unitId, unitName, conversionFactor, baseQuantity
+                    unitId, unitName, conversionFactor, baseQuantity, variantId
                 ) VALUES ?`, [refundLineValues]);
             // === PERF: BATCH stock restore ===
             if (effectiveWarehouseId) {
@@ -3289,10 +4539,15 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 const sortedItems = [...items].sort((a, b) => String(a.productId).localeCompare(String(b.productId)));
                 for (const item of sortedItems) {
                     const baseQty = item.baseQuantity || item.quantity;
-                    yield conn.query(`UPDATE product_stocks SET stock = stock + ? WHERE productId = ? AND warehouseId = ?`, [baseQty, item.productId, effectiveWarehouseId]);
+                    // ON DUPLICATE KEY UPDATE to handle returns of unstocked products
+                    yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock)
+                         VALUES (?, ?, ?, ?)
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), item.productId, effectiveWarehouseId, baseQty, baseQty]);
                     // Restore variant-specific stock (mirrors sale deduction logic)
                     if (item.variantId) {
-                        yield conn.query(`UPDATE product_variant_stocks SET stock = stock + ? WHERE variantId = ? AND warehouseId = ?`, [baseQty, item.variantId, effectiveWarehouseId]);
+                        yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
+                             VALUES (?, ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [(0, crypto_1.randomUUID)(), item.variantId, item.productId, effectiveWarehouseId, baseQty, baseQty]);
                         yield conn.query(`UPDATE product_variants SET stock = stock + ? WHERE id = ?`, [baseQty, item.variantId]);
                     }
                 }
@@ -3331,17 +4586,27 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                     ) VALUES ?
                 `, [movementValues]);
             }
-            // Record refund cash movement
-            const movementId = (0, crypto_1.randomUUID)();
-            yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
-                 VALUES (?, ?, 'REFUND', ?, ?, ?, 'INVOICE', ?, ?)`, [movementId, shiftId, refundTotal, effectiveRefundMethod, refundId, reason || 'مرتجع', now]);
+            // Resolve payments array
+            const resolvedPayments = Array.isArray(payments) && payments.length > 0
+                ? payments.map((p) => (Object.assign(Object.assign({}, p), { amount: Math.abs(p.amount) })))
+                : [{
+                        method: effectiveRefundMethod,
+                        amount: Math.abs(refundTotal),
+                        accountId: refundAccountId || undefined,
+                        accountName: refundAccountName || undefined
+                    }];
+            // Record cash movements for each payment method
+            for (const payment of resolvedPayments) {
+                const movementId = (0, crypto_1.randomUUID)();
+                yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
+                     VALUES (?, ?, 'REFUND', ?, ?, ?, 'INVOICE', ?, ?)`, [movementId, shiftId, payment.amount, payment.method, refundId, reason || 'مرتجع', now]);
+            }
             // Update shift totals
             yield conn.query(`UPDATE pos_shifts SET totalRefunds = COALESCE(totalRefunds, 0) + ?, refundsCount = COALESCE(refundsCount, 0) + 1, updatedAt = ? WHERE id = ?`, [refundTotal, now, shiftId]);
             // ═══════════════════════════════════════════════════════════════════
             // REVERSE REVENUE/COGS JOURNAL ENTRY (ATOMIC — failure rolls back refund)
             // Mirrors the sale journal but with RETURN_SALE type — reverses Dr/Cr
             // ═══════════════════════════════════════════════════════════════════
-            const origInvoice = origInvoices[0];
             const refundLines = items.map((item) => ({
                 productId: item.productId,
                 productName: item.productName,
@@ -3350,7 +4615,7 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 cost: item.cost || 0,
                 total: item.quantity * item.price,
             }));
-            yield (0, invoiceController_1.syncRevenueCogsJournal)(conn, refundId, refundNumber, 'RETURN_SALE', now, origInvoice.partnerName || 'عميل نقدي', refundTotal, refundLines, userName, false, true, 0, (0, branchFilter_1.resolveBranchIdForWrite)(req));
+            yield (0, invoiceController_1.syncRevenueCogsJournal)(conn, refundId, refundNumber, 'RETURN_SALE', now, resolvedPartnerName, refundTotal, refundLines, userName, false, true, 0, shift.branchId || null);
             console.log(`📒 [POS Refund] Revenue/COGS reverse journal created for ${refundNumber}`);
             // ═══════════════════════════════════════════════════════════════════
             // REVERSE TREASURY JOURNAL ENTRY (ATOMIC)
@@ -3364,54 +4629,56 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 [refPartnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE '%عملاء%' LIMIT 1`);
             }
             const refPartnerAccount = refPartnerAccRows[0];
-            // Resolve cash account (refunds go through selected account, or cash drawer fallback)
-            let refCashAccount = null;
-            // Use the refundAccountId sent from the client if provided
-            if (refundAccountId) {
-                const [refAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [refundAccountId]);
-                if (refAccRows.length > 0) {
-                    refCashAccount = refAccRows[0];
+            for (const payment of resolvedPayments) {
+                if (payment.amount === 0)
+                    continue;
+                // Resolve cash account for this split
+                let refCashAccount = null;
+                if (payment.accountId) {
+                    const [refAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [payment.accountId]);
+                    if (refAccRows.length > 0) {
+                        refCashAccount = refAccRows[0];
+                    }
+                }
+                if (!refCashAccount && shift.treasuryId) {
+                    const [refCashAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [shift.treasuryId]);
+                    if (refCashAccRows.length > 0) {
+                        refCashAccount = refCashAccRows[0];
+                    }
+                }
+                if (!refCashAccount) {
+                    refCashAccount = yield (0, branchFilter_1.resolveBranchCashAccount)(conn, req);
+                }
+                if (refPartnerAccount && refCashAccount) {
+                    const refTreasuryJournalId = (0, crypto_1.randomUUID)();
+                    yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate, branchId)
+                         VALUES (?, ?, ?, ?, ?, 'EGP', 1, ?)`, [
+                        refTreasuryJournalId, now,
+                        `مردودات (POS) #${refundNumber} - ${resolvedPartnerName}`,
+                        refundId, userName, shift.branchId || null
+                    ]);
+                    // Reverse: Dr Receivables (partner owes less), Cr Cash (cash goes out)
+                    yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
+                            [refTreasuryJournalId, refPartnerAccount.id, refPartnerAccount.name, payment.amount, 0, 'EGP', 1, payment.amount, 0],
+                            [refTreasuryJournalId, refCashAccount.id, refCashAccount.name, 0, payment.amount, 'EGP', 1, 0, payment.amount]
+                        ]]);
+                    if (!refundAffectedAccountIds.includes(refPartnerAccount.id))
+                        refundAffectedAccountIds.push(refPartnerAccount.id);
+                    if (!refundAffectedAccountIds.includes(refCashAccount.id))
+                        refundAffectedAccountIds.push(refCashAccount.id);
                 }
             }
-            // Fallback to shift treasury if no explicit account was provided
-            if (!refCashAccount && shift.treasuryId) {
-                const [refCashAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE id = ? LIMIT 1`, [shift.treasuryId]);
-                if (refCashAccRows.length > 0) {
-                    refCashAccount = refCashAccRows[0];
-                }
-            }
-            if (!refCashAccount) {
-                // Branch-aware fallback
-                refCashAccount = yield (0, branchFilter_1.resolveBranchCashAccount)(conn, req);
-            }
-            if (refPartnerAccount && refCashAccount) {
-                const refTreasuryJournalId = (0, crypto_1.randomUUID)();
-                yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate)
-                     VALUES (?, ?, ?, ?, ?, 'EGP', 1)`, [
-                    refTreasuryJournalId, now,
-                    `مردودات (POS) #${refundNumber} - ${origInvoice.partnerName || 'عميل نقدي'}`,
-                    refundId, userName
-                ]);
-                // Reverse: Dr Receivables (partner owes less), Cr Cash (cash goes out)
-                yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
-                        [refTreasuryJournalId, refPartnerAccount.id, refPartnerAccount.name, refundTotal, 0, 'EGP', 1, refundTotal, 0],
-                        [refTreasuryJournalId, refCashAccount.id, refCashAccount.name, 0, refundTotal, 'EGP', 1, 0, refundTotal]
-                    ]]);
-                if (!refundAffectedAccountIds.includes(refPartnerAccount.id))
-                    refundAffectedAccountIds.push(refPartnerAccount.id);
-                if (!refundAffectedAccountIds.includes(refCashAccount.id))
-                    refundAffectedAccountIds.push(refCashAccount.id);
-                if (refundAffectedAccountIds.length > 0) {
-                    yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, refundAffectedAccountIds);
-                }
-                console.log(`📒 [POS Refund] Treasury reverse journal created for ${refundNumber}`);
+            if (refundAffectedAccountIds.length > 0) {
+                yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, refundAffectedAccountIds);
+                console.log(`📒 [POS Refund] Treasury reverse journals created for ${refundNumber}`);
             }
             yield conn.query('COMMIT');
+            eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: userName });
             // === LOYALTY: Clawback earned points after refund (non-fatal) ===
-            const refundPartnerId = origInvoices[0].partnerId;
+            const refundPartnerId = resolvedPartnerId;
             let loyaltyClawbackPoints = 0;
             try {
-                if (refundPartnerId) {
+                if (refundPartnerId && originalInvoiceId) {
                     loyaltyClawbackPoints = yield (0, loyaltyController_1.recordLoyaltyClawback)(conn, refundPartnerId, originalInvoiceId, refundTotal, userName);
                 }
             }
@@ -3424,7 +4691,7 @@ const processPOSRefund = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 refund: {
                     id: refundId,
                     number: refundNumber,
-                    originalInvoiceId,
+                    originalInvoiceId: originalInvoiceId || null,
                     items,
                     total: refundTotal,
                     reason,
@@ -3463,8 +4730,7 @@ const getEmbeddedVariants = (req, res) => __awaiter(void 0, void 0, void 0, func
         const { id: productId } = req.params;
         const includeInactive = req.query.includeInactive === 'true';
         const userCtx = req.user;
-        const userRole = ((userCtx === null || userCtx === void 0 ? void 0 : userCtx.role) || '').toUpperCase();
-        const isPrivileged = ['ADMIN', 'SUPER_ADMIN', 'MASTER_ADMIN'].includes(userRole);
+        const { isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
         // Branch isolation: warehouse from JWT unless privileged overrides
         const warehouseId = isPrivileged && req.query.warehouseId
             ? String(req.query.warehouseId)
@@ -3607,10 +4873,12 @@ function orderByToSQL(orderBy, fallback) {
  * Build a reusable WHERE clause + params from all supported report filter params.
  * shiftIds / sessionNumbers are treated as aliases for posShiftId (multi-value).
  */
-function buildReportFilters(query) {
+function buildReportFilters(req, queryOverride) {
+    const query = queryOverride || req.query || {};
     const { dateFrom, dateTo, shiftId, shiftIds, sessionNumbers, warehouseId, branchId, branchIds, currency, page, pageSize, } = query;
     const conditions = ["i.type IN ('INVOICE_SALE', 'RETURN_SALE')", "i.isPOSSale = 1", "i.status != 'VOID'"];
     const params = [];
+    (0, branchFilter_1.appendBranchFilter)(conditions, params, req, 'i');
     if (dateFrom && dateTo) {
         conditions.push('DATE(i.date) BETWEEN ? AND ?');
         params.push(dateFrom, dateTo);
@@ -3685,7 +4953,7 @@ function buildDeviceJoin(posDeviceId) {
 const getCategorySalesSummary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { where, params, limit, offset } = buildReportFilters(req.query);
+        const { where, params, limit, offset } = buildReportFilters(req);
         const { join: dj, condition: dc, param: dp } = buildDeviceJoin(req.query.posDeviceId);
         const orderSQL = orderByToSQL(req.query.orderBy, 'totalRevenue DESC');
         const allParams = [...params, ...dp];
@@ -3718,7 +4986,7 @@ exports.getCategorySalesSummary = getCategorySalesSummary;
 const getProductSalesSummary = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { where, params, limit, offset } = buildReportFilters(req.query);
+        const { where, params, limit, offset } = buildReportFilters(req);
         const { join: dj, condition: dc, param: dp } = buildDeviceJoin(req.query.posDeviceId);
         const orderSQL = orderByToSQL(req.query.orderBy, 'totalRevenue DESC');
         const allParams = [...params, ...dp];
@@ -3757,6 +5025,7 @@ const getShiftSalesReport = (req, res) => __awaiter(void 0, void 0, void 0, func
         const { dateFrom, dateTo, warehouseId, posDeviceId, branchId, branchIds, page, pageSize } = req.query;
         const conditions = ["ps.status IN ('CLOSED', 'VALIDATED', 'PENDING_VALIDATION', 'OPEN')"];
         const params = [];
+        (0, branchFilter_1.appendBranchFilter)(conditions, params, req, 'ps');
         if (dateFrom && dateTo) {
             conditions.push('DATE(ps.openedAt) BETWEEN ? AND ?');
             params.push(dateFrom, dateTo);
@@ -3828,6 +5097,17 @@ const getShiftMovementDetail = (req, res) => __awaiter(void 0, void 0, void 0, f
             conn.release();
             return res.status(400).json({ error: 'shiftId is required' });
         }
+        const [shiftRows] = yield conn.query(`SELECT branchId FROM pos_shifts WHERE id = ?`, [shiftId]);
+        if (shiftRows.length === 0) {
+            conn.release();
+            return res.status(404).json({ error: 'الوردية غير موجودة' });
+        }
+        const shift = shiftRows[0];
+        const { branchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(req);
+        if (!isPrivileged && branchId && shift.branchId && shift.branchId !== branchId) {
+            conn.release();
+            return res.status(403).json({ error: 'ليس لديك صلاحية للوصول إلى بيانات هذا الفرع' });
+        }
         const [movements] = yield conn.query(`SELECT
                 pcm.id,
                 pcm.type,
@@ -3837,8 +5117,19 @@ const getShiftMovementDetail = (req, res) => __awaiter(void 0, void 0, void 0, f
                 pcm.referenceId,
                 pcm.referenceType,
                 pcm.approvedBy,
-                pcm.createdAt
+                pcm.createdAt,
+                COALESCE(i.bankName, a.name, 
+                    CASE pcm.paymentMethod 
+                        WHEN 'CASH' THEN 'نقدي'
+                        WHEN 'TREASURY' THEN 'خزينة'
+                        WHEN 'DEFERRED' THEN 'آجل'
+                        WHEN 'CHEQUE' THEN 'شيك'
+                        ELSE pcm.paymentMethod 
+                    END
+                ) as paymentMethodName
              FROM pos_cash_movements pcm
+             LEFT JOIN invoices i ON pcm.referenceType = 'INVOICE' AND pcm.referenceId COLLATE utf8mb4_unicode_ci = i.id COLLATE utf8mb4_unicode_ci
+             LEFT JOIN accounts a ON i.bankAccountId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
              WHERE pcm.shiftId = ?
              ORDER BY pcm.createdAt ASC`, [shiftId]);
         const [invoices] = yield conn.query(`SELECT
@@ -3848,8 +5139,18 @@ const getShiftMovementDetail = (req, res) => __awaiter(void 0, void 0, void 0, f
                 i.partnerName,
                 i.total,
                 i.paymentMethod,
-                i.status
+                i.status,
+                COALESCE(i.bankName, a.name, 
+                    CASE i.paymentMethod 
+                        WHEN 'CASH' THEN 'نقدي'
+                        WHEN 'TREASURY' THEN 'خزينة'
+                        WHEN 'DEFERRED' THEN 'آجل'
+                        WHEN 'CHEQUE' THEN 'شيك'
+                        ELSE i.paymentMethod 
+                    END
+                ) as paymentMethodName
              FROM invoices i
+             LEFT JOIN accounts a ON i.bankAccountId COLLATE utf8mb4_unicode_ci = a.id COLLATE utf8mb4_unicode_ci
              WHERE i.posShiftId = ?
                AND i.type IN ('INVOICE_SALE', 'CREDIT_NOTE')
                AND i.isPOSSale = 1
@@ -3870,6 +5171,7 @@ const getShiftProfitabilityReport = (req, res) => __awaiter(void 0, void 0, void
         const { dateFrom, dateTo, warehouseId, posDeviceId, page, pageSize } = req.query;
         const shiftConditions = ["ps.status IN ('CLOSED', 'VALIDATED', 'PENDING_VALIDATION')"];
         const shiftParams = [];
+        (0, branchFilter_1.appendBranchFilter)(shiftConditions, shiftParams, req, 'ps');
         if (dateFrom && dateTo) {
             shiftConditions.push('DATE(ps.openedAt) BETWEEN ? AND ?');
             shiftParams.push(dateFrom, dateTo);
@@ -3895,19 +5197,21 @@ const getShiftProfitabilityReport = (req, res) => __awaiter(void 0, void 0, void
                 COALESCE(ps.totalRefunds, 0) AS totalRefunds,
                 COALESCE(ps.totalSales, 0) - COALESCE(ps.totalRefunds, 0) AS netSales,
                 COALESCE((
-                    SELECT SUM(CASE WHEN inv.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END)
+                    SELECT SUM(CASE WHEN inv.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END)
                     FROM invoices inv
                     JOIN invoice_lines il ON il.invoiceId = inv.id
                     LEFT JOIN products p ON p.id = il.productId
+                    LEFT JOIN product_variants pv ON il.variantId = pv.id
                     WHERE inv.posShiftId = ps.id
                       AND inv.type IN ('INVOICE_SALE', 'RETURN_SALE')
                 ), 0) AS totalCost,
                 COALESCE(ps.totalSales, 0) - COALESCE(ps.totalRefunds, 0)
                     - COALESCE((
-                        SELECT SUM(CASE WHEN inv.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END)
+                        SELECT SUM(CASE WHEN inv.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END)
                         FROM invoices inv
                         JOIN invoice_lines il ON il.invoiceId = inv.id
                         LEFT JOIN products p ON p.id = il.productId
+                        LEFT JOIN product_variants pv ON il.variantId = pv.id
                         WHERE inv.posShiftId = ps.id
                           AND inv.type IN ('INVOICE_SALE', 'RETURN_SALE')
                     ), 0) AS grossProfit
@@ -3930,7 +5234,7 @@ exports.getShiftProfitabilityReport = getShiftProfitabilityReport;
 const getCategoryProfitabilityReport = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { where, params, limit, offset } = buildReportFilters(req.query);
+        const { where, params, limit, offset } = buildReportFilters(req);
         const { join: dj, condition: dc, param: dp } = buildDeviceJoin(req.query.posDeviceId);
         const orderSQL = orderByToSQL(req.query.orderBy, 'grossProfit DESC');
         const allParams = [...params, ...dp];
@@ -3938,17 +5242,18 @@ const getCategoryProfitabilityReport = (req, res) => __awaiter(void 0, void 0, v
                 COALESCE(c.name, 'غير مصنف') AS category,
                 SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty,
                 SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) AS totalRevenue,
-                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END) AS totalCost,
-                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END) AS grossProfit,
+                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END) AS totalCost,
+                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END) AS grossProfit,
                 CASE
                     WHEN SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) > 0
-                    THEN ROUND((SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END)) / SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) * 100, 2)
+                    THEN ROUND((SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END)) / SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) * 100, 2)
                     ELSE 0
                 END AS marginPercent,
-                SUM(CASE WHEN COALESCE(p.cost, 0) = 0 THEN 1 ELSE 0 END) AS missingCostCount
+                SUM(CASE WHEN COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0) = 0 THEN 1 ELSE 0 END) AS missingCostCount
              FROM invoice_lines il
              JOIN invoices i ON i.id = il.invoiceId
              LEFT JOIN products p ON p.id = il.productId
+             LEFT JOIN product_variants pv ON il.variantId = pv.id
              LEFT JOIN categories c ON c.id = p.categoryId
              ${dj}
              WHERE ${where}${dc}
@@ -3968,7 +5273,7 @@ exports.getCategoryProfitabilityReport = getCategoryProfitabilityReport;
 const getProductProfitabilityReport = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const conn = yield (0, db_1.getConnection)();
     try {
-        const { where, params, limit, offset } = buildReportFilters(req.query);
+        const { where, params, limit, offset } = buildReportFilters(req);
         const { join: dj, condition: dc, param: dp } = buildDeviceJoin(req.query.posDeviceId);
         const orderSQL = orderByToSQL(req.query.orderBy, 'grossProfit DESC');
         const allParams = [...params, ...dp];
@@ -3978,22 +5283,23 @@ const getProductProfitabilityReport = (req, res) => __awaiter(void 0, void 0, vo
                 COALESCE(c.name, 'غير مصنف') AS category,
                 SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty,
                 SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) AS totalRevenue,
-                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END) AS totalCost,
-                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END) AS grossProfit,
+                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END) AS totalCost,
+                SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END) AS grossProfit,
                 CASE
                     WHEN SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) > 0
-                    THEN ROUND((SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(p.cost, 0)) ELSE (il.quantity * COALESCE(p.cost, 0)) END)) / SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) * 100, 2)
+                    THEN ROUND((SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) - SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -(il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) ELSE (il.quantity * COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0)) END)) / SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) * 100, 2)
                     ELSE 0
                 END AS marginPercent,
-                CASE WHEN COALESCE(p.cost, 0) = 0 THEN 1 ELSE 0 END AS missingCost
+                CASE WHEN COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0) = 0 THEN 1 ELSE 0 END AS missingCost
              FROM invoice_lines il
              JOIN invoices i ON i.id = il.invoiceId
              LEFT JOIN products p ON p.id = il.productId
+             LEFT JOIN product_variants pv ON il.variantId = pv.id
              LEFT JOIN categories c ON c.id = p.categoryId
              ${dj}
              WHERE ${where}${dc}
              GROUP BY il.productId, il.productName, COALESCE(c.name, 'غير مصنف'),
-                      CASE WHEN COALESCE(p.cost, 0) = 0 THEN 1 ELSE 0 END
+                      CASE WHEN COALESCE(NULLIF(il.cost, 0), NULLIF(pv.purchasePrice, 0), p.cost, 0) = 0 THEN 1 ELSE 0 END
              ORDER BY ${orderSQL}
              LIMIT ? OFFSET ?`, [...allParams, limit, offset]);
         conn.release();
@@ -4011,8 +5317,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
     const { reportKey } = req.params;
     const query = req.query;
     const REPORT_DISPATCH = {
-        'category-sales': (q, conn) => __awaiter(void 0, void 0, void 0, function* () {
-            const { where, params } = buildReportFilters(q);
+        'category-sales': (req, conn) => __awaiter(void 0, void 0, void 0, function* () {
+            const q = req.query;
+            const { where, params } = buildReportFilters(req);
             const { join: dj, condition: dc, param: dp } = buildDeviceJoin(q.posDeviceId);
             const [rows] = yield conn.query(`SELECT COALESCE(c.name,'غير مصنف') AS category,
                     COUNT(DISTINCT i.id) AS invoiceCount, SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty,
@@ -4025,8 +5332,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                  WHERE ${where}${dc} GROUP BY COALESCE(c.name,'غير مصنف') ORDER BY totalRevenue DESC`, [...params, ...dp]);
             return rows;
         }),
-        'product-sales': (q, conn) => __awaiter(void 0, void 0, void 0, function* () {
-            const { where, params } = buildReportFilters(q);
+        'product-sales': (req, conn) => __awaiter(void 0, void 0, void 0, function* () {
+            const q = req.query;
+            const { where, params } = buildReportFilters(req);
             const { join: dj, condition: dc, param: dp } = buildDeviceJoin(q.posDeviceId);
             const [rows] = yield conn.query(`SELECT il.productId, il.productName, COALESCE(c.name,'غير مصنف') AS category,
                     SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty, AVG(il.price) AS avgPrice,
@@ -4040,9 +5348,11 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                  ORDER BY totalRevenue DESC`, [...params, ...dp]);
             return rows;
         }),
-        'shift-sales': (q, conn) => __awaiter(void 0, void 0, void 0, function* () {
+        'shift-sales': (req, conn) => __awaiter(void 0, void 0, void 0, function* () {
+            const q = req.query;
             const conds = ["ps.status IN ('CLOSED','VALIDATED','PENDING_VALIDATION','OPEN')"];
             const p = [];
+            (0, branchFilter_1.appendBranchFilter)(conds, p, req, 'ps');
             if (q.dateFrom && q.dateTo) {
                 conds.push('DATE(ps.openedAt) BETWEEN ? AND ?');
                 p.push(q.dateFrom, q.dateTo);
@@ -4059,9 +5369,11 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                  WHERE ${conds.join(' AND ')} ORDER BY ps.openedAt DESC`, p);
             return rows;
         }),
-        'shift-profitability': (q, conn) => __awaiter(void 0, void 0, void 0, function* () {
+        'shift-profitability': (req, conn) => __awaiter(void 0, void 0, void 0, function* () {
+            const q = req.query;
             const conds = ["ps.status IN ('CLOSED','VALIDATED','PENDING_VALIDATION')"];
             const p = [];
+            (0, branchFilter_1.appendBranchFilter)(conds, p, req, 'ps');
             if (q.dateFrom && q.dateTo) {
                 conds.push('DATE(ps.openedAt) BETWEEN ? AND ?');
                 p.push(q.dateFrom, q.dateTo);
@@ -4073,8 +5385,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                  WHERE ${conds.join(' AND ')} ORDER BY ps.openedAt DESC`, p);
             return rows;
         }),
-        'category-profitability': (q, conn) => __awaiter(void 0, void 0, void 0, function* () {
-            const { where, params } = buildReportFilters(q);
+        'category-profitability': (req, conn) => __awaiter(void 0, void 0, void 0, function* () {
+            const q = req.query;
+            const { where, params } = buildReportFilters(req);
             const { join: dj, condition: dc, param: dp } = buildDeviceJoin(q.posDeviceId);
             const [rows] = yield conn.query(`SELECT COALESCE(c.name,'غير مصنف') AS category,
                     SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty, SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) AS totalRevenue,
@@ -4090,8 +5403,9 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
                  WHERE ${where}${dc} GROUP BY COALESCE(c.name,'غير مصنف') ORDER BY grossProfit DESC`, [...params, ...dp]);
             return rows;
         }),
-        'product-profitability': (q, conn) => __awaiter(void 0, void 0, void 0, function* () {
-            const { where, params } = buildReportFilters(q);
+        'product-profitability': (req, conn) => __awaiter(void 0, void 0, void 0, function* () {
+            const q = req.query;
+            const { where, params } = buildReportFilters(req);
             const { join: dj, condition: dc, param: dp } = buildDeviceJoin(q.posDeviceId);
             const [rows] = yield conn.query(`SELECT il.productId, il.productName, COALESCE(c.name,'غير مصنف') AS category,
                     SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.quantity ELSE il.quantity END) AS totalQty, SUM(CASE WHEN i.type = 'RETURN_SALE' THEN -il.total ELSE il.total END) AS totalRevenue,
@@ -4116,7 +5430,7 @@ const exportPOSReport = (req, res) => __awaiter(void 0, void 0, void 0, function
     }
     const conn = yield (0, db_1.getConnection)();
     try {
-        const rows = yield queryFn(query, conn);
+        const rows = yield queryFn(req, conn);
         conn.release();
         const BOM = '\uFEFF';
         const headers = rows.length > 0 ? Object.keys(rows[0]) : [];
@@ -4150,7 +5464,7 @@ const updatePOSInvoice = (req, res) => __awaiter(void 0, void 0, void 0, functio
         const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
         const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'Unknown';
         // 1. Validate invoice exists and is a POS invoice
-        const [invRows] = yield conn.query('SELECT id, number, date, type, total, isPOSSale, posShiftId FROM invoices WHERE id = ?', [invoiceId]);
+        const [invRows] = yield conn.query('SELECT id, number, date, type, total, isPOSSale, posShiftId, paymentMethod FROM invoices WHERE id = ?', [invoiceId]);
         const invoice = invRows[0];
         if (!invoice) {
             conn.release();
@@ -4165,7 +5479,6 @@ const updatePOSInvoice = (req, res) => __awaiter(void 0, void 0, void 0, functio
         const settingsData = settingsRows[0] || {};
         const cutoffDate = settingsData.editCutoffDate;
         const cutoffDays = parseInt(settingsData.editCutoffDays) || 0;
-        // Determine effective cutoff: rolling days takes priority over static date
         let effectiveCutoff = null;
         if (cutoffDays > 0) {
             effectiveCutoff = new Date();
@@ -4190,44 +5503,93 @@ const updatePOSInvoice = (req, res) => __awaiter(void 0, void 0, void 0, functio
         }
         // 3. Record old state for audit
         const oldTotal = parseFloat(invoice.total) || 0;
+        const oldPaymentMethod = invoice.paymentMethod;
         const [oldLineRows] = yield conn.query('SELECT COUNT(*) AS cnt FROM invoice_lines WHERE invoiceId = ?', [invoiceId]);
         const oldItemCount = parseInt((_c = oldLineRows[0]) === null || _c === void 0 ? void 0 : _c.cnt) || 0;
+        // 3b. Collect old treasury journal account IDs BEFORE delegation
+        // These journals will be recreated by updateInvoice, so we need to
+        // recalculate balances for ALL affected accounts (old + new).
+        const [oldJournalAccRows] = yield conn.query(`SELECT DISTINCT jl.accountId FROM journal_lines jl
+             JOIN journal_entries je ON jl.journalId = je.id
+             WHERE je.referenceId = ? OR je.referenceId = ?`, [invoiceId, invoice.number]);
+        const oldAffectedAccountIds = oldJournalAccRows.map((r) => r.accountId).filter(Boolean);
         conn.release(); // Release before delegating
         // 4. Delegate to existing updateInvoice handler
         req.params.id = invoiceId;
-        // Wrap response to intercept the result and create audit log
+        // Wrap response to intercept the result and fix POS-specific data
         const originalJson = res.json.bind(res);
         res.json = function (body) {
             var _a;
-            // After successful update, create audit record (fire-and-forget)
+            // After successful update, fix POS cash movements + journals
             if (!(body === null || body === void 0 ? void 0 : body.error) && res.statusCode < 400) {
                 const newTotal = parseFloat(req.body.total) || 0;
                 const newItemCount = ((_a = req.body.lines) === null || _a === void 0 ? void 0 : _a.length) || 0;
-                (0, db_1.getConnection)().then(auditConn => {
-                    auditConn.query(`
-                        CREATE TABLE IF NOT EXISTS pos_invoice_edits (
-                            id VARCHAR(36) PRIMARY KEY,
-                            invoiceId VARCHAR(36) NOT NULL,
-                            editedBy VARCHAR(100),
-                            editedByName VARCHAR(200),
-                            editedAt DATETIME,
-                            oldTotal DECIMAL(15,2),
-                            newTotal DECIMAL(15,2),
-                            oldItemCount INT,
-                            newItemCount INT,
-                            reason TEXT,
-                            INDEX idx_pie_invoiceId (invoiceId)
-                        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-                    `).then(() => {
-                        return auditConn.query(`INSERT INTO pos_invoice_edits (id, invoiceId, editedBy, editedByName, editedAt, oldTotal, newTotal, oldItemCount, newItemCount, reason)
-                             VALUES (?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?)`, [
-                            (0, crypto_1.randomUUID)(), invoiceId, userId, userName,
-                            oldTotal, newTotal, oldItemCount, newItemCount,
-                            req.body.editReason || null
-                        ]);
-                    }).catch(e => console.error('[POS] Audit log error:', e.message))
-                        .finally(() => auditConn.release());
-                }).catch(e => console.error('[POS] Audit conn error:', e.message));
+                const newPaymentMethod = req.body.paymentMethod || oldPaymentMethod;
+                (0, db_1.getConnection)().then((auditConn) => __awaiter(this, void 0, void 0, function* () {
+                    try {
+                        yield auditConn.beginTransaction();
+                        // ── Ensure audit table exists ──
+                        yield auditConn.query(`
+                            CREATE TABLE IF NOT EXISTS pos_invoice_edits (
+                                id VARCHAR(36) PRIMARY KEY,
+                                invoiceId VARCHAR(36) NOT NULL,
+                                editedBy VARCHAR(100),
+                                editedByName VARCHAR(200),
+                                editedAt DATETIME,
+                                oldTotal DECIMAL(15,2),
+                                newTotal DECIMAL(15,2),
+                                oldItemCount INT,
+                                newItemCount INT,
+                                reason TEXT,
+                                INDEX idx_pie_invoiceId (invoiceId)
+                            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+                        `);
+                        // ── Insert audit record ──
+                        yield auditConn.query(`INSERT INTO pos_invoice_edits (id, invoiceId, editedBy, editedByName, editedAt, oldTotal, newTotal, oldItemCount, newItemCount, reason)
+                             VALUES (?, ?, ?, ?, NOW(), ?, ?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), invoiceId, userId, userName, oldTotal, newTotal, oldItemCount, newItemCount, req.body.editReason || null]);
+                        // ── Fix pos_cash_movements: delete old + insert new ──
+                        yield auditConn.query(`DELETE FROM pos_cash_movements WHERE referenceId = ? AND type IN ('SALE', 'DEFERRED')`, [invoiceId]);
+                        const payments = req.body.payments || [];
+                        if (payments.length > 0) {
+                            // Split payment — insert one movement per payment split
+                            for (const p of payments) {
+                                const movType = p.method === 'DEFERRED' ? 'DEFERRED' : 'SALE';
+                                yield auditConn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, description, createdAt)
+                                     VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`, [(0, crypto_1.randomUUID)(), invoice.posShiftId, movType, Math.abs(p.amount), p.method, invoiceId, `POS Edit #${invoice.number}`]);
+                            }
+                        }
+                        else {
+                            // Single payment method — insert one movement
+                            const movType = newPaymentMethod === 'DEFERRED' ? 'DEFERRED' : 'SALE';
+                            yield auditConn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, description, createdAt)
+                                 VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`, [(0, crypto_1.randomUUID)(), invoice.posShiftId, movType, newTotal, newPaymentMethod, invoiceId, `POS Edit #${invoice.number}`]);
+                        }
+                        // ── Recalculate account balances for old + new journal accounts ──
+                        // updateInvoice already recreated journal_entries/journal_lines,
+                        // but account.balance may be stale for old accounts that were removed.
+                        const [newJournalAccRows] = yield auditConn.query(`SELECT DISTINCT jl.accountId FROM journal_lines jl
+                             JOIN journal_entries je ON jl.journalId = je.id
+                             WHERE je.referenceId = ? OR je.referenceId = ?`, [invoiceId, invoice.number]);
+                        const newAccountIds = newJournalAccRows.map((r) => r.accountId).filter(Boolean);
+                        const allAccountIds = [...new Set([...oldAffectedAccountIds, ...newAccountIds])];
+                        if (allAccountIds.length > 0) {
+                            yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(auditConn, allAccountIds);
+                            console.log(`✅ [POS Edit] Recalculated ${allAccountIds.length} account balances after edit`);
+                        }
+                        // ── Recalculate parent shift totals (expectedCash, variance) ──
+                        if (invoice.posShiftId) {
+                            yield recalculateShiftTotals(auditConn, invoice.posShiftId, userName);
+                        }
+                        yield auditConn.commit();
+                    }
+                    catch (e) {
+                        yield auditConn.rollback().catch(() => { });
+                        console.error('[POS] Post-edit fix error:', e.message);
+                    }
+                    finally {
+                        auditConn.release();
+                    }
+                })).catch(e => console.error('[POS] Audit conn error:', e.message));
             }
             return originalJson(body);
         };
@@ -4243,3 +5605,353 @@ const updatePOSInvoice = (req, res) => __awaiter(void 0, void 0, void 0, functio
     }
 });
 exports.updatePOSInvoice = updatePOSInvoice;
+// ============================================
+// ADMIN: QUICK PAYMENT METHOD EDIT
+// Changes only the payment method on a POS invoice
+// without touching items/stock. Properly reverses and
+// recreates treasury journal entries.
+// ============================================
+const updatePOSInvoicePayment = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b, _c;
+    const conn = yield (0, db_1.getConnection)();
+    try {
+        const { invoiceId } = req.params;
+        const userId = (_a = req.user) === null || _a === void 0 ? void 0 : _a.id;
+        const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'Unknown';
+        const { payments } = req.body;
+        if (!payments || !Array.isArray(payments) || payments.length === 0) {
+            conn.release();
+            return res.status(400).json({ error: 'يجب تحديد طريقة دفع واحدة على الأقل' });
+        }
+        // 1. Validate invoice
+        const [invRows] = yield conn.query(`SELECT i.id, i.number, i.date, i.type, i.total, i.isPOSSale, i.posShiftId,
+                    i.paymentMethod, i.partnerId, i.partnerName
+             FROM invoices i WHERE i.id = ?`, [invoiceId]);
+        const invoice = invRows[0];
+        if (!invoice) {
+            conn.release();
+            return res.status(404).json({ error: 'الفاتورة غير موجودة' });
+        }
+        if (!invoice.isPOSSale) {
+            conn.release();
+            return res.status(400).json({ error: 'هذه ليست فاتورة نقطة بيع' });
+        }
+        // 2. Cutoff date check
+        const [settingsRows] = yield conn.query('SELECT editCutoffDate, editCutoffDays FROM pos_settings LIMIT 1');
+        const settingsData = settingsRows[0] || {};
+        const cutoffDays = parseInt(settingsData.editCutoffDays) || 0;
+        const cutoffDate = settingsData.editCutoffDate;
+        let effectiveCutoff = null;
+        if (cutoffDays > 0) {
+            effectiveCutoff = new Date();
+            effectiveCutoff.setDate(effectiveCutoff.getDate() - cutoffDays);
+            effectiveCutoff.setHours(0, 0, 0, 0);
+        }
+        else if (cutoffDate) {
+            effectiveCutoff = new Date(cutoffDate);
+        }
+        if (effectiveCutoff && new Date(invoice.date) < effectiveCutoff) {
+            conn.release();
+            return res.status(403).json({ error: 'تجاوزت فترة التعديل المسموحة', errorCode: 'CUTOFF_DATE_EXCEEDED' });
+        }
+        // 3. Validate total matches — sum of payments must equal invoice total
+        const invoiceTotal = parseFloat(invoice.total) || 0;
+        const paymentSum = payments.reduce((s, p) => s + (Math.abs(parseFloat(p.amount)) || 0), 0);
+        const ROUNDING_EPSILON = 0.05;
+        if (Math.abs(paymentSum - Math.abs(invoiceTotal)) > ROUNDING_EPSILON) {
+            conn.release();
+            return res.status(400).json({
+                error: `مجموع المدفوعات (${paymentSum.toFixed(2)}) لا يساوي إجمالي الفاتورة (${Math.abs(invoiceTotal).toFixed(2)})`,
+                errorCode: 'PAYMENT_TOTAL_MISMATCH'
+            });
+        }
+        // Determine dominant payment method
+        const dominantPayment = payments.reduce((max, p) => (Math.abs(p.amount) > Math.abs(max.amount)) ? p : max, payments[0]);
+        const newPaymentMethod = dominantPayment.method || 'CASH';
+        yield conn.beginTransaction();
+        // ── 4. Delete old treasury journal entries for this invoice ──
+        const [oldJournalRows] = yield conn.query(`SELECT je.id FROM journal_entries je
+             WHERE (je.referenceId = ? OR je.referenceId = ?)
+               AND (je.description LIKE '%POS%' OR je.description LIKE '%متحصلات%' OR je.description LIKE '%صرف%' OR je.description LIKE '%مرتجع%')`, [invoiceId, invoice.number]);
+        const oldJournalIds = oldJournalRows.map((r) => r.id);
+        // Collect affected accounts before deletion for balance recalc
+        let oldAffectedAccountIds = [];
+        if (oldJournalIds.length > 0) {
+            const ph = oldJournalIds.map(() => '?').join(',');
+            const [oldAccRows] = yield conn.query(`SELECT DISTINCT accountId FROM journal_lines WHERE journalId IN (${ph})`, oldJournalIds);
+            oldAffectedAccountIds = oldAccRows.map((r) => r.accountId).filter(Boolean);
+            yield conn.query(`DELETE FROM journal_lines WHERE journalId IN (${ph})`, oldJournalIds);
+            yield conn.query(`DELETE FROM journal_entries WHERE id IN (${ph})`, oldJournalIds);
+        }
+        // ── 5. Update invoice payment fields ──
+        const paymentBreakdown = payments.map((p) => ({
+            method: p.method, amount: Math.abs(p.amount),
+            accountId: p.accountId, accountName: p.accountName, reference: p.reference
+        }));
+        yield conn.query(`UPDATE invoices SET paymentMethod = ?, paymentBreakdown = ?, bankAccountId = ?, bankName = ? WHERE id = ?`, [
+            newPaymentMethod,
+            JSON.stringify(paymentBreakdown),
+            dominantPayment.accountId || null,
+            dominantPayment.accountName || null,
+            invoiceId
+        ]);
+        // ── 6. Recreate pos_cash_movements ──
+        yield conn.query(`DELETE FROM pos_cash_movements WHERE referenceId = ? AND type IN ('SALE', 'DEFERRED')`, [invoiceId]);
+        for (const p of payments) {
+            const movType = p.method === 'DEFERRED' ? 'DEFERRED' : 'SALE';
+            yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, description, createdAt)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, NOW())`, [(0, crypto_1.randomUUID)(), invoice.posShiftId, movType, Math.abs(p.amount), p.method, invoiceId, `تعديل دفع #${invoice.number}`]);
+        }
+        // ── 7. Recreate treasury journal entries ──
+        const isPurchase = invoice.type === 'INVOICE_PURCHASE';
+        const isReturn = invoice.type === 'RETURN_SALE' || invoice.type === 'RETURN_PURCHASE';
+        // Resolve partner account (AR or AP) — with broad fallback + auto-create
+        const partnerAccountCode = isPurchase ? '201%' : '104%';
+        let [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1`, [partnerAccountCode]);
+        if (partnerAccRows.length === 0) {
+            const fallbackName = isPurchase ? '%موردين%' : '%عملاء%';
+            [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1`, [fallbackName]);
+        }
+        if (partnerAccRows.length === 0) {
+            const broadPattern = isPurchase ? '%دائنين%' : '%مدينين%';
+            [partnerAccRows] = yield conn.query(`SELECT id, name FROM accounts WHERE (name LIKE ? OR name LIKE '%ذمم%') AND type = 'ASSET' LIMIT 1`, [broadPattern]);
+        }
+        if (partnerAccRows.length === 0) {
+            const autoAccId = (0, crypto_1.randomUUID)();
+            const autoCode = isPurchase ? '2010' : '1040';
+            const autoName = isPurchase ? 'موردين - ذمم دائنة' : 'عملاء - ذمم مدينة';
+            const autoType = isPurchase ? 'LIABILITY' : 'ASSET';
+            yield conn.query(`INSERT INTO accounts (id, code, name, type, balance, openingBalance, currencyCode) VALUES (?, ?, ?, ?, 0, 0, 'EGP')`, [autoAccId, autoCode, autoName, autoType]);
+            partnerAccRows = [{ id: autoAccId, name: autoName }];
+            console.log(`🔧 [POS PaymentEdit] Auto-created ${autoType} account: ${autoName} (${autoCode})`);
+        }
+        const partnerAccount = partnerAccRows[0];
+        const newAffectedAccountIds = [];
+        // Resolve shift for treasury fallback
+        let shiftTreasuryId = null;
+        if (invoice.posShiftId) {
+            const [shiftRows] = yield conn.query('SELECT treasuryId FROM pos_shifts WHERE id = ?', [invoice.posShiftId]);
+            shiftTreasuryId = ((_c = shiftRows[0]) === null || _c === void 0 ? void 0 : _c.treasuryId) || null;
+        }
+        for (const payment of payments) {
+            if (Math.abs(payment.amount) === 0)
+                continue;
+            if (payment.method === 'DEFERRED')
+                continue; // Deferred = no cash movement journal
+            const treasuryJournalId = (0, crypto_1.randomUUID)();
+            // Resolve payment GL account
+            let paymentAccount = null;
+            if (payment.accountId) {
+                const [direct] = yield conn.query('SELECT id, name FROM accounts WHERE id = ? LIMIT 1', [payment.accountId]);
+                if (direct.length > 0)
+                    paymentAccount = direct[0];
+            }
+            if (!paymentAccount) {
+                if ((payment.method === 'CASH' || payment.method === 'TREASURY') && shiftTreasuryId) {
+                    const [tRows] = yield conn.query('SELECT id, name FROM accounts WHERE id = ? LIMIT 1', [shiftTreasuryId]);
+                    if (tRows.length > 0)
+                        paymentAccount = tRows[0];
+                }
+                if (!paymentAccount) {
+                    if (payment.method === 'CASH' || payment.method === 'TREASURY') {
+                        paymentAccount = yield (0, branchFilter_1.resolveBranchCashAccount)(conn, req);
+                    }
+                    else {
+                        const code = payment.method === 'BANK' ? '102%' : '106%';
+                        let [fbRows] = yield conn.query('SELECT id, name FROM accounts WHERE code LIKE ? LIMIT 1', [code]);
+                        if (fbRows.length === 0) {
+                            const nameFb = payment.method === 'BANK' ? '%بنك%' : '%أوراق قبض%';
+                            [fbRows] = yield conn.query('SELECT id, name FROM accounts WHERE name LIKE ? LIMIT 1', [nameFb]);
+                        }
+                        paymentAccount = fbRows[0] || null;
+                    }
+                }
+            }
+            if (!paymentAccount || !partnerAccount) {
+                console.warn(`⚠️ [POS PaymentEdit] Could not resolve GL account for ${payment.method}`);
+                continue;
+            }
+            const methodLabel = payment.accountName || paymentAccount.name;
+            const absAmount = Math.abs(payment.amount);
+            const isPayout = isPurchase || isReturn;
+            const invoiceDate = invoice.date;
+            // Journal header
+            yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, currencyCode, exchangeRate)
+                 VALUES (?, ?, ?, ?, ?, 'EGP', 1)`, [
+                treasuryJournalId, invoiceDate,
+                isPayout
+                    ? `مدفوعات خارجة (تعديل دفع POS) #${invoice.number} - ${invoice.partnerName || 'عميل نقدي'} (${methodLabel})`
+                    : `متحصلات (تعديل دفع POS) #${invoice.number} - ${invoice.partnerName || 'عميل نقدي'} (${methodLabel})`,
+                invoiceId, userName
+            ]);
+            // Journal lines: Dr Payment Account / Cr Partner (or flipped for payout)
+            const drAccount = isPayout ? partnerAccount : paymentAccount;
+            const crAccount = isPayout ? paymentAccount : partnerAccount;
+            yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, currencyCode, exchangeRate, foreignDebit, foreignCredit) VALUES ?`, [[
+                    [treasuryJournalId, drAccount.id, drAccount.name, absAmount, 0, 'EGP', 1, absAmount, 0],
+                    [treasuryJournalId, crAccount.id, crAccount.name, 0, absAmount, 'EGP', 1, 0, absAmount]
+                ]]);
+            if (!newAffectedAccountIds.includes(paymentAccount.id))
+                newAffectedAccountIds.push(paymentAccount.id);
+            if (!newAffectedAccountIds.includes(partnerAccount.id))
+                newAffectedAccountIds.push(partnerAccount.id);
+            console.log(`📒 [POS PaymentEdit] Journal: ${methodLabel} ${absAmount} → ${paymentAccount.name} for #${invoice.number}`);
+        }
+        // ── 8. Recalculate all affected account balances ──
+        const allAccountIds = [...new Set([...oldAffectedAccountIds, ...newAffectedAccountIds])];
+        if (allAccountIds.length > 0) {
+            yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, allAccountIds);
+            console.log(`✅ [POS PaymentEdit] Recalculated ${allAccountIds.length} account balances`);
+        }
+        // ── 9. Audit record with payment method tracking ──
+        yield conn.query(`
+            CREATE TABLE IF NOT EXISTS pos_invoice_edits (
+                id VARCHAR(36) PRIMARY KEY,
+                invoiceId VARCHAR(36) NOT NULL,
+                shiftId VARCHAR(36),
+                editedBy VARCHAR(100),
+                editedByName VARCHAR(200),
+                editedAt DATETIME,
+                oldTotal DECIMAL(15,2),
+                newTotal DECIMAL(15,2),
+                oldItemCount INT,
+                newItemCount INT,
+                oldPaymentMethod VARCHAR(20),
+                newPaymentMethod VARCHAR(20),
+                shiftWasValidated TINYINT(1) DEFAULT 0,
+                reason TEXT,
+                INDEX idx_pie_invoiceId (invoiceId),
+                INDEX idx_pie_shiftId (shiftId)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        `);
+        // Check if shift was validated before this edit
+        let shiftWasValidated = 0;
+        if (invoice.posShiftId) {
+            const [shiftStatusRows] = yield conn.query(`SELECT status, approvalStatus FROM pos_shifts WHERE id = ?`, [invoice.posShiftId]);
+            const shiftStatus = shiftStatusRows[0];
+            shiftWasValidated = ((shiftStatus === null || shiftStatus === void 0 ? void 0 : shiftStatus.status) === 'VALIDATED' || (shiftStatus === null || shiftStatus === void 0 ? void 0 : shiftStatus.approvalStatus) === 'approved') ? 1 : 0;
+        }
+        // Safely add new columns if they don't exist yet (ALTER IGNORE for existing DBs)
+        try {
+            yield conn.query(`ALTER TABLE pos_invoice_edits ADD COLUMN IF NOT EXISTS shiftId VARCHAR(36) AFTER invoiceId`);
+            yield conn.query(`ALTER TABLE pos_invoice_edits ADD COLUMN IF NOT EXISTS oldPaymentMethod VARCHAR(20) AFTER newItemCount`);
+            yield conn.query(`ALTER TABLE pos_invoice_edits ADD COLUMN IF NOT EXISTS newPaymentMethod VARCHAR(20) AFTER oldPaymentMethod`);
+            yield conn.query(`ALTER TABLE pos_invoice_edits ADD COLUMN IF NOT EXISTS shiftWasValidated TINYINT(1) DEFAULT 0 AFTER newPaymentMethod`);
+        }
+        catch ( /* columns may already exist */_d) { /* columns may already exist */ }
+        yield conn.query(`INSERT INTO pos_invoice_edits (id, invoiceId, shiftId, editedBy, editedByName, editedAt, oldTotal, newTotal, oldItemCount, newItemCount, oldPaymentMethod, newPaymentMethod, shiftWasValidated, reason)
+             VALUES (?, ?, ?, ?, ?, NOW(), ?, ?, NULL, NULL, ?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), invoiceId, invoice.posShiftId || null, userId, userName, invoiceTotal, invoiceTotal, invoice.paymentMethod, newPaymentMethod, shiftWasValidated, `تغيير طريقة الدفع: ${invoice.paymentMethod} → ${newPaymentMethod}`]);
+        // ── 10. Recalculate parent shift totals (expectedCash, variance) ──
+        if (invoice.posShiftId) {
+            yield recalculateShiftTotals(conn, invoice.posShiftId, userName);
+        }
+        yield conn.commit();
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: userName });
+        res.json({
+            success: true,
+            message: `تم تعديل طريقة الدفع إلى ${newPaymentMethod}`,
+            paymentMethod: newPaymentMethod,
+            payments: paymentBreakdown
+        });
+    }
+    catch (error) {
+        yield conn.rollback().catch(() => { });
+        console.error('[POS] Error in updatePOSInvoicePayment:', error);
+        res.status(500).json({ error: error.message });
+    }
+    finally {
+        conn.release();
+    }
+});
+exports.updatePOSInvoicePayment = updatePOSInvoicePayment;
+// ============================================
+// PHASE 15 & 16: OFFLINE SYNC & CROSS-BRANCH
+// ============================================
+const syncQueue = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { operations } = req.body;
+    if (!Array.isArray(operations)) {
+        return res.status(400).json({ error: 'Operations must be an array' });
+    }
+    const results = [];
+    for (const op of operations) {
+        if (op.type === 'SALE') {
+            try {
+                // Simulate req/res for processPOSSale
+                const mockReq = Object.assign(Object.assign({}, req), { body: op.payload, user: req.user });
+                let responseData = null;
+                let statusCode = 200;
+                yield new Promise((resolve, reject) => {
+                    const mockRes = {
+                        status: (code) => { statusCode = code; return mockRes; },
+                        json: (data) => {
+                            responseData = data;
+                            if (statusCode >= 400)
+                                reject(new Error(data.error || 'Unknown error'));
+                            else
+                                resolve();
+                        },
+                        send: (data) => {
+                            responseData = data;
+                            resolve();
+                        }
+                    };
+                    (0, exports.processPOSSale)(mockReq, mockRes).catch(reject);
+                });
+                results.push({
+                    localId: op.localId,
+                    status: 'SUCCESS',
+                    serverInvoiceId: (responseData === null || responseData === void 0 ? void 0 : responseData.invoiceId) || (responseData === null || responseData === void 0 ? void 0 : responseData.id),
+                    response: responseData
+                });
+            }
+            catch (err) {
+                // Accept the error and continue processing others
+                results.push({
+                    localId: op.localId,
+                    status: 'ERROR',
+                    error: err.message || 'Unknown error during sync'
+                });
+            }
+        }
+        else {
+            results.push({ localId: op.localId, status: 'SKIPPED', error: 'Unknown operation type' });
+        }
+    }
+    res.json({ results });
+});
+exports.syncQueue = syncQueue;
+const requestStockTransfer = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { sourceWarehouseId, items, description, shiftId } = req.body;
+    if (!sourceWarehouseId || !items || !items.length) {
+        return res.status(400).json({ error: 'Missing source warehouse or items' });
+    }
+    const conn = yield (0, db_1.getConnection)();
+    let destWarehouseId = req.body.destWarehouseId;
+    try {
+        if (!destWarehouseId && shiftId) {
+            const [shifts] = yield conn.query('SELECT warehouseId FROM pos_shifts WHERE id = ?', [shiftId]);
+            if (shifts.length > 0)
+                destWarehouseId = shifts[0].warehouseId;
+        }
+    }
+    finally {
+        conn.release();
+    }
+    if (!destWarehouseId) {
+        return res.status(400).json({ error: 'Could not determine destination warehouse from shift' });
+    }
+    // Format for createStockPermit — include posShiftId so the transfer
+    // appears in حركات الوردية الحالية and shift reporting.
+    req.body = {
+        date: (0, dateUtils_1.getEgyptianISOString)().split('T')[0],
+        type: 'STOCK_TRANSFER',
+        sourceWarehouseId,
+        destWarehouseId,
+        description: description || 'POS Transfer',
+        posShiftId: shiftId || null,
+        items
+    };
+    const { createStockPermit } = yield Promise.resolve().then(() => __importStar(require('./stockPermitController')));
+    return createStockPermit(req, res);
+});
+exports.requestStockTransfer = requestStockTransfer;

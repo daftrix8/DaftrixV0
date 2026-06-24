@@ -23,7 +23,7 @@ const eventBus_1 = require("../utils/eventBus");
 const getProductionOrders = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
-        const { status, startDate, endDate, productId, limit = 50, offset = 0, search } = req.query;
+        const { status, startDate, endDate, productId, limit = 50, offset = 0, search, showArchived } = req.query;
         // Build WHERE clause
         let whereClause = ' WHERE 1=1';
         const params = [];
@@ -53,6 +53,9 @@ const getProductionOrders = (req, res) => __awaiter(void 0, void 0, void 0, func
             const searchPattern = `%${search.trim()}%`;
             params.push(searchPattern, searchPattern);
         }
+        if (showArchived !== 'true') {
+            whereClause += ' AND (po.is_archived = 0 OR po.is_archived IS NULL)';
+        }
         // Get total count for pagination
         const countQuery = `
             SELECT COUNT(*) as total
@@ -63,15 +66,21 @@ const getProductionOrders = (req, res) => __awaiter(void 0, void 0, void 0, func
         const [countResult] = yield db_1.pool.query(countQuery, params);
         const total = ((_a = countResult[0]) === null || _a === void 0 ? void 0 : _a.total) || 0;
         // Get statistics (always for all orders, ignoring pagination)
-        const [statsResult] = yield db_1.pool.query(`
+        let statsQuery = `
             SELECT 
                 COUNT(*) as total,
                 SUM(CASE WHEN status IN ('PLANNED', 'CONFIRMED', 'WAITING_MATERIALS') THEN 1 ELSE 0 END) as pending,
                 SUM(CASE WHEN status = 'IN_PROGRESS' THEN 1 ELSE 0 END) as inProgress,
                 SUM(CASE WHEN status = 'COMPLETED' THEN 1 ELSE 0 END) as completed,
                 SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) as cancelled
-            FROM production_orders
-        `);
+            FROM production_orders po
+            WHERE 1=1
+        `;
+        const statsParams = [];
+        if (showArchived !== 'true') {
+            statsQuery += ' AND (po.is_archived = 0 OR po.is_archived IS NULL)';
+        }
+        const [statsResult] = yield db_1.pool.query(statsQuery, statsParams);
         const stats = statsResult[0] || { total: 0, pending: 0, inProgress: 0, completed: 0, cancelled: 0 };
         // Main query with pagination
         const query = `
@@ -105,6 +114,7 @@ const getProductionOrders = (req, res) => __awaiter(void 0, void 0, void 0, func
             qtyScrapped: parseFloat(row.qty_scrapped) || 0,
             status: row.status,
             priority: row.priority || 'MEDIUM',
+            isArchived: row.is_archived === 1,
             scheduledStartDate: row.scheduled_start_date || row.start_date,
             scheduledEndDate: row.scheduled_end_date || row.end_date,
             startDate: row.start_date,
@@ -326,7 +336,7 @@ exports.createProductionOrder = createProductionOrder;
 const updateProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { id } = req.params;
-        const { qtyPlanned, startDate, endDate, notes, warehouseId, destWarehouseId } = req.body;
+        const { qtyPlanned, startDate, endDate, notes, warehouseId, destWarehouseId, isArchived } = req.body;
         // Check if order exists and is PLANNED
         const [rows] = yield db_1.pool.query('SELECT status FROM production_orders WHERE id = ?', [id]);
         if (rows.length === 0) {
@@ -340,6 +350,7 @@ const updateProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             // Let's allow it.
         }
         const sanitizeDate = (d) => d ? String(d).split('T')[0] : null;
+        const isArchivedVal = isArchived !== undefined ? (isArchived ? 1 : 0) : null;
         yield db_1.pool.query(`
             UPDATE production_orders 
             SET qty_planned = COALESCE(?, qty_planned),
@@ -348,7 +359,8 @@ const updateProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
                 notes = COALESCE(?, notes),
                 warehouse_id = COALESCE(?, warehouse_id),
                 source_warehouse_id = COALESCE(?, source_warehouse_id),
-                dest_warehouse_id = COALESCE(?, dest_warehouse_id)
+                dest_warehouse_id = COALESCE(?, dest_warehouse_id),
+                is_archived = COALESCE(?, is_archived)
             WHERE id = ?
         `, [
             qtyPlanned,
@@ -358,6 +370,7 @@ const updateProductionOrder = (req, res) => __awaiter(void 0, void 0, void 0, fu
             warehouseId,
             warehouseId,
             destWarehouseId,
+            isArchivedVal,
             id
         ]);
         // Return updated order

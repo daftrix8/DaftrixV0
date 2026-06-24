@@ -7,8 +7,10 @@ const express_1 = __importDefault(require("express"));
 const backupController_1 = require("../controllers/backupController");
 const authMiddleware_1 = require("../middleware/authMiddleware");
 const router = express_1.default.Router();
-// Create new backup
+// Create new backup (async — returns backupId for polling)
 router.post('/create', (0, authMiddleware_1.requirePermission)('backup.manage'), backupController_1.createBackup);
+// Poll backup job status
+router.get('/status/:backupId', (0, authMiddleware_1.requirePermission)('backup.manage'), backupController_1.getBackupJobStatus);
 // List all backups
 router.get('/list', (0, authMiddleware_1.requirePermission)('backup.manage'), backupController_1.listBackups);
 // Download specific backup

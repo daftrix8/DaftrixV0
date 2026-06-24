@@ -23,6 +23,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 };
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.findRelatedDocuments = findRelatedDocuments;
+exports.releaseInvoiceReservations = releaseInvoiceReservations;
 exports.deleteInvoiceWithCascade = deleteInvoiceWithCascade;
 exports.previewCascadeDelete = previewCascadeDelete;
 const crypto_1 = require("crypto");
@@ -147,10 +148,10 @@ function archiveInvoice(conn, invoice, deletedBy) {
                 yield conn.query(`
                 INSERT INTO deleted_invoice_lines (
                     deletedInvoiceId, originalInvoiceId, productId, productName, 
-                    quantity, price, cost, discount, total
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity, price, cost, discount, total, hasWarranty, inBranchInstallation, warrantyMonths
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `, [archiveId, invoice.id, line.productId, line.productName,
-                    line.quantity, line.price, line.cost, line.discount, line.total]);
+                    line.quantity, line.price, line.cost, line.discount, line.total, line.hasWarranty || 0, line.inBranchInstallation || 0, line.warrantyMonths || 0]);
             }
         }
         catch (err) {
@@ -284,16 +285,45 @@ function updateAccountBalances(conn, journalIds) {
     });
 }
 /**
+/**
+ * Release stock reservations for an invoice
+ */
+function releaseInvoiceReservations(conn, invoiceId) {
+    return __awaiter(this, void 0, void 0, function* () {
+        try {
+            const [reservations] = yield conn.query(`SELECT productId, warehouseId, quantity FROM stock_reservations 
+             WHERE invoiceId = ? AND status = 'RESERVED'`, [invoiceId]);
+            if (reservations.length > 0) {
+                console.log(`📦 [Reservations] Releasing ${reservations.length} reservations for invoice ${invoiceId}`);
+                for (const res of reservations) {
+                    const qty = Number(res.quantity) || 0;
+                    if (qty > 0 && res.productId && res.warehouseId) {
+                        yield conn.query(`UPDATE product_stocks 
+                         SET reserved_stock = ROUND(GREATEST(0, reserved_stock - ?), 5) 
+                         WHERE productId = ? AND warehouseId = ?`, [qty, res.productId, res.warehouseId]);
+                    }
+                }
+                yield conn.query(`DELETE FROM stock_reservations WHERE invoiceId = ?`, [invoiceId]);
+            }
+        }
+        catch (err) {
+            console.warn(`⚠️ [Reservations] Error releasing reservations for invoice ${invoiceId}:`, err.message);
+        }
+    });
+}
+/**
  * Main cascade delete function
  *
  * Deletes an invoice and all its related documents in the correct order:
- * 1. Archive everything for audit trail
- * 2. Delete bank transactions
- * 3. Delete account transactions
- * 4. Delete journal lines, then journal entries
- * 5. Delete linked RECEIPT/PAYMENT invoices
- * 6. Reverse partner/bank balances
- * 7. Delete the main invoice and its lines
+ * 1. Release reservations
+ * 2. Invalidate cache
+ * 3. Archive everything for audit trail
+ * 4. Delete bank transactions
+ * 5. Delete account transactions
+ * 6. Delete journal lines, then journal entries
+ * 7. Delete linked RECEIPT/PAYMENT invoices
+ * 8. Reverse partner/bank balances
+ * 9. Delete the main invoice and its lines
  */
 function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
     return __awaiter(this, void 0, void 0, function* () {
@@ -318,6 +348,18 @@ function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
                 return result;
             }
             console.log(`🗑️ [CascadeDelete] Starting cascade delete for invoice ${invoiceId} (${invoice.type})`);
+            // 1b. Release reservations if any
+            yield releaseInvoiceReservations(conn, invoiceId);
+            // 1c. Invalidate cache dynamically
+            try {
+                const { invalidateInvoiceCache } = require('../controllers/invoiceController');
+                if (invalidateInvoiceCache) {
+                    invalidateInvoiceCache(invoiceId, invoice.number);
+                }
+            }
+            catch (e) {
+                // Ignore circular require issues during bootstrap
+            }
             // 2. Find all related documents
             const related = yield findRelatedDocuments(conn, invoiceId);
             console.log(`📋 Found: ${related.receipts.length} receipts, ${related.payments.length} payments, ${related.journals.length} journals`);
@@ -344,6 +386,13 @@ function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
                 }
                 catch (e) {
                     console.warn('⚠️ Could not delete account_transactions for doc:', e.message);
+                }
+                // Delete payment allocations for this linked document
+                try {
+                    yield conn.query('DELETE FROM payment_allocations WHERE paymentId = ? OR invoiceId = ?', [doc.id, doc.id]);
+                }
+                catch (e) {
+                    console.warn('⚠️ Could not delete payment_allocations for linked doc:', e.message);
                 }
                 // ✅ FIX: Delete journal entries for this linked document
                 // The journal entries are referenced by the receipt number (e.g., RCV-VAN-2026-00006)
@@ -401,6 +450,13 @@ function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
             }
             catch (e) {
                 console.warn('⚠️ Could not delete account_transactions for main invoice:', e.message);
+            }
+            // Delete payment allocations for main invoice
+            try {
+                yield conn.query('DELETE FROM payment_allocations WHERE paymentId = ? OR invoiceId = ?', [invoiceId, invoiceId]);
+            }
+            catch (e) {
+                console.warn('⚠️ Could not delete payment_allocations for main invoice:', e.message);
             }
             result.deletedTransactions = related.transactions.length;
             // 6. Collect journal IDs and delete journals
@@ -552,7 +608,7 @@ function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
             // c) Reverse the products.stock change
             try {
                 // Get invoice lines before deletion to know what to reverse
-                const [invoiceLines] = yield conn.query('SELECT productId, quantity, warehouseId, returnCondition FROM invoice_lines WHERE invoiceId = ?', [invoiceId]);
+                const [invoiceLines] = yield conn.query('SELECT productId, quantity, baseQuantity, warehouseId, returnCondition FROM invoice_lines WHERE invoiceId = ?', [invoiceId]);
                 // Determine the stock change direction based on invoice type
                 // We need to REVERSE what the invoice did:
                 // - INVOICE_PURCHASE added stock (+), so deletion should subtract (-)
@@ -580,7 +636,7 @@ function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
                             console.log(`   ⚠️ Skipping reversal for DAMAGED item: ${line.productId} (was هالك, no stock to reverse)`);
                             continue;
                         }
-                        const qty = Number(line.quantity) || 0;
+                        const qty = Number(line.baseQuantity !== null && line.baseQuantity !== undefined ? line.baseQuantity : line.quantity) || 0;
                         const reverseChange = qty * reverseMultiplier;
                         const warehouseId = line.warehouseId || invoice.warehouseId;
                         // a) Reverse products.stock (global stock)
@@ -614,9 +670,97 @@ function deleteInvoiceWithCascade(conn, invoiceId, deletedBy) {
                 console.warn(`⚠️ [CascadeDelete] Warning reversing stock: ${stockError.message}`);
                 // Continue with deletion - stock can be recalculated later
             }
+            // 10d. Delete linked POS expense and POS cash movement (if payment/receipt links to one)
+            if (invoice.referenceInvoiceId) {
+                try {
+                    // Find the linked POS expense
+                    const [expRows] = yield conn.query(`SELECT * FROM pos_expenses WHERE id = ?`, [invoice.referenceInvoiceId]);
+                    if (expRows.length > 0) {
+                        const expense = expRows[0];
+                        console.log(`🗑️ [CascadeDelete] Found linked POS expense ${expense.id} for invoice ${invoiceId}. Deleting...`);
+                        // Delete employee advance if exists (سلفة)
+                        if (expense.entityType === 'EMPLOYEE' && expense.entityId) {
+                            const dateStr = expense.createdAt instanceof Date
+                                ? expense.createdAt.toISOString().split('T')[0]
+                                : String(expense.createdAt).split('T')[0];
+                            const [advances] = yield conn.query(`SELECT id FROM employee_advances
+                             WHERE employeeId = ? AND amount = ? AND status = 'ACTIVE'
+                               AND (issueDate = ? OR ABS(DATEDIFF(issueDate, ?)) <= 1)`, [expense.entityId, expense.amount, dateStr, dateStr]);
+                            if (advances.length > 0) {
+                                const advanceIds = advances.map((a) => a.id);
+                                const ph = advanceIds.map(() => '?').join(',');
+                                yield conn.query(`DELETE FROM employee_advances WHERE id IN (${ph})`, advanceIds);
+                            }
+                        }
+                        // Delete linked journal entry from journal_entries
+                        const [journalRows] = yield conn.query(`SELECT id FROM journal_entries WHERE referenceId = ?`, [expense.id]);
+                        if (journalRows.length > 0) {
+                            const journalId = journalRows[0].id;
+                            yield updateAccountBalances(conn, [journalId]);
+                            yield conn.query('DELETE FROM journal_lines WHERE journalId = ?', [journalId]);
+                            yield conn.query('DELETE FROM journal_entries WHERE id = ?', [journalId]);
+                        }
+                        // Delete from pos_expenses
+                        yield conn.query(`DELETE FROM pos_expenses WHERE id = ?`, [expense.id]);
+                        // Recalculate shift totals so expectedCash and variance stay accurate
+                        const { recalculateShiftTotals } = require('../controllers/posController');
+                        yield recalculateShiftTotals(conn, expense.shiftId, deletedBy);
+                        // Delete linked cash movement from pos_cash_movements
+                        const [delResult] = yield conn.query(`DELETE FROM pos_cash_movements
+                         WHERE shiftId = ?
+                           AND type = 'EXPENSE'
+                           AND (referenceId = ? OR referenceId IS NULL)
+                           AND amount = ?
+                         ORDER BY createdAt DESC
+                         LIMIT 1`, [expense.shiftId, expense.id, expense.amount]);
+                        if (delResult.affectedRows === 0) {
+                            yield conn.query(`DELETE FROM pos_cash_movements
+                             WHERE shiftId = ? AND type = 'EXPENSE' AND amount = ?
+                             ORDER BY createdAt DESC LIMIT 1`, [expense.shiftId, expense.amount]);
+                        }
+                    }
+                }
+                catch (posExpenseErr) {
+                    console.warn(`⚠️ [CascadeDelete] Warning deleting linked POS expense: ${posExpenseErr.message}`);
+                }
+            }
+            // Resolve shiftId (from invoice, falling back to linked cash movements if invoice.posShiftId is missing/null)
+            let resolvedShiftId = invoice.posShiftId || null;
+            if (!resolvedShiftId) {
+                try {
+                    const [pcmRows] = yield conn.query('SELECT DISTINCT shiftId FROM pos_cash_movements WHERE referenceId = ? LIMIT 1', [invoiceId]);
+                    if (pcmRows && pcmRows.length > 0) {
+                        resolvedShiftId = pcmRows[0].shiftId;
+                    }
+                }
+                catch (pcmErr) {
+                    console.warn('⚠️ [CascadeDelete] Warning fetching shiftId from pos_cash_movements:', pcmErr.message);
+                }
+            }
+            // Delete POS cash movements if referenceId matches
+            try {
+                const [delMovements] = yield conn.query('DELETE FROM pos_cash_movements WHERE referenceId = ?', [invoiceId]);
+                const affected = delMovements.affectedRows || 0;
+                if (affected > 0) {
+                    console.log(`🗑️ [CascadeDelete] Deleted ${affected} pos_cash_movements for POS invoice ${invoiceId}`);
+                }
+            }
+            catch (posMoveErr) {
+                console.warn(`⚠️ [CascadeDelete] Warning deleting associated pos_cash_movements: ${posMoveErr.message}`);
+            }
             // 11. Delete the main invoice and its lines
             yield conn.query('DELETE FROM invoice_lines WHERE invoiceId = ?', [invoiceId]);
             yield conn.query('DELETE FROM invoices WHERE id = ?', [invoiceId]);
+            // Recalculate shift totals so expectedCash, variance, and totals/counts stay accurate
+            if (resolvedShiftId) {
+                try {
+                    const { recalculateShiftTotals } = require('../controllers/posController');
+                    yield recalculateShiftTotals(conn, resolvedShiftId, deletedBy);
+                }
+                catch (posShiftErr) {
+                    console.warn(`⚠️ [CascadeDelete] Warning recalculating shift totals for shift ${resolvedShiftId}: ${posShiftErr.message}`);
+                }
+            }
             // 12. Delete related customer visits (الزيارات)
             // Customer visits have invoiceId linking them to VAN sale invoices
             try {

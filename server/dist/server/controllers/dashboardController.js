@@ -137,11 +137,11 @@ const getDashboardStats = (req, res) => __awaiter(void 0, void 0, void 0, functi
             dailySalesFilter = `WHERE date >= DATE_SUB(?, INTERVAL 7 DAY) AND status IN ('POSTED', 'COMPLETED', 'PARTIAL')`;
             dailySalesParams = [today];
         }
-        // Recent invoices: fiscal-year-aware
-        let recentInvoicesFilter = '';
+        // Recent invoices: fiscal-year-aware, excluding employee/operational categories
+        let recentInvoicesFilter = "WHERE COALESCE(i.voucherCategory, '') NOT IN ('expenses', 'employee_advance', 'employee_repay', 'salary', 'labour')";
         let recentInvoicesParams = [];
         if (fyStart && fyEnd) {
-            recentInvoicesFilter = `WHERE i.date >= ? AND i.date <= ?`;
+            recentInvoicesFilter += ` AND i.date >= ? AND i.date <= ?`;
             recentInvoicesParams = [fyStart, fyEnd];
         }
         // Run ALL queries in parallel for maximum throughput (15+ users hitting dashboard)

@@ -46,7 +46,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getSyncHistory = exports.syncAllDevices = exports.syncDevice = exports.suggestMappings = exports.deleteMapping = exports.saveMappings = exports.getMappings = exports.getDeviceUserList = exports.testConnection = exports.deleteDevice = exports.updateDevice = exports.createDevice = exports.getDevices = void 0;
+exports.getOverview = exports.getSyncHistory = exports.syncAllDevices = exports.syncDevice = exports.suggestMappings = exports.deleteMapping = exports.saveMappings = exports.getMappings = exports.getDeviceUserList = exports.testConnection = exports.deleteDevice = exports.updateDevice = exports.createDevice = exports.getDevices = void 0;
 const errorHandler_1 = require("../utils/errorHandler");
 const fpService = __importStar(require("../services/fingerprintService"));
 const IP_V4_PATTERN = /^(\d{1,3}\.){3}\d{1,3}$/;
@@ -70,6 +70,9 @@ const createDevice = (req, res) => __awaiter(void 0, void 0, void 0, function* (
     }
     if (!IP_V4_PATTERN.test(ip)) {
         return res.status(400).json({ error: 'صيغة عنوان IP غير صحيحة' });
+    }
+    if (port !== undefined && (isNaN(Number(port)) || Number(port) < 1 || Number(port) > 65535)) {
+        return res.status(400).json({ error: 'رقم المنفذ يجب أن يكون بين 1 و 65535' });
     }
     try {
         const device = yield fpService.createDevice({ name, ip, port, model });
@@ -272,3 +275,13 @@ const getSyncHistory = (req, res) => __awaiter(void 0, void 0, void 0, function*
     }
 });
 exports.getSyncHistory = getSyncHistory;
+const getOverview = (_req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const overview = yield fpService.getOverviewStats();
+        res.json(overview);
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetch fingerprint overview');
+    }
+});
+exports.getOverview = getOverview;

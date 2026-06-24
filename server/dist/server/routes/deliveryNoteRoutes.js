@@ -1,0 +1,14 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const deliveryNoteController_1 = require("../controllers/deliveryNoteController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const router = (0, express_1.Router)();
+router.get('/', (0, authMiddleware_1.requirePermission)('operations.view'), deliveryNoteController_1.getDeliveryNotes);
+router.get('/:id', (0, authMiddleware_1.requirePermission)('operations.view'), deliveryNoteController_1.getDeliveryNote);
+router.post('/', (0, authMiddleware_1.requirePermission)('operations.manage'), deliveryNoteController_1.createDeliveryNote);
+router.post('/from-invoice/:invoiceId', (0, authMiddleware_1.requirePermission)('operations.manage'), deliveryNoteController_1.createFromInvoice);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('operations.manage'), deliveryNoteController_1.updateDeliveryNote);
+router.put('/:id/status', (0, authMiddleware_1.requirePermission)('operations.manage'), deliveryNoteController_1.updateDeliveryNoteStatus);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('operations.manage'), deliveryNoteController_1.deleteDeliveryNote);
+exports.default = router;

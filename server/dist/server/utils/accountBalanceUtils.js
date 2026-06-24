@@ -90,6 +90,30 @@ function updateAccountBalancesFromJournal(conn, accountIds) {
                 balanceUpdates.push({ id: account.id, code: account.code, name: account.name, oldBalance: currentBalance, newBalance });
             }
         }
+        // --- Overdraft Policy Check ---
+        try {
+            const [configRows] = yield conn.query('SELECT config FROM system_config LIMIT 1');
+            const configData = configRows[0];
+            let systemConfig = null;
+            if (configData && configData.config) {
+                systemConfig = typeof configData.config === 'string'
+                    ? JSON.parse(configData.config)
+                    : configData.config;
+            }
+            if (systemConfig && systemConfig.preventBankOverdraft) {
+                const { enforceOverdraftCheck } = require('./policyEnforcement');
+                const overdraftResult = yield enforceOverdraftCheck(accountIds, systemConfig, conn);
+                if (!overdraftResult.valid) {
+                    throw new Error(overdraftResult.error);
+                }
+            }
+        }
+        catch (cfgErr) {
+            if (cfgErr.message && cfgErr.message.includes('رصيد الحساب غير كافٍ')) {
+                throw cfgErr;
+            }
+            console.warn('⚠️ Account balance check skipped:', cfgErr.message);
+        }
         if (balanceUpdates.length === 0) {
             return { updatedCount: 0, changes: [] };
         }
@@ -110,6 +134,8 @@ function updateAccountBalancesFromJournal(conn, accountIds) {
                     // Single account — simple UPDATE is cleaner
                     const u = balanceUpdates[0];
                     yield conn.query('UPDATE accounts SET balance = ? WHERE id = ?', [u.newBalance, u.id]);
+                    // Code-level fallback: Propagate to banks table if linked
+                    yield conn.query('UPDATE banks SET balance = ? WHERE accountId = ?', [u.newBalance, u.id]);
                 }
                 else {
                     // Multiple accounts — batch CASE-based UPDATE
@@ -121,6 +147,15 @@ function updateAccountBalancesFromJournal(conn, accountIds) {
                     }
                     const idParams = balanceUpdates.map(u => u.id);
                     yield conn.query(`UPDATE accounts SET balance = CASE id ${caseLines} END WHERE id IN (${idPlaceholders})`, [...caseParams, ...idParams]);
+                    // Code-level fallback: Propagate to banks table if linked
+                    const bankCaseLines = balanceUpdates.map(u => `WHEN ? THEN ?`).join(' ');
+                    const bankIdPlaceholders = balanceUpdates.map(() => '?').join(',');
+                    const bankCaseParams = [];
+                    for (const u of balanceUpdates) {
+                        bankCaseParams.push(u.id, u.newBalance);
+                    }
+                    const bankIdParams = balanceUpdates.map(u => u.id);
+                    yield conn.query(`UPDATE banks SET balance = CASE accountId ${bankCaseLines} END WHERE accountId IN (${bankIdPlaceholders})`, [...bankCaseParams, ...bankIdParams]);
                 }
                 // Record changes and log
                 for (const u of balanceUpdates) {

@@ -9,7 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.checkAndActivateMembership = exports.updateMembershipSettings = exports.getMembershipSettings = exports.toggleMembershipSuspension = exports.unfreezeMembership = exports.freezeMembership = exports.getMembershipFreezes = exports.renewMembership = exports.deleteMembership = exports.updateMembership = exports.markMembershipPaid = exports.createMembership = exports.getMembershipById = exports.getMemberships = exports.deleteMembershipPackage = exports.updateMembershipPackage = exports.createMembershipPackage = exports.getMembershipPackages = void 0;
+exports.getPublicMembershipCard = exports.checkAndActivateMembership = exports.updateMembershipSettings = exports.getMembershipSettings = exports.toggleMembershipSuspension = exports.unfreezeMembership = exports.freezeMembership = exports.getMembershipFreezes = exports.renewMembership = exports.deleteMembership = exports.updateMembership = exports.markMembershipPaid = exports.createMembership = exports.getMembershipById = exports.getMemberships = exports.deleteMembershipPackage = exports.updateMembershipPackage = exports.createMembershipPackage = exports.getMembershipPackages = void 0;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -21,12 +21,13 @@ const freezes_1 = require("../services/membershipEngine/freezes");
 const billing_1 = require("../services/membershipEngine/billing");
 const lifecycle_1 = require("../services/membershipEngine/lifecycle");
 const membershipBenefitsSync_1 = require("../utils/membershipBenefitsSync");
+const branchFilter_1 = require("../utils/branchFilter");
 // --- PACKAGES ---
 const getMembershipPackages = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
         const conn = yield (0, db_1.getConnection)();
-        const [rows] = yield conn.query('SELECT id, name, description, price, durationDays, includedVisits, isActive, createdAt, updatedAt, icon FROM membership_packages ORDER BY name ASC');
+        const [rows] = yield conn.query('SELECT id, name, description, price, durationDays, includedVisits, isActive, createdAt, updatedAt, icon, commissionType, commissionValue FROM membership_packages ORDER BY name ASC');
         // Fetch all benefits — gracefully handle missing linkedMembershipId column
         let benefitRows = [];
         try {
@@ -166,20 +167,20 @@ exports.getMembershipPackages = getMembershipPackages;
 const createMembershipPackage = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
-        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon } = req.body;
+        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon, commissionType, commissionValue } = req.body;
         const userName = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
         const id = (0, crypto_1.randomUUID)();
         const finalDuration = durationDays || 0;
         const finalVisits = includedVisits !== undefined ? includedVisits : null;
         const finalIsActive = isActive !== undefined ? isActive : true;
         const conn = yield (0, db_1.getConnection)();
-        yield conn.query('INSERT INTO membership_packages (id, name, description, price, durationDays, includedVisits, isActive, icon) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', [id, name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null]);
+        yield conn.query('INSERT INTO membership_packages (id, name, description, price, durationDays, includedVisits, isActive, icon, commissionType, commissionValue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, commissionType || 'PERCENT', commissionValue || 0]);
         if (benefits && benefits.length > 0) {
             yield (0, membershipBenefitsSync_1.syncPackageBenefits)(conn, id, benefits, userName);
         }
         conn.release();
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'membership_packages', updatedBy: 'System' });
-        res.status(201).json({ id, name, description, price, durationDays: finalDuration, includedVisits: finalVisits, isActive: finalIsActive, benefits });
+        res.status(201).json({ id, name, description, price, durationDays: finalDuration, includedVisits: finalVisits, isActive: finalIsActive, benefits, commissionType, commissionValue });
     }
     catch (error) {
         return (0, errorHandler_1.handleControllerError)(res, error, 'creating membership package');
@@ -190,17 +191,17 @@ const updateMembershipPackage = (req, res) => __awaiter(void 0, void 0, void 0, 
     var _a;
     try {
         const { id } = req.params;
-        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon } = req.body;
+        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon, commissionType, commissionValue } = req.body;
         const userName = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
         const finalDuration = durationDays || 0;
         const finalVisits = includedVisits !== undefined ? includedVisits : null;
         const finalIsActive = isActive !== undefined ? isActive : true;
         const conn = yield (0, db_1.getConnection)();
-        yield conn.query('UPDATE membership_packages SET name = ?, description = ?, price = ?, durationDays = ?, includedVisits = ?, isActive = ?, icon = ? WHERE id = ?', [name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, id]);
+        yield conn.query('UPDATE membership_packages SET name = ?, description = ?, price = ?, durationDays = ?, includedVisits = ?, isActive = ?, icon = ?, commissionType = ?, commissionValue = ? WHERE id = ?', [name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, commissionType || 'PERCENT', commissionValue || 0, id]);
         yield (0, membershipBenefitsSync_1.syncPackageBenefits)(conn, id, benefits || [], userName);
         conn.release();
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'membership_packages', updatedBy: 'System' });
-        res.json({ id, name, description, price, durationDays: finalDuration, includedVisits: finalVisits, isActive: finalIsActive, benefits, icon });
+        res.json({ id, name, description, price, durationDays: finalDuration, includedVisits: finalVisits, isActive: finalIsActive, benefits, icon, commissionType, commissionValue });
     }
     catch (error) {
         return (0, errorHandler_1.handleControllerError)(res, error, 'updating membership package');
@@ -240,10 +241,11 @@ const getMemberships = (req, res) => __awaiter(void 0, void 0, void 0, function*
         const { search, status, customerId, page = 1, limit = 25 } = req.query;
         const offset = (Number(page) - 1) * Number(limit);
         let query = `
-            SELECT m.*, p.name as customerName, pk.name as packageName, pk.durationDays, pk.price 
+            SELECT m.*, p.name as customerName, p.phone as customerPhone, pk.name as packageName, pk.durationDays, pk.price, s.name as salesmanName
             FROM memberships m
             LEFT JOIN partners p ON m.customerId = p.id
             LEFT JOIN membership_packages pk ON m.packageId = pk.id
+            LEFT JOIN salesmen s ON m.salesmanId = s.id
             WHERE 1=1
         `;
         const queryParams = [];
@@ -351,10 +353,11 @@ const getMembershipById = (req, res) => __awaiter(void 0, void 0, void 0, functi
         }
         const conn = yield (0, db_1.getConnection)();
         const [rows] = yield conn.query(`
-            SELECT m.*, p.name as customerName, pk.name as packageName, pk.durationDays, pk.price 
+            SELECT m.*, p.name as customerName, pk.name as packageName, pk.durationDays, pk.price, s.name as salesmanName
             FROM memberships m
             LEFT JOIN partners p ON m.customerId = p.id
             LEFT JOIN membership_packages pk ON m.packageId = pk.id
+            LEFT JOIN salesmen s ON m.salesmanId = s.id
             WHERE m.id = ?
         `, [id]);
         if (rows.length === 0) {
@@ -377,7 +380,7 @@ const getMembershipById = (req, res) => __awaiter(void 0, void 0, void 0, functi
 exports.getMembershipById = getMembershipById;
 const createMembership = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const { customerId, packageId, description, joinDate, isPaid, treasuryAccountId } = req.body;
+        const { customerId, packageId, description, joinDate, isPaid, treasuryAccountId, salesmanId } = req.body;
         const id = (0, crypto_1.randomUUID)();
         const conn = yield (0, db_1.getConnection)();
         yield conn.beginTransaction();
@@ -388,15 +391,32 @@ const createMembership = (req, res) => __awaiter(void 0, void 0, void 0, functio
             const pkg = packages[0];
             const endDate = dateEngine_1.DateEngine.addDays(joinDate, pkg.durationDays).format('YYYY-MM-DD');
             const initialStatus = isPaid ? types_1.MembershipStatus.ACTIVE : types_1.MembershipStatus.PENDING_PAYMENT;
+            // Calculate commission amount at the time of creation
+            let commissionAmount = 0.00;
+            if (salesmanId) {
+                const [salesmen] = yield conn.query('SELECT commissionRate FROM salesmen WHERE id = ?', [salesmanId]);
+                const salesmanRate = salesmen.length > 0 ? (salesmen[0].commissionRate || 0) : 0;
+                const val = pkg.commissionValue || 0;
+                if (pkg.commissionType === 'FIXED') {
+                    commissionAmount = val;
+                }
+                else {
+                    const pct = val > 0 ? val : salesmanRate;
+                    commissionAmount = pkg.price * (pct / 100);
+                }
+                commissionAmount = Math.round(commissionAmount * 100) / 100;
+            }
             yield conn.query(`
-                INSERT INTO memberships (id, customerId, packageId, description, joinDate, endDate, status, includedVisits, remainingVisits)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [id, customerId, packageId, description || null, joinDate, endDate, initialStatus, pkg.includedVisits, pkg.includedVisits]);
+                INSERT INTO memberships (id, customerId, packageId, description, joinDate, endDate, status, includedVisits, remainingVisits, salesmanId, commissionAmount)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [id, customerId, packageId, description || null, joinDate, endDate, initialStatus, pkg.includedVisits, pkg.includedVisits, salesmanId || null, commissionAmount]);
             // Get customer name for invoice
             const [customers] = yield conn.query('SELECT name FROM partners WHERE id = ?', [customerId]);
             const customerName = customers.length > 0 ? customers[0].name : 'Unknown';
+            // Resolve branchId
+            const branchId = (0, branchFilter_1.resolveBranchIdForWrite)(req, req.body.branchId);
             // Generate invoice to hit the statement, and auto-generate receipt if paid
-            yield billing_1.MembershipBilling.generateInvoice(id, customerId, customerName, packageId, req.body.createdBy || 'System', conn, isPaid, treasuryAccountId);
+            yield billing_1.MembershipBilling.generateInvoice(id, customerId, customerName, packageId, req.body.createdBy || 'System', conn, isPaid, treasuryAccountId, salesmanId, branchId);
             yield lifecycle_1.MembershipLifecycle.addLog(id, 'Created', `Membership created with status ${initialStatus}`, req.body.createdBy || 'System', null, conn);
             yield conn.commit();
             conn.release();
@@ -442,23 +462,47 @@ const updateMembership = (req, res) => __awaiter(void 0, void 0, void 0, functio
 });
 exports.updateMembership = updateMembership;
 const deleteMembership = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
     try {
         const { id } = req.params;
         const conn = yield (0, db_1.getConnection)();
-        const [memberships] = yield conn.query('SELECT invoiceId FROM memberships WHERE id = ?', [id]);
-        if (memberships.length > 0 && memberships[0].invoiceId) {
-            const [invoices] = yield conn.query('SELECT status FROM invoices WHERE id = ?', [memberships[0].invoiceId]);
-            if (invoices.length > 0 && invoices[0].status === types_1.InvoiceStatus.PAID) {
-                conn.release();
-                return res.status(400).json({ message: 'لا يمكن حذف اشتراك الفاتورة الخاصة به مدفوعة.' });
+        yield conn.beginTransaction();
+        try {
+            const [memberships] = yield conn.query('SELECT invoiceId FROM memberships WHERE id = ?', [id]);
+            if (memberships.length > 0) {
+                const invoiceId = memberships[0].invoiceId;
+                if (invoiceId) {
+                    const [invoices] = yield conn.query('SELECT status FROM invoices WHERE id = ?', [invoiceId]);
+                    if (invoices.length > 0 && invoices[0].status === types_1.InvoiceStatus.PAID) {
+                        yield conn.rollback();
+                        conn.release();
+                        return res.status(400).json({ message: 'لا يمكن حذف اشتراك الفاتورة الخاصة به مدفوعة.' });
+                    }
+                    // Nullify invoiceId reference first to break the FK constraint
+                    yield conn.query('UPDATE memberships SET invoiceId = NULL WHERE id = ?', [id]);
+                    // Cascade delete invoice using our robust cascade helper
+                    const { deleteInvoiceWithCascade } = require('../utils/invoiceCascadeDelete');
+                    const deletedBy = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
+                    const cascadeResult = yield deleteInvoiceWithCascade(conn, invoiceId, deletedBy);
+                    if (!cascadeResult.success) {
+                        throw new Error(cascadeResult.error || 'Failed to cascade delete invoice');
+                    }
+                }
             }
-            // Delete invoice
-            yield conn.query('DELETE FROM invoices WHERE id = ?', [memberships[0].invoiceId]);
+            // Delete freeze periods and audit logs first to prevent FK violations
+            yield conn.query('DELETE FROM membership_freeze_periods WHERE membershipId = ?', [id]);
+            yield conn.query('DELETE FROM membership_audit_logs WHERE membershipId = ?', [id]);
+            yield conn.query('DELETE FROM memberships WHERE id = ?', [id]);
+            yield conn.commit();
+            conn.release();
+            eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'memberships', entityId: id, deletedBy: 'System' });
+            res.json({ message: 'تم الحذف بنجاح' });
         }
-        yield conn.query('DELETE FROM memberships WHERE id = ?', [id]);
-        conn.release();
-        eventBus_1.eventBus.broadcast('entity:deleted', { entityType: 'memberships', entityId: id, deletedBy: 'System' });
-        res.json({ message: 'تم الحذف بنجاح' });
+        catch (err) {
+            yield conn.rollback();
+            conn.release();
+            throw err;
+        }
     }
     catch (error) {
         return (0, errorHandler_1.handleControllerError)(res, error, 'deleting membership');
@@ -468,9 +512,10 @@ exports.deleteMembership = deleteMembership;
 const renewMembership = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { id } = req.params;
-        const { packageId, joinDate } = req.body;
+        const { packageId, joinDate, salesmanId } = req.body;
         const userId = req.body.createdBy || 'System';
-        const result = yield renewals_1.MembershipRenewals.renewMembership(id, packageId, joinDate, userId);
+        const branchId = (0, branchFilter_1.resolveBranchIdForWrite)(req, req.body.branchId);
+        const result = yield renewals_1.MembershipRenewals.renewMembership(id, packageId, joinDate, userId, undefined, salesmanId, branchId);
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'memberships', updatedBy: userId });
         res.json(Object.assign({ message: 'تم التجديد بنجاح، يرجى سداد الفاتورة للتفعيل' }, result));
     }
@@ -593,3 +638,210 @@ const checkAndActivateMembership = (invoiceId, conn) => __awaiter(void 0, void 0
     }
 });
 exports.checkAndActivateMembership = checkAndActivateMembership;
+// --- PUBLIC MEMBERSHIP CARD (VIRTUAL CARD) ---
+const getPublicMembershipCard = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    try {
+        const { id } = req.params;
+        const conn = yield (0, db_1.getConnection)();
+        let membership = null;
+        if (id.startsWith('regular-membership-')) {
+            const customerId = id.replace('regular-membership-', '');
+            const [customerRows] = yield conn.query('SELECT name, phone, email FROM partners WHERE id = ?', [customerId]);
+            if (customerRows.length > 0) {
+                membership = {
+                    id,
+                    customerId,
+                    customerName: customerRows[0].name,
+                    customerPhone: customerRows[0].phone,
+                    customerEmail: customerRows[0].email,
+                    packageId: 'regular-package',
+                    packageName: 'عضوية عادية',
+                    description: 'عضوية عادية افتراضية للعميل',
+                    status: 'ACTIVE',
+                    joinDate: new Date().toISOString().split('T')[0],
+                    endDate: null,
+                    remainingVisits: null,
+                    includedVisits: null,
+                    durationDays: null,
+                    packagePrice: 0,
+                    packageIcon: 'Star'
+                };
+            }
+        }
+        else {
+            const [rows] = yield conn.query(`
+                SELECT m.id, m.customerId, m.packageId, m.description, m.joinDate, m.endDate, m.status, 
+                       m.includedVisits, m.remainingVisits, m.createdAt, m.updatedAt,
+                       p.name as customerName, p.phone as customerPhone, p.email as customerEmail,
+                       pk.name as packageName, pk.durationDays, pk.price as packagePrice, pk.icon as packageIcon
+                FROM memberships m
+                LEFT JOIN partners p ON m.customerId = p.id
+                LEFT JOIN membership_packages pk ON m.packageId = pk.id
+                WHERE m.id = ?
+            `, [id]);
+            if (rows.length > 0) {
+                membership = rows[0];
+                if (membership.status)
+                    membership.status = membership.status.toUpperCase();
+            }
+        }
+        if (!membership) {
+            conn.release();
+            return res.status(404).json({ message: 'الاشتراك غير موجود' });
+        }
+        // Fetch package benefits
+        let benefits = [];
+        try {
+            const [benefitRows] = yield conn.query(`SELECT p.id, p.name as description, p.type as promoType, p.discountValue, p.discountType,
+                 p.status as promoStatus, p.maxDiscountAmount,
+                 r.ruleType, r.targetValue 
+                 FROM promotions p 
+                 LEFT JOIN promo_rules r ON p.id = r.promotionId 
+                 WHERE p.linkedMembershipId = ? AND p.status = 'ACTIVE'`, [membership.packageId]);
+            const benefitsMap = new Map();
+            for (const b of benefitRows) {
+                if (!benefitsMap.has(b.id)) {
+                    let type = 'خصم نسبة';
+                    if (b.discountType === 'FIXED')
+                        type = 'خصم مبلغ ثابت';
+                    if (b.discountType === 'FREE_PRODUCT')
+                        type = 'منتج مجاني';
+                    benefitsMap.set(b.id, {
+                        id: b.id,
+                        description: b.description,
+                        type,
+                        value: b.discountValue,
+                        maxDiscount: b.maxDiscountAmount ? parseFloat(b.maxDiscountAmount) : 0
+                    });
+                }
+            }
+            benefits = Array.from(benefitsMap.values());
+        }
+        catch (e) {
+            console.error('Failed to fetch benefits for public card:', e);
+        }
+        // Fetch system config for branding
+        const [configRows] = yield conn.query('SELECT companyName, companyAddress, companyPhone, companyEmail, logo, config FROM system_config LIMIT 1');
+        let systemConfig = {};
+        if (configRows.length > 0) {
+            const row = configRows[0];
+            let additionalConfig = {};
+            if (row.config) {
+                try {
+                    additionalConfig = typeof row.config === 'string' ? JSON.parse(row.config) : row.config;
+                }
+                catch (e) { }
+            }
+            systemConfig = {
+                companyName: row.companyName,
+                companyAddress: row.companyAddress,
+                companyPhone: row.companyPhone,
+                companyEmail: row.companyEmail,
+                logo: row.logo,
+                themeColor: additionalConfig.themeColor || 'teal'
+            };
+        }
+        // Fetch loyalty details
+        let loyalty = null;
+        let loyaltySettings = null;
+        let tierInfo = null;
+        let referralCode = '';
+        try {
+            // 1. Fetch loyalty settings
+            const [settingsRows] = yield conn.query(`SELECT * FROM loyalty_settings LIMIT 1`);
+            const defaultSettings = {
+                balanceType: 'loyalty_points',
+                minimumRedemptionPoints: 100,
+                conversionRate: 1.00,
+                allowDecimals: false,
+                tier_silver_min_spend: 2000.00,
+                tier_gold_min_spend: 5000.00,
+                tier_platinum_min_spend: 10000.00,
+                tier_silver_multiplier: 1.20,
+                tier_gold_multiplier: 1.50,
+                tier_platinum_multiplier: 2.00
+            };
+            loyaltySettings = settingsRows.length > 0 ? Object.assign(Object.assign({}, defaultSettings), settingsRows[0]) : defaultSettings;
+            // 2. Fetch customer loyalty transaction summary
+            const [loyaltyRows] = yield conn.query(`SELECT
+                    COALESCE(SUM(CASE WHEN type = 'EARN' THEN points ELSE 0 END), 0) AS totalEarned,
+                    COALESCE(SUM(CASE WHEN type = 'REDEEM' THEN ABS(points) ELSE 0 END), 0) AS totalRedeemed,
+                    COALESCE(SUM(CASE WHEN type = 'REFUND_CLAWBACK' THEN ABS(points) ELSE 0 END), 0) AS totalClawback,
+                    COALESCE(SUM(CASE WHEN type = 'ADJUST' THEN points ELSE 0 END), 0) AS totalAdjusted,
+                    COALESCE(SUM(CASE WHEN type = 'EXPIRE' THEN ABS(points) ELSE 0 END), 0) AS totalExpired
+                 FROM loyalty_transactions
+                 WHERE customerId = ?`, [membership.customerId]);
+            const row = loyaltyRows[0] || {};
+            const totalEarned = Number(row.totalEarned) || 0;
+            const totalRedeemed = Number(row.totalRedeemed) || 0;
+            const totalClawback = Number(row.totalClawback) || 0;
+            const totalAdjusted = Number(row.totalAdjusted) || 0;
+            const totalExpired = Number(row.totalExpired) || 0;
+            const currentBalance = totalEarned - totalRedeemed - totalClawback + totalAdjusted - totalExpired;
+            loyalty = {
+                currentBalance,
+                totalEarned,
+                totalRedeemed,
+                totalClawback,
+                totalAdjusted,
+                totalExpired
+            };
+            // 3. Fetch rolling 12-month spend for tier
+            const [spendRows] = yield conn.query(`SELECT COALESCE(SUM(total), 0) AS totalSpend 
+                 FROM invoices 
+                 WHERE partnerId = ? 
+                   AND type = 'INVOICE_SALE' 
+                   AND status != 'VOID'
+                   AND date >= DATE_SUB(NOW(), INTERVAL 12 MONTH)`, [membership.customerId]);
+            const totalSpend = Number((_a = spendRows[0]) === null || _a === void 0 ? void 0 : _a.totalSpend) || 0;
+            const silverSpend = Number(loyaltySettings.tier_silver_min_spend) || 2000.00;
+            const goldSpend = Number(loyaltySettings.tier_gold_min_spend) || 5000.00;
+            const platSpend = Number(loyaltySettings.tier_platinum_min_spend) || 10000.00;
+            const silverMult = Number(loyaltySettings.tier_silver_multiplier) || 1.20;
+            const goldMult = Number(loyaltySettings.tier_gold_multiplier) || 1.50;
+            const platMult = Number(loyaltySettings.tier_platinum_multiplier) || 2.00;
+            let tier = 'BRONZE';
+            let multiplier = 1.0;
+            let nextTierSpend = silverSpend;
+            if (totalSpend >= platSpend) {
+                tier = 'PLATINUM';
+                multiplier = platMult;
+                nextTierSpend = 0;
+            }
+            else if (totalSpend >= goldSpend) {
+                tier = 'GOLD';
+                multiplier = goldMult;
+                nextTierSpend = platSpend;
+            }
+            else if (totalSpend >= silverSpend) {
+                tier = 'SILVER';
+                multiplier = silverMult;
+                nextTierSpend = goldSpend;
+            }
+            else {
+                tier = 'BRONZE';
+                multiplier = 1.0;
+                nextTierSpend = silverSpend;
+            }
+            tierInfo = {
+                tier,
+                multiplier,
+                totalSpend,
+                nextTierSpend
+            };
+            // 4. Fetch customer referral code
+            const [custRows] = yield conn.query('SELECT referral_code FROM partners WHERE id = ?', [membership.customerId]);
+            referralCode = ((_b = custRows[0]) === null || _b === void 0 ? void 0 : _b.referral_code) || '';
+        }
+        catch (loyaltyErr) {
+            console.error('Failed to fetch loyalty details for public card:', loyaltyErr);
+        }
+        conn.release();
+        res.json({ membership, benefits, systemConfig, loyalty, loyaltySettings, tierInfo, referralCode });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'fetching public membership card');
+    }
+});
+exports.getPublicMembershipCard = getPublicMembershipCard;

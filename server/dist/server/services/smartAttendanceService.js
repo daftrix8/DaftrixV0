@@ -23,6 +23,8 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.generateBranchQrToken = generateBranchQrToken;
+exports.verifyBranchQrToken = verifyBranchQrToken;
 exports.getLocations = getLocations;
 exports.getAllLocations = getAllLocations;
 exports.getLocationById = getLocationById;
@@ -33,13 +35,21 @@ exports.calculateConfidence = calculateConfidence;
 exports.recordPunch = recordPunch;
 exports.getTodayStatus = getTodayStatus;
 exports.getPendingReviews = getPendingReviews;
+exports.getAuditLogs = getAuditLogs;
 exports.reviewPunch = reviewPunch;
 exports.getSmartAttendanceStats = getSmartAttendanceStats;
 exports.haversineDistance = haversineDistance;
 exports.generateDeviceFingerprint = generateDeviceFingerprint;
+exports.resetDeviceBinding = resetDeviceBinding;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const crypto_2 = __importDefault(require("crypto"));
+const fs_1 = __importDefault(require("fs"));
+const path_1 = __importDefault(require("path"));
+const attendanceHelper_1 = require("./attendanceHelper");
+// ── Selfie storage directory ───────────────────────────────────────────
+const SELFIE_UPLOAD_DIR = path_1.default.join(process.cwd(), 'uploads', 'attendance-selfies');
+const MAX_SELFIE_SIZE_BYTES = 2 * 1024 * 1024; // 2MB after base64 decode
 // ── Constants ──────────────────────────────────────────────────────────
 const SIGNAL_WEIGHTS = {
     GPS: 50,
@@ -58,6 +68,35 @@ const PUNCH_COOLDOWN_SECONDS = 300; // 5 minutes between same-type punches
 const MAX_REJECTED_PER_DAY = 3; // lock out after 3 rejections
 const MAX_VELOCITY_KMH = 200; // teleportation detection threshold
 const PERFECT_ACCURACY_THRESHOLD = 1; // GPS accuracy ≤1m is suspiciously perfect (mock GPS)
+// ── Dynamic QR Code Cryptography ──────────────────────────────────────
+const QR_SECRET = process.env.JWT_SECRET || 'smart-attendance-qr-secret-key-123';
+const usedQrTokens = new Set();
+function generateBranchQrToken(branchId) {
+    const payload = JSON.stringify({ branchId, timestamp: Date.now() });
+    const iv = crypto_2.default.randomBytes(16);
+    const key = crypto_2.default.scryptSync(QR_SECRET, 'salt', 32);
+    const cipher = crypto_2.default.createCipheriv('aes-256-cbc', key, iv);
+    let encrypted = cipher.update(payload, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return `${iv.toString('hex')}:${encrypted}`;
+}
+function verifyBranchQrToken(qrToken) {
+    try {
+        const [ivHex, encrypted] = qrToken.split(':');
+        if (!ivHex || !encrypted) {
+            throw new Error('رمز QR تالف أو غير صالح');
+        }
+        const iv = Buffer.from(ivHex, 'hex');
+        const key = crypto_2.default.scryptSync(QR_SECRET, 'salt', 32);
+        const decipher = crypto_2.default.createDecipheriv('aes-256-cbc', key, iv);
+        let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return JSON.parse(decrypted);
+    }
+    catch (e) {
+        throw new Error(`رمز QR غير صالح: ${e.message}`);
+    }
+}
 // ── Geofence CRUD ──────────────────────────────────────────────────────
 function getLocations() {
     return __awaiter(this, void 0, void 0, function* () {
@@ -80,8 +119,8 @@ function getLocationById(id) {
 function createLocation(data) {
     return __awaiter(this, void 0, void 0, function* () {
         const id = (0, crypto_1.randomUUID)();
-        yield db_1.pool.query(`INSERT INTO attendance_locations (id, name, latitude, longitude, radiusMeters, branchId)
-         VALUES (?, ?, ?, ?, ?, ?)`, [id, data.name, data.latitude, data.longitude, data.radiusMeters || 200, data.branchId || null]);
+        yield db_1.pool.query(`INSERT INTO attendance_locations (id, name, latitude, longitude, radiusMeters, branchId, wifiSsid, allowedIp)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [id, data.name, data.latitude, data.longitude, data.radiusMeters || 200, data.branchId || null, data.wifiSsid || null, data.allowedIp || null]);
         return (yield getLocationById(id));
     });
 }
@@ -89,7 +128,7 @@ function updateLocation(id, data) {
     return __awaiter(this, void 0, void 0, function* () {
         const fields = [];
         const values = [];
-        const allowed = ['name', 'latitude', 'longitude', 'radiusMeters', 'branchId', 'isActive'];
+        const allowed = ['name', 'latitude', 'longitude', 'radiusMeters', 'branchId', 'isActive', 'wifiSsid', 'allowedIp'];
         for (const field of allowed) {
             if (data[field] !== undefined) {
                 fields.push(`${field} = ?`);
@@ -112,16 +151,19 @@ function deleteLocation(id) {
  * Enforce cooldown, daily rejection cap, and velocity checks.
  * Throws descriptive error if any check fails.
  */
-function validatePunchEligibility(employeeId, punchType, gpsLatitude, gpsLongitude) {
+function validatePunchEligibility(employeeId, punchType, punchTime, gpsLatitude, gpsLongitude, isMockGps, deviceId) {
     return __awaiter(this, void 0, void 0, function* () {
-        const today = getLocalDateString(new Date());
+        if (isMockGps) {
+            throw new Error('تم رصد محاولة تزييف الموقع الجغرافي (Mock Location). تم إلغاء تسجيل الحضور.');
+        }
+        const today = (0, attendanceHelper_1.getLocalDateString)(punchTime);
         // 1. Cooldown — no same-type punch within PUNCH_COOLDOWN_SECONDS
         const [recentRows] = yield db_1.pool.query(`SELECT punchTime FROM smart_attendance_punches
          WHERE employeeId = ? AND punchType = ? AND DATE(punchTime) = ?
          ORDER BY punchTime DESC LIMIT 1`, [employeeId, punchType, today]);
         if (recentRows.length > 0) {
             const lastPunch = new Date(recentRows[0].punchTime);
-            const elapsedSeconds = (Date.now() - lastPunch.getTime()) / 1000;
+            const elapsedSeconds = (punchTime.getTime() - lastPunch.getTime()) / 1000;
             if (elapsedSeconds < PUNCH_COOLDOWN_SECONDS) {
                 const remaining = Math.ceil(PUNCH_COOLDOWN_SECONDS - elapsedSeconds);
                 throw new Error(`يجب الانتظار ${remaining} ثانية قبل التسجيل مرة أخرى`);
@@ -143,7 +185,7 @@ function validatePunchEligibility(employeeId, punchType, gpsLatitude, gpsLongitu
             if (lastGps.length > 0) {
                 const prev = lastGps[0];
                 const distanceMeters = haversineDistance(gpsLatitude, gpsLongitude, Number(prev.gpsLatitude), Number(prev.gpsLongitude));
-                const elapsedHours = (Date.now() - new Date(prev.punchTime).getTime()) / 3600000;
+                const elapsedHours = (punchTime.getTime() - new Date(prev.punchTime).getTime()) / 3600000;
                 if (elapsedHours > 0) {
                     const velocityKmh = (distanceMeters / 1000) / elapsedHours;
                     if (velocityKmh > MAX_VELOCITY_KMH) {
@@ -152,17 +194,112 @@ function validatePunchEligibility(employeeId, punchType, gpsLatitude, gpsLongitu
                 }
             }
         }
+        // 4. Device Binding & Locking Prevention
+        if (!deviceId) {
+            throw new Error('مُعرّف الجهاز غير متوفر. يرجى تفعيل أذونات التخزين والموقع للتطبيق.');
+        }
+        // A. Check if this device is already bound to another active employee (Multi-account prevention)
+        const [boundToOther] = yield db_1.pool.query('SELECT fullName FROM employees WHERE boundDeviceId = ? AND id != ? AND status = "ACTIVE"', [deviceId, employeeId]);
+        if (boundToOther.length > 0) {
+            throw new Error(`هذا الهاتف مسجل ومربوط باسم الموظف (${boundToOther[0].fullName}). لا يمكن استخدام نفس الهاتف لتسجيل الحضور لأكثر من موظف.`);
+        }
+        // B. Check if employee already has a bound device
+        const [empRows] = yield db_1.pool.query('SELECT boundDeviceId FROM employees WHERE id = ?', [employeeId]);
+        if (empRows.length > 0) {
+            const boundId = empRows[0].boundDeviceId;
+            if (!boundId) {
+                // First time punching — bind device to this employee
+                yield db_1.pool.query('UPDATE employees SET boundDeviceId = ? WHERE id = ?', [deviceId, employeeId]);
+                console.log(`📱 [DeviceLock] Bound device "${deviceId}" to employee "${employeeId}"`);
+            }
+            else if (boundId !== deviceId) {
+                throw new Error('هذا الحساب مربوط بهاتف ذكي آخر. لا يمكنك تسجيل البصمة إلا من هاتفك الشخصي المعتمد.');
+            }
+        }
     });
 }
 // ── Confidence Scoring ─────────────────────────────────────────────────
 function calculateConfidence(req) {
     return __awaiter(this, void 0, void 0, function* () {
+        var _a;
         const signals = [];
         let matchedLocationId = null;
         let gpsDistanceMeters = null;
         // ── Signal 1: GPS Geofence ────────────────────────────────────────
         const locations = yield getLocations();
-        if (req.gpsLatitude != null && req.gpsLongitude != null && locations.length > 0) {
+        // Branch Restrictions logic: If user has a branch and not allowed everywhere, filter locations
+        const [empRows] = yield db_1.pool.query('SELECT branchId, allowAllLocations FROM employees WHERE id = ?', [req.employeeId]);
+        let allowedLocations = locations;
+        let isRestrictedBranch = false;
+        let employeeBranchName = '';
+        let empBranchId = null;
+        if (empRows.length > 0) {
+            const emp = empRows[0];
+            empBranchId = emp.branchId;
+            if (!emp.allowAllLocations && emp.branchId) {
+                allowedLocations = locations.filter(l => l.branchId === emp.branchId);
+                isRestrictedBranch = true;
+                const [branchRows] = yield db_1.pool.query('SELECT name FROM branches WHERE id = ?', [emp.branchId]);
+                if (branchRows.length > 0) {
+                    employeeBranchName = branchRows[0].name;
+                }
+            }
+        }
+        let qrScanned = false;
+        let qrBranchId = null;
+        if (req.qrToken) {
+            try {
+                // 1. Single-use token prevention (anti-replay check)
+                if (usedQrTokens.has(req.qrToken)) {
+                    throw new Error('تم مسح رمز الـ QR هذا واستخدامه بالفعل من قبل.');
+                }
+                // 2. Decrypt and check age limit
+                const qrData = verifyBranchQrToken(req.qrToken);
+                const ageMs = Date.now() - qrData.timestamp;
+                if (ageMs < 0 || ageMs > 15000) {
+                    throw new Error('انتهت صلاحية رمز QR. يرجى إعادة المحاولة من شاشة الفرع.');
+                }
+                qrScanned = true;
+                qrBranchId = qrData.branchId;
+                // 3. Enforce branch restriction if applicable
+                if (isRestrictedBranch && qrBranchId !== empBranchId) {
+                    throw new Error(`غير مسموح لك بتسجيل البصمة في هذا الفرع. فرعك المعتمد هو: ${employeeBranchName}`);
+                }
+                const matchedLocation = locations.find(l => l.branchId === qrBranchId);
+                if (matchedLocation) {
+                    matchedLocationId = matchedLocation.id;
+                    // 4. Hybrid geofence validation: if phone GPS is provided, assert proximity (max 1000m)
+                    if (req.gpsLatitude != null && req.gpsLongitude != null) {
+                        const distance = haversineDistance(req.gpsLatitude, req.gpsLongitude, Number(matchedLocation.latitude), Number(matchedLocation.longitude));
+                        gpsDistanceMeters = Math.round(distance);
+                        const MAX_HYBRID_DISTANCE_METERS = 1000;
+                        if (distance > MAX_HYBRID_DISTANCE_METERS) {
+                            throw new Error(`أنت بعيد جداً عن موقع الفرع الجغرافي (${gpsDistanceMeters} متر). لا يمكنك تسجيل الحضور عن بعد.`);
+                        }
+                    }
+                }
+                gpsDistanceMeters = gpsDistanceMeters !== null && gpsDistanceMeters !== void 0 ? gpsDistanceMeters : 0;
+                const [branchRows] = yield db_1.pool.query('SELECT name FROM branches WHERE id = ?', [qrBranchId]);
+                const branchName = ((_a = branchRows[0]) === null || _a === void 0 ? void 0 : _a.name) || 'الفرع';
+                // Mark token as used to prevent subsequent replay submissions
+                usedQrTokens.add(req.qrToken);
+                setTimeout(() => {
+                    usedQrTokens.delete(req.qrToken);
+                }, 15000);
+                signals.push({
+                    signal: 'GPS',
+                    score: 100,
+                    weight: SIGNAL_WEIGHTS.GPS,
+                    weighted: SIGNAL_WEIGHTS.GPS,
+                    detail: `✅ تم التحقق بالـ QR: متواجد في ${branchName}`,
+                });
+            }
+            catch (e) {
+                // Strict QR Rejection: Throw directly to abort instead of logging a 0 score and falling back to review
+                throw new Error(`فشل التحقق برمز الـ QR: ${e.message}`);
+            }
+        }
+        else if (req.gpsLatitude != null && req.gpsLongitude != null && allowedLocations.length > 0) {
             // Flag suspiciously perfect GPS accuracy (mock GPS apps report 0.0m)
             const isMockSuspect = req.gpsAccuracyMeters != null
                 && req.gpsAccuracyMeters <= PERFECT_ACCURACY_THRESHOLD;
@@ -179,7 +316,7 @@ function calculateConfidence(req) {
             else {
                 let closestDistance = Infinity;
                 let closestLocation = null;
-                for (const loc of locations) {
+                for (const loc of allowedLocations) {
                     const distance = haversineDistance(req.gpsLatitude, req.gpsLongitude, Number(loc.latitude), Number(loc.longitude));
                     if (distance < closestDistance) {
                         closestDistance = distance;
@@ -187,29 +324,62 @@ function calculateConfidence(req) {
                     }
                 }
                 gpsDistanceMeters = Math.round(closestDistance);
-                if (closestLocation && closestDistance <= closestLocation.radiusMeters) {
+                let effectiveRadius = closestLocation ? closestLocation.radiusMeters : 200;
+                let accuracyTolerance = 0;
+                if (req.gpsAccuracyMeters && req.gpsAccuracyMeters > 50) {
+                    // If accuracy is low (e.g. 150m), extend radius dynamically by up to 100m
+                    accuracyTolerance = Math.min(100, req.gpsAccuracyMeters * 0.5);
+                    effectiveRadius += accuracyTolerance;
+                }
+                if (closestLocation && closestDistance <= effectiveRadius) {
                     // Inside geofence — score scaled by proximity
-                    const proximityRatio = 1 - (closestDistance / closestLocation.radiusMeters);
+                    const proximityRatio = 1 - (closestDistance / effectiveRadius);
                     let gpsScore = Math.round(70 + (proximityRatio * 30)); // 70-100
                     matchedLocationId = closestLocation.id;
-                    // Penalize suspiciously perfect accuracy
-                    if (isMockSuspect) {
-                        gpsScore = Math.round(gpsScore * 0.6);
+                    // Penalize score if we relied on dynamic tolerance drift
+                    if (accuracyTolerance > 0 && closestDistance > closestLocation.radiusMeters) {
+                        gpsScore = Math.round(gpsScore * 0.7);
+                    }
+                    // Penalize suspiciously perfect accuracy or flagged mock
+                    if (isMockSuspect || req.isMockGps) {
+                        gpsScore = Math.round(gpsScore * 0.4);
+                    }
+                    // Wi-Fi SSID Validation
+                    let wifiDetail = '';
+                    if (closestLocation.wifiSsid) {
+                        if (req.wifiSsid) {
+                            const match = req.wifiSsid.trim().toLowerCase() === closestLocation.wifiSsid.trim().toLowerCase();
+                            if (match) {
+                                wifiDetail = ` | Wi-Fi Verified: "${req.wifiSsid}"`;
+                            }
+                            else {
+                                gpsScore = Math.round(gpsScore * 0.1); // Penalize severely
+                                wifiDetail = ` | ⚠️ Wi-Fi mismatch: expected "${closestLocation.wifiSsid}", got "${req.wifiSsid}"`;
+                            }
+                        }
+                        else {
+                            gpsScore = Math.round(gpsScore * 0.5); // Fall below auto-approve
+                            wifiDetail = ` | ⚠️ Wi-Fi required but not provided`;
+                        }
+                    }
+                    let gpsDetail = isMockSuspect || req.isMockGps
+                        ? `Inside "${closestLocation.name}" — ${gpsDistanceMeters}m ⚠️ GPS accuracy suspiciously perfect (Mock GPS)`
+                        : `Inside "${closestLocation.name}" — ${gpsDistanceMeters}m from center (radius: ${closestLocation.radiusMeters}m)`;
+                    if (accuracyTolerance > 0 && closestDistance > closestLocation.radiusMeters) {
+                        gpsDetail += ` (⚠️ Dynamic tolerance applied due to GPS accuracy ${req.gpsAccuracyMeters}m)`;
                     }
                     signals.push({
                         signal: 'GPS',
                         score: gpsScore,
                         weight: SIGNAL_WEIGHTS.GPS,
                         weighted: Math.round(gpsScore * SIGNAL_WEIGHTS.GPS / 100),
-                        detail: isMockSuspect
-                            ? `Inside "${closestLocation.name}" — ${gpsDistanceMeters}m ⚠️ GPS accuracy suspiciously perfect`
-                            : `Inside "${closestLocation.name}" — ${gpsDistanceMeters}m from center (radius: ${closestLocation.radiusMeters}m)`,
+                        detail: gpsDetail + wifiDetail,
                     });
                 }
                 else {
                     // Outside all geofences
                     const overshoot = closestLocation
-                        ? closestDistance - closestLocation.radiusMeters
+                        ? closestDistance - (closestLocation.radiusMeters + accuracyTolerance)
                         : closestDistance;
                     const decayScore = Math.max(0, Math.round(50 * (1 - overshoot / 500)));
                     signals.push({
@@ -222,15 +392,26 @@ function calculateConfidence(req) {
                 }
             }
         }
-        else if (locations.length === 0) {
-            // No geofences configured — skip GPS scoring entirely, give full credit
-            signals.push({
-                signal: 'GPS',
-                score: 100,
-                weight: SIGNAL_WEIGHTS.GPS,
-                weighted: SIGNAL_WEIGHTS.GPS,
-                detail: 'No geofences configured — GPS check skipped',
-            });
+        else if (allowedLocations.length === 0) {
+            if (isRestrictedBranch) {
+                signals.push({
+                    signal: 'GPS',
+                    score: 0,
+                    weight: SIGNAL_WEIGHTS.GPS,
+                    weighted: 0,
+                    detail: `لم يتم تهيئة مواقع جغرافية لفرعك المعتمد: ${employeeBranchName || 'فرع غير معروف'}`,
+                });
+            }
+            else {
+                // No geofences configured — skip GPS scoring entirely, give full credit
+                signals.push({
+                    signal: 'GPS',
+                    score: 100,
+                    weight: SIGNAL_WEIGHTS.GPS,
+                    weighted: SIGNAL_WEIGHTS.GPS,
+                    detail: 'No geofences configured — GPS check skipped',
+                });
+            }
         }
         else {
             signals.push({
@@ -240,6 +421,31 @@ function calculateConfidence(req) {
                 weighted: 0,
                 detail: 'GPS data not provided',
             });
+        }
+        // ── Signal: IP Address Match (bonus — boosts confidence when IP matches) ──
+        if (req.ipAddress && matchedLocationId) {
+            const matchedLoc = locations.find(l => l.id === matchedLocationId);
+            if (matchedLoc === null || matchedLoc === void 0 ? void 0 : matchedLoc.allowedIp) {
+                const allowedIps = matchedLoc.allowedIp.split(',').map(ip => ip.trim()).filter(Boolean);
+                const clientIp = req.ipAddress.replace('::ffff:', ''); // normalize IPv6-mapped IPv4
+                const isIpMatch = allowedIps.includes(clientIp);
+                if (isIpMatch) {
+                    // IP match — add a small bonus to the GPS signal's weighted score
+                    const gpsSignal = signals.find(s => s.signal === 'GPS');
+                    if (gpsSignal) {
+                        const IP_BONUS = 5;
+                        gpsSignal.weighted = Math.min(SIGNAL_WEIGHTS.GPS, gpsSignal.weighted + IP_BONUS);
+                        gpsSignal.detail += ` | ✅ IP مطابق (${clientIp})`;
+                    }
+                }
+                else {
+                    // IP mismatch — informational only, no penalty
+                    const gpsSignal = signals.find(s => s.signal === 'GPS');
+                    if (gpsSignal) {
+                        gpsSignal.detail += ` | ⚠️ IP مختلف (${clientIp})`;
+                    }
+                }
+            }
         }
         // ── Signal 2: Device Fingerprint ──────────────────────────────────
         const deviceFingerprint = generateDeviceFingerprint(req.userAgent, req.ipAddress, req.acceptLanguage);
@@ -260,7 +466,8 @@ function calculateConfidence(req) {
             detail: 'Authenticated user session verified',
         });
         // ── Signal 4: Time Window ─────────────────────────────────────────
-        const timeScore = yield scoreTimeWindow(req.employeeId, req.punchType);
+        const punchTime = req.offlineCreatedTime ? new Date(req.offlineCreatedTime) : new Date();
+        const timeScore = yield scoreTimeWindow(req.employeeId, req.punchType, punchTime);
         signals.push({
             signal: 'TIME_WINDOW',
             score: timeScore.score,
@@ -280,15 +487,16 @@ function calculateConfidence(req) {
         else {
             status = 'REJECTED';
         }
-        return { totalScore, status, signals, matchedLocationId, gpsDistanceMeters };
+        return { totalScore, status, signals, matchedLocationId, gpsDistanceMeters, qrScanned, qrBranchId };
     });
 }
 // ── Punch Recording ────────────────────────────────────────────────────
 function recordPunch(req) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a;
-        // ── Pre-punch validation (cooldown, cap, velocity) ────────────────
-        yield validatePunchEligibility(req.employeeId, req.punchType, req.gpsLatitude, req.gpsLongitude);
+        const punchTime = req.offlineCreatedTime ? new Date(req.offlineCreatedTime) : new Date();
+        // ── Pre-punch validation (cooldown, cap, velocity, mock, device lock) ──
+        yield validatePunchEligibility(req.employeeId, req.punchType, punchTime, req.gpsLatitude, req.gpsLongitude, req.isMockGps, req.deviceId);
         // ── Advisory lock to prevent double-click race conditions ─────────
         const lockName = `smart_punch_${req.employeeId}`;
         const [lockResult] = yield db_1.pool.query('SELECT GET_LOCK(?, 5) as acquired', [lockName]);
@@ -299,74 +507,74 @@ function recordPunch(req) {
             const confidence = yield calculateConfidence(req);
             const deviceFingerprint = generateDeviceFingerprint(req.userAgent, req.ipAddress, req.acceptLanguage);
             const punchId = (0, crypto_1.randomUUID)();
-            const now = new Date();
+            // ── Save selfie to disk (if provided) ─────────────────────────
+            let selfiePath = null;
+            if (req.selfieBase64) {
+                selfiePath = saveSelfie(punchId, req.selfieBase64);
+            }
+            // Silent validation of offline time difference:
+            let verificationStatus = confidence.status;
+            let reviewNotes = '';
+            if (req.offlineCreatedTime && verificationStatus === 'AUTO_APPROVED') {
+                const clientTime = new Date(req.offlineCreatedTime).getTime();
+                const serverTime = Date.now();
+                const timeDiffMinutes = Math.abs(serverTime - clientTime) / 60000;
+                if (timeDiffMinutes > 5) {
+                    verificationStatus = 'PENDING_REVIEW';
+                    reviewNotes = 'تنبيه: فارق توقيت محلي مشبوه أثناء الأوفلاين';
+                }
+            }
             // ── Store raw punch (immutable audit trail) ────────────────────
             yield db_1.pool.query(`INSERT INTO smart_attendance_punches
              (id, employeeId, userId, punchTime, punchType,
               gpsLatitude, gpsLongitude, gpsAccuracyMeters,
               matchedLocationId, gpsDistanceMeters,
               deviceFingerprint, ipAddress, userAgent,
-              confidenceScore, verificationStatus)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
-                punchId, req.employeeId, req.userId, now, req.punchType,
+              confidenceScore, verificationStatus, wifiSsid, isMockGps, selfiePath, deviceId, offlineCreatedTime, reviewNotes, qrScanned, qrBranchId)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                punchId, req.employeeId, req.userId, punchTime, req.punchType,
                 req.gpsLatitude || null, req.gpsLongitude || null, req.gpsAccuracyMeters || null,
                 confidence.matchedLocationId, confidence.gpsDistanceMeters,
                 deviceFingerprint, req.ipAddress, req.userAgent,
-                confidence.totalScore, confidence.status,
+                confidence.totalScore, verificationStatus,
+                req.wifiSsid || null, req.isMockGps ? 1 : 0, selfiePath, req.deviceId || null,
+                req.offlineCreatedTime ? new Date(req.offlineCreatedTime) : null,
+                reviewNotes || null,
+                confidence.qrScanned ? 1 : 0,
+                confidence.qrBranchId || null
             ]);
             // ── Write to attendance_records ONLY for auto-approved ─────────
             // PENDING_REVIEW punches wait until HR approves via reviewPunch()
             let attendanceRecordId;
-            if (confidence.status === 'AUTO_APPROVED') {
-                attendanceRecordId = yield upsertAttendanceRecord(req, now);
+            if (verificationStatus === 'AUTO_APPROVED') {
+                const dateStr = (0, attendanceHelper_1.getLocalDateString)(punchTime);
+                const timeStr = punchTime.toTimeString().slice(0, 5);
+                const options = {
+                    employeeId: req.employeeId,
+                    dateStr,
+                    source: 'SMART',
+                    notes: req.punchType === 'CHECK_IN' ? 'تسجيل ذكي' : 'انصراف ذكي'
+                };
+                if (req.punchType === 'CHECK_IN') {
+                    options.checkIn = timeStr;
+                }
+                else {
+                    options.checkOut = timeStr;
+                }
+                const upsertRes = yield (0, attendanceHelper_1.upsertAttendanceRecord)(options);
+                if (upsertRes.status === 'SUCCESS') {
+                    attendanceRecordId = upsertRes.id;
+                }
+                else if (upsertRes.status === 'LOCKED') {
+                    throw new Error('لا يمكن تسجيل الحضور لشهر مغلق مالياً');
+                }
             }
-            return { punchId, confidence, attendanceRecordId };
+            // Return the modified verificationStatus and confidence total
+            const finalConfidence = Object.assign(Object.assign({}, confidence), { status: verificationStatus });
+            return { punchId, confidence: finalConfidence, attendanceRecordId };
         }
         finally {
             yield db_1.pool.query('SELECT RELEASE_LOCK(?)', [lockName]).catch(() => { });
-        }
-    });
-}
-// ── Attendance Record Upsert ───────────────────────────────────────────
-function upsertAttendanceRecord(req, punchTime) {
-    return __awaiter(this, void 0, void 0, function* () {
-        var _a;
-        // Use local time, NOT UTC — prevents date drift at midnight boundaries
-        const dateStr = getLocalDateString(punchTime);
-        const timeStr = punchTime.toTimeString().slice(0, 5); // HH:MM (already local)
-        // Get employee scheduled check-in for late calculation
-        const [empRows] = yield db_1.pool.query('SELECT scheduledCheckIn FROM employees WHERE id = ?', [req.employeeId]);
-        const scheduledStart = padTime(((_a = empRows[0]) === null || _a === void 0 ? void 0 : _a.scheduledCheckIn) || '09:00');
-        if (req.punchType === 'CHECK_IN') {
-            // Late calculation (same logic as fingerprintService)
-            const checkInMin = timeToMinutes(timeStr);
-            const scheduledMin = timeToMinutes(scheduledStart);
-            const MINUTES_IN_DAY = 1440;
-            const LATE_WINDOW_MINUTES = 720;
-            const diff = (checkInMin - scheduledMin + MINUTES_IN_DAY) % MINUTES_IN_DAY;
-            const isLate = diff > 0 && diff <= LATE_WINDOW_MINUTES;
-            const status = isLate ? 'LATE' : 'PRESENT';
-            const lateMinutes = isLate ? diff : 0;
-            const id = (0, crypto_1.randomUUID)();
-            const [result] = yield db_1.pool.query(`INSERT INTO attendance_records
-             (id, employeeId, date, checkIn, status, lateMinutes, scheduledCheckIn, notes, source)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'SMART')
-             ON DUPLICATE KEY UPDATE
-                 checkIn = IF(VALUES(checkIn) < checkIn OR checkIn IS NULL, VALUES(checkIn), checkIn),
-                 status = VALUES(status),
-                 lateMinutes = VALUES(lateMinutes),
-                 scheduledCheckIn = VALUES(scheduledCheckIn),
-                 source = 'SMART',
-                 notes = VALUES(notes)`, [id, req.employeeId, dateStr, timeStr, status, lateMinutes, scheduledStart, 'تسجيل ذكي']);
-            return result.insertId || id;
-        }
-        else {
-            // CHECK_OUT — update existing record's checkOut
-            yield db_1.pool.query(`UPDATE attendance_records
-             SET checkOut = ?,
-                 notes = CONCAT(COALESCE(notes, ''), ' | انصراف ذكي')
-             WHERE employeeId = ? AND date = ?`, [timeStr, req.employeeId, dateStr]);
-            return '';
         }
     });
 }
@@ -374,34 +582,109 @@ function upsertAttendanceRecord(req, punchTime) {
 function getTodayStatus(employeeId) {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b;
-        const today = new Date().toISOString().split('T')[0];
-        const [rows] = yield db_1.pool.query(`SELECT punchType, TIME_FORMAT(punchTime, '%H:%i') as time, confidenceScore
+        const today = (0, attendanceHelper_1.getLocalDateString)(new Date());
+        const [rows] = yield db_1.pool.query(`SELECT punchType, TIME_FORMAT(punchTime, '%H:%i') as time,
+                confidenceScore, verificationStatus, reviewNotes, punchTime
          FROM smart_attendance_punches
          WHERE employeeId = ? AND DATE(punchTime) = ?
-         ORDER BY punchTime`, [employeeId, today]);
-        const checkIn = rows.find((r) => r.punchType === 'CHECK_IN');
-        const checkOut = rows.find((r) => r.punchType === 'CHECK_OUT');
+         ORDER BY punchTime DESC`, [employeeId, today]);
+        // Group punches by type
+        const checkIns = rows.filter((r) => r.punchType === 'CHECK_IN');
+        const checkOuts = rows.filter((r) => r.punchType === 'CHECK_OUT');
+        // Find the latest valid/active punch of each type
+        const latestCheckIn = checkIns[0]; // sorted DESC
+        const latestCheckOut = checkOuts[0];
+        // Find any rejected punch today to return the last rejection reason
+        const rejectedPunch = rows.find((r) => r.verificationStatus === 'REJECTED' || r.verificationStatus === 'MANUALLY_REJECTED');
+        // Calculate remaining cooldown (in seconds) since the last punch of each type
+        const getCooldownRemaining = (lastPunch) => {
+            if (!lastPunch)
+                return 0;
+            const lastTime = new Date(lastPunch.punchTime).getTime();
+            const elapsed = (Date.now() - lastTime) / 1000;
+            const cooldown = PUNCH_COOLDOWN_SECONDS; // 300
+            return elapsed < cooldown ? Math.ceil(cooldown - elapsed) : 0;
+        };
         return {
-            hasCheckedIn: !!checkIn,
-            hasCheckedOut: !!checkOut,
-            checkInTime: (checkIn === null || checkIn === void 0 ? void 0 : checkIn.time) || null,
-            checkOutTime: (checkOut === null || checkOut === void 0 ? void 0 : checkOut.time) || null,
-            checkInScore: (_a = checkIn === null || checkIn === void 0 ? void 0 : checkIn.confidenceScore) !== null && _a !== void 0 ? _a : null,
-            checkOutScore: (_b = checkOut === null || checkOut === void 0 ? void 0 : checkOut.confidenceScore) !== null && _b !== void 0 ? _b : null,
+            hasCheckedIn: checkIns.some((c) => c.verificationStatus !== 'REJECTED' && c.verificationStatus !== 'MANUALLY_REJECTED'),
+            hasCheckedOut: checkOuts.some((c) => c.verificationStatus !== 'REJECTED' && c.verificationStatus !== 'MANUALLY_REJECTED'),
+            checkInTime: (latestCheckIn === null || latestCheckIn === void 0 ? void 0 : latestCheckIn.time) || null,
+            checkOutTime: (latestCheckOut === null || latestCheckOut === void 0 ? void 0 : latestCheckOut.time) || null,
+            checkInScore: (_a = latestCheckIn === null || latestCheckIn === void 0 ? void 0 : latestCheckIn.confidenceScore) !== null && _a !== void 0 ? _a : null,
+            checkOutScore: (_b = latestCheckOut === null || latestCheckOut === void 0 ? void 0 : latestCheckOut.confidenceScore) !== null && _b !== void 0 ? _b : null,
+            checkInStatus: (latestCheckIn === null || latestCheckIn === void 0 ? void 0 : latestCheckIn.verificationStatus) || null,
+            checkOutStatus: (latestCheckOut === null || latestCheckOut === void 0 ? void 0 : latestCheckOut.verificationStatus) || null,
+            lastRejectionReason: (rejectedPunch === null || rejectedPunch === void 0 ? void 0 : rejectedPunch.reviewNotes) || (rejectedPunch === null || rejectedPunch === void 0 ? void 0 : rejectedPunch.verificationStatus) || null,
+            cooldownRemainingCheckIn: getCooldownRemaining(latestCheckIn),
+            cooldownRemainingCheckOut: getCooldownRemaining(latestCheckOut),
         };
     });
 }
 // ── Pending Reviews ────────────────────────────────────────────────────
 function getPendingReviews() {
     return __awaiter(this, arguments, void 0, function* (limit = 50) {
-        const [rows] = yield db_1.pool.query(`SELECT sap.*, e.fullName as employeeName, al.name as locationName,
-                al.latitude as officeLatitude, al.longitude as officeLongitude, al.radiusMeters as officeRadiusMeters
+        const [rows] = yield db_1.pool.query(`SELECT sap.*, e.fullName as employeeName, e.boundDeviceId as employeeBoundDeviceId,
+                u.name as userName, u.username as username,
+                al.name as locationName,
+                al.latitude as officeLatitude, al.longitude as officeLongitude,
+                al.radiusMeters as officeRadiusMeters, al.allowedIp as locationAllowedIp,
+                qrb.name as qrBranchName
          FROM smart_attendance_punches sap
          LEFT JOIN employees e ON sap.employeeId = e.id
+         LEFT JOIN users u ON sap.userId = u.id
          LEFT JOIN attendance_locations al ON sap.matchedLocationId = al.id
+         LEFT JOIN branches qrb ON sap.qrBranchId = qrb.id
          WHERE sap.verificationStatus = 'PENDING_REVIEW'
          ORDER BY sap.punchTime DESC
          LIMIT ?`, [limit]);
+        return rows;
+    });
+}
+function getAuditLogs(filters) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const whereClauses = [];
+        const params = [];
+        if (filters.employeeId) {
+            whereClauses.push('sap.employeeId = ?');
+            params.push(filters.employeeId);
+        }
+        if (filters.status) {
+            whereClauses.push('sap.verificationStatus = ?');
+            params.push(filters.status);
+        }
+        if (filters.riskMin != null) {
+            whereClauses.push('sap.confidenceScore <= ?');
+            params.push(100 - Number(filters.riskMin));
+        }
+        if (filters.riskMax != null) {
+            whereClauses.push('sap.confidenceScore >= ?');
+            params.push(100 - Number(filters.riskMax));
+        }
+        if (filters.fromDate) {
+            whereClauses.push('DATE(sap.punchTime) >= ?');
+            params.push(filters.fromDate);
+        }
+        if (filters.toDate) {
+            whereClauses.push('DATE(sap.punchTime) <= ?');
+            params.push(filters.toDate);
+        }
+        const whereSql = whereClauses.length > 0 ? `WHERE ${whereClauses.join(' AND ')}` : '';
+        const limit = Number(filters.limit || 100);
+        params.push(limit);
+        const [rows] = yield db_1.pool.query(`SELECT sap.*, e.fullName as employeeName, e.boundDeviceId as employeeBoundDeviceId,
+                u.name as userName, u.username as username,
+                al.name as locationName,
+                al.latitude as officeLatitude, al.longitude as officeLongitude,
+                al.radiusMeters as officeRadiusMeters, al.allowedIp as locationAllowedIp,
+                qrb.name as qrBranchName
+         FROM smart_attendance_punches sap
+         LEFT JOIN employees e ON sap.employeeId = e.id
+         LEFT JOIN users u ON sap.userId = u.id
+         LEFT JOIN attendance_locations al ON sap.matchedLocationId = al.id
+         LEFT JOIN branches qrb ON sap.qrBranchId = qrb.id
+         ${whereSql}
+         ORDER BY sap.punchTime DESC
+         LIMIT ?`, params);
         return rows;
     });
 }
@@ -410,28 +693,38 @@ function reviewPunch(punchId, action, reviewedBy, notes) {
         const conn = yield db_1.pool.getConnection();
         try {
             yield conn.beginTransaction();
+            const [punch] = yield conn.query('SELECT employeeId, punchTime, punchType FROM smart_attendance_punches WHERE id = ?', [punchId]);
+            if (punch.length === 0) {
+                throw new Error('لم يتم العثور على البصمة المطلوبة');
+            }
+            const p = punch[0];
+            const dateStr = (0, attendanceHelper_1.getLocalDateString)(new Date(p.punchTime));
+            // Block if date falls in a locked payroll cycle
+            const locked = yield (0, attendanceHelper_1.isPayrollLocked)(dateStr, conn);
+            if (locked) {
+                throw new Error('لا يمكن تعديل الحضور لشهر مغلق مالياً');
+            }
             yield conn.query(`UPDATE smart_attendance_punches
              SET verificationStatus = ?, reviewedBy = ?, reviewedAt = NOW(), reviewNotes = ?
              WHERE id = ?`, [action, reviewedBy, notes || null, punchId]);
             // If manually approved and no attendance record exists, create one
             if (action === 'MANUALLY_APPROVED') {
-                const [punch] = yield conn.query('SELECT * FROM smart_attendance_punches WHERE id = ?', [punchId]);
-                if (punch.length > 0) {
-                    const p = punch[0];
-                    const dateStr = new Date(p.punchTime).toISOString().split('T')[0];
-                    const timeStr = new Date(p.punchTime).toTimeString().slice(0, 5);
-                    if (p.punchType === 'CHECK_IN') {
-                        const id = (0, crypto_1.randomUUID)();
-                        yield conn.query(`INSERT INTO attendance_records
-                         (id, employeeId, date, checkIn, status, notes, source)
-                         VALUES (?, ?, ?, ?, 'PRESENT', ?, 'SMART')
-                         ON DUPLICATE KEY UPDATE
-                             checkIn = VALUES(checkIn), status = 'PRESENT',
-                             source = 'SMART', notes = VALUES(notes)`, [id, p.employeeId, dateStr, timeStr, 'موافقة يدوية على تسجيل ذكي']);
-                    }
-                    else {
-                        yield conn.query(`UPDATE attendance_records SET checkOut = ? WHERE employeeId = ? AND date = ?`, [timeStr, p.employeeId, dateStr]);
-                    }
+                const timeStr = new Date(p.punchTime).toTimeString().slice(0, 5);
+                const options = {
+                    employeeId: p.employeeId,
+                    dateStr,
+                    source: 'SMART',
+                    notes: 'موافقة يدوية على تسجيل ذكي'
+                };
+                if (p.punchType === 'CHECK_IN') {
+                    options.checkIn = timeStr;
+                }
+                else {
+                    options.checkOut = timeStr;
+                }
+                const upsertRes = yield (0, attendanceHelper_1.upsertAttendanceRecord)(options, conn);
+                if (upsertRes.status === 'FAILED') {
+                    throw new Error('فشلت عملية حفظ سجل الحضور');
                 }
             }
             yield conn.commit();
@@ -448,7 +741,7 @@ function reviewPunch(punchId, action, reviewedBy, notes) {
 // ── Analytics ──────────────────────────────────────────────────────────
 function getSmartAttendanceStats() {
     return __awaiter(this, void 0, void 0, function* () {
-        const today = getLocalDateString(new Date());
+        const today = (0, attendanceHelper_1.getLocalDateString)(new Date());
         // 1. Linked employees
         const [linkedRows] = yield db_1.pool.query('SELECT COUNT(*) as cnt FROM users WHERE employeeId IS NOT NULL');
         // 2. Today's punches
@@ -541,18 +834,18 @@ function scoreDeviceConsistency(employeeId, currentFingerprint) {
  * Score whether the punch falls within a reasonable time window
  * relative to the employee's scheduled hours.
  */
-function scoreTimeWindow(employeeId, punchType) {
-    return __awaiter(this, void 0, void 0, function* () {
+function scoreTimeWindow(employeeId_1, punchType_1) {
+    return __awaiter(this, arguments, void 0, function* (employeeId, punchType, punchTime = new Date()) {
         const [empRows] = yield db_1.pool.query('SELECT scheduledCheckIn, scheduledCheckOut FROM employees WHERE id = ?', [employeeId]);
         if (empRows.length === 0) {
             return { score: 50, detail: 'Employee schedule not found' };
         }
         const emp = empRows[0];
-        const nowMinutes = new Date().getHours() * 60 + new Date().getMinutes();
+        const nowMinutes = punchTime.getHours() * 60 + punchTime.getMinutes();
         const EARLY_WINDOW_MINUTES = 120; // 2 hours before scheduled
         const LATE_WINDOW_MINUTES = 240; // 4 hours after scheduled
         if (punchType === 'CHECK_IN') {
-            const scheduledMin = timeToMinutes(padTime(emp.scheduledCheckIn || '09:00'));
+            const scheduledMin = (0, attendanceHelper_1.timeToMinutes)((0, attendanceHelper_1.padTime)(emp.scheduledCheckIn || '09:00'));
             const diffFromScheduled = nowMinutes - scheduledMin;
             if (diffFromScheduled >= -EARLY_WINDOW_MINUTES && diffFromScheduled <= LATE_WINDOW_MINUTES) {
                 // Within reasonable window
@@ -568,7 +861,7 @@ function scoreTimeWindow(employeeId, punchType) {
         }
         else {
             // CHECK_OUT — any time after scheduled start is valid
-            const scheduledOut = timeToMinutes(padTime(emp.scheduledCheckOut || '17:00'));
+            const scheduledOut = (0, attendanceHelper_1.timeToMinutes)((0, attendanceHelper_1.padTime)(emp.scheduledCheckOut || '17:00'));
             const diffFromEnd = nowMinutes - scheduledOut;
             if (diffFromEnd >= -60) {
                 return { score: 90, detail: 'Check-out within expected window' };
@@ -577,25 +870,39 @@ function scoreTimeWindow(employeeId, punchType) {
         }
     });
 }
-function padTime(time) {
-    if (!time)
-        return '00:00';
-    const parts = String(time).slice(0, 5).split(':');
-    const h = (parts[0] || '0').padStart(2, '0');
-    const m = (parts[1] || '0').padStart(2, '0');
-    return `${h}:${m}`;
-}
-function timeToMinutes(time) {
-    const [h, m] = time.split(':').map(Number);
-    return (h || 0) * 60 + (m || 0);
+/**
+ * Reset bound device for an employee (requires admin privilege at controller layer).
+ */
+function resetDeviceBinding(employeeId) {
+    return __awaiter(this, void 0, void 0, function* () {
+        yield db_1.pool.query('UPDATE employees SET boundDeviceId = NULL WHERE id = ?', [employeeId]);
+        console.log(`📱 [DeviceLock] Reset bound device for employee "${employeeId}"`);
+    });
 }
 /**
- * Extract YYYY-MM-DD from a Date using the server's local timezone.
- * Avoids UTC date drift (e.g. 11:30 PM Cairo = next day in UTC).
+ * Decode a base64-encoded selfie and save to disk.
+ * Accepts "data:image/jpeg;base64,..." or raw base64.
+ * Returns the relative URL path (e.g. /uploads/attendance-selfies/xxx.jpg).
  */
-function getLocalDateString(date) {
-    const y = date.getFullYear();
-    const m = String(date.getMonth() + 1).padStart(2, '0');
-    const d = String(date.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
+function saveSelfie(punchId, base64Data) {
+    try {
+        if (!fs_1.default.existsSync(SELFIE_UPLOAD_DIR)) {
+            fs_1.default.mkdirSync(SELFIE_UPLOAD_DIR, { recursive: true });
+        }
+        // Strip data URL prefix if present
+        const raw = base64Data.replace(/^data:image\/\w+;base64,/, '');
+        const buffer = Buffer.from(raw, 'base64');
+        if (buffer.length > MAX_SELFIE_SIZE_BYTES) {
+            console.warn(`📸 Selfie too large for punch ${punchId}: ${buffer.length} bytes`);
+            return null;
+        }
+        const filename = `selfie-${punchId}.jpg`;
+        const filePath = path_1.default.join(SELFIE_UPLOAD_DIR, filename);
+        fs_1.default.writeFileSync(filePath, buffer);
+        return `/uploads/attendance-selfies/${filename}`;
+    }
+    catch (err) {
+        console.error(`📸 Failed to save selfie for punch ${punchId}:`, err);
+        return null;
+    }
 }

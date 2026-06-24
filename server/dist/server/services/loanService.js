@@ -147,12 +147,15 @@ exports.checkLoanEligibility = checkLoanEligibility;
 /**
  * Generate installment schedule for a loan
  */
-const generateInstallments = (loanId_1, employeeId_1, totalAmount_1, numberOfMonths_1, ...args_1) => __awaiter(void 0, [loanId_1, employeeId_1, totalAmount_1, numberOfMonths_1, ...args_1], void 0, function* (loanId, employeeId, totalAmount, numberOfMonths, startDate = new Date()) {
+const generateInstallments = (loanId_1, employeeId_1, totalAmount_1, numberOfMonths_1, ...args_1) => __awaiter(void 0, [loanId_1, employeeId_1, totalAmount_1, numberOfMonths_1, ...args_1], void 0, function* (loanId, employeeId, totalAmount, numberOfMonths, startDate = new Date(), connection) {
     const installmentAmount = totalAmount / numberOfMonths;
     const installments = [];
-    const conn = yield (0, db_1.getConnection)();
+    const ownConnection = !connection;
+    const conn = connection || (yield (0, db_1.getConnection)());
     try {
-        yield conn.beginTransaction();
+        if (ownConnection) {
+            yield conn.beginTransaction();
+        }
         // Delete existing installments if any (for regeneration scenarios)
         yield conn.query('DELETE FROM loan_installments WHERE loanId = ?', [loanId]);
         // Generate new installments
@@ -180,15 +183,21 @@ const generateInstallments = (loanId_1, employeeId_1, totalAmount_1, numberOfMon
                 status: 'PENDING'
             });
         }
-        yield conn.commit();
+        if (ownConnection) {
+            yield conn.commit();
+        }
         return installments;
     }
     catch (error) {
-        yield conn.rollback();
+        if (ownConnection) {
+            yield conn.rollback();
+        }
         throw error;
     }
     finally {
-        conn.release();
+        if (ownConnection) {
+            conn.release();
+        }
     }
 });
 exports.generateInstallments = generateInstallments;
@@ -452,11 +461,14 @@ exports.getPendingInstallments = getPendingInstallments;
 /**
  * Mark installments as deducted after payroll approval
  */
-const markInstallmentsAsDeducted = (employeeId, payrollCycleId, startDate, endDate) => __awaiter(void 0, void 0, void 0, function* () {
+const markInstallmentsAsDeducted = (employeeId, payrollCycleId, startDate, endDate, connection) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
-    const conn = yield (0, db_1.getConnection)();
+    const ownConnection = !connection;
+    const conn = connection || (yield (0, db_1.getConnection)());
     try {
-        yield conn.beginTransaction();
+        if (ownConnection) {
+            yield conn.beginTransaction();
+        }
         // Get the installments
         const [installments] = yield conn.query(`
       SELECT * FROM loan_installments
@@ -465,7 +477,9 @@ const markInstallmentsAsDeducted = (employeeId, payrollCycleId, startDate, endDa
         AND status = 'PENDING'
     `, [employeeId, startDate, endDate]);
         if (installments.length === 0) {
-            yield conn.commit();
+            if (ownConnection) {
+                yield conn.commit();
+            }
             return 0;
         }
         // Mark as deducted
@@ -504,15 +518,21 @@ const markInstallmentsAsDeducted = (employeeId, payrollCycleId, startDate, endDa
                 JSON.stringify({ payrollCycleId, installmentId: inst.id })
             ]);
         }
-        yield conn.commit();
+        if (ownConnection) {
+            yield conn.commit();
+        }
         return totalDeducted;
     }
     catch (error) {
-        yield conn.rollback();
+        if (ownConnection) {
+            yield conn.rollback();
+        }
         throw error;
     }
     finally {
-        conn.release();
+        if (ownConnection) {
+            conn.release();
+        }
     }
 });
 exports.markInstallmentsAsDeducted = markInstallmentsAsDeducted;

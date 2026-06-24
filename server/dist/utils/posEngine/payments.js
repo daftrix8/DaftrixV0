@@ -19,7 +19,11 @@ const money_1 = require("./money");
 // ── Reconciliation ───────────────────────────────────────────────────────────
 /** Reconcile a set of payment splits against a required total. */
 function reconcilePayments(splits, requiredTotal) {
-    const requiredP = (0, money_1.toPiasters)(requiredTotal);
+    // Sum fees loaded on client
+    const clientFeesP = (0, money_1.sumP)(splits
+        .filter(s => s.feeChargedTo === 'CLIENT' && s.feeTotal)
+        .map(s => (0, money_1.toPiasters)(s.feeTotal || 0)));
+    const requiredP = (0, money_1.sumP)([(0, money_1.toPiasters)(requiredTotal), clientFeesP]);
     const totalPaidP = (0, money_1.sumP)(splits.map(s => (0, money_1.toPiasters)(s.amount)));
     const remainingP = (0, money_1.subP)(requiredP, totalPaidP);
     // Change is only given on CASH overpayment
@@ -58,11 +62,16 @@ function validatePaymentSplits(splits, requiredTotal) {
 function computePaymentState(invoiceTotal, loyaltyDiscount, splits) {
     const effectiveTotal = Math.max(0, (0, money_1.fromPiasters)((0, money_1.subP)((0, money_1.toPiasters)(invoiceTotal), (0, money_1.toPiasters)(loyaltyDiscount))));
     const reconciliation = reconcilePayments(splits, effectiveTotal);
+    const clientFeesTotal = (0, money_1.fromPiasters)((0, money_1.sumP)(splits
+        .filter(s => s.feeChargedTo === 'CLIENT' && s.feeTotal)
+        .map(s => (0, money_1.toPiasters)(s.feeTotal || 0))));
     return {
         effectiveTotal,
         totalPaid: reconciliation.totalPaid,
         remaining: reconciliation.remaining,
         change: reconciliation.change,
         isFullyPaid: reconciliation.isComplete,
+        clientFeesTotal,
+        grandTotal: effectiveTotal + clientFeesTotal,
     };
 }

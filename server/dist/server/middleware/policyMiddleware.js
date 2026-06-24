@@ -13,7 +13,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.enforceLockDate = exports.requireMinimumRole = exports.canModifyRecordMiddleware = exports.validateTransactionAmountMiddleware = exports.loadSystemConfig = void 0;
+exports.enforceLockDate = exports.closePolicyCleanup = exports.requireMinimumRole = exports.canModifyRecordMiddleware = exports.validateTransactionAmountMiddleware = exports.loadSystemConfig = exports.invalidateConfigCache = exports.invalidateSalesmanCache = exports.closePolicyThrottle = void 0;
 exports.getInvoiceCreator = getInvoiceCreator;
 exports.getJournalCreator = getJournalCreator;
 exports.getChequeCreator = getChequeCreator;
@@ -23,91 +23,102 @@ exports.isAccountLocked = isAccountLocked;
 exports.cleanupOldAttempts = cleanupOldAttempts;
 const db_1 = require("../db");
 const dataFiltering_1 = require("../utils/dataFiltering");
-/**
- * Middleware to load system configuration and user filter options
- * Should be used after authenticateToken middleware
- * PERFORMANCE: Caches system config in memory for 60s to avoid
- * opening a DB connection on every single API request
- */
+const lockDateValidator_1 = require("../utils/lockDateValidator");
 // In-memory cache for system config (prevents DB hit on every request)
 let _configCache = null;
 const CONFIG_CACHE_TTL = 60000; // 60 seconds
-// ═══════════════════════════════════════════════════════════
-// PERF: Per-user salesman cache — eliminates 2nd DB connection per request.
-// Previously, EVERY API request opened a 2nd connection just to check if
-// the user is linked to a salesman. With 5 users × 10 req/sec = 50 wasted
-// connections/sec, which alone could exhaust the 25-connection pool.
-// Salesman-user linkage changes very rarely, so 5-min cache is safe.
-// ═══════════════════════════════════════════════════════════
+// In-memory cache for per-user salesman link.
+// Maps userId -> { salesmanId: string | null; timestamp: number }
+// Using null as a sentinel for "checked, no salesman exists".
 const _salesmanCache = new Map();
 const SALESMAN_CACHE_TTL = 300000; // 5 minutes
 // Clean up stale entries every 10 minutes to prevent unbounded growth
-setInterval(() => {
+const salesmanCleanupInterval = setInterval(() => {
     const cutoff = Date.now() - SALESMAN_CACHE_TTL * 2;
     for (const [key, entry] of _salesmanCache) {
         if (entry.timestamp < cutoff)
             _salesmanCache.delete(key);
     }
 }, 600000);
+// Cleanup hook for testing or shutdown
+const closePolicyThrottle = () => {
+    clearInterval(salesmanCleanupInterval);
+};
+exports.closePolicyThrottle = closePolicyThrottle;
+// Cache invalidation helpers
+const invalidateSalesmanCache = (userId) => {
+    _salesmanCache.delete(userId);
+};
+exports.invalidateSalesmanCache = invalidateSalesmanCache;
+const invalidateConfigCache = () => {
+    _configCache = null;
+};
+exports.invalidateConfigCache = invalidateConfigCache;
+/**
+ * Middleware to load system configuration and user filter options.
+ * Performance: Reuses a single database connection for both config and salesman checks,
+ * and caches results to avoid connection pool pressure.
+ */
 const loadSystemConfig = (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b;
+    const now = Date.now();
+    let conn;
     try {
-        // Try serving from cache first
-        const now = Date.now();
+        let systemConfig = _configCache === null || _configCache === void 0 ? void 0 : _configCache.data;
+        // 1. Resolve System Config (Cache or DB)
         if (_configCache && (now - _configCache.timestamp) < CONFIG_CACHE_TTL) {
-            req.systemConfig = _configCache.data;
+            req.systemConfig = systemConfig;
         }
         else {
-            // Cache miss or expired — load from DB
-            const conn = yield (0, db_1.getConnection)();
-            try {
-                const [configRows] = yield conn.query('SELECT config FROM system_config LIMIT 1');
-                const configData = configRows[0];
-                if (configData && configData.config) {
-                    const config = typeof configData.config === 'string'
-                        ? JSON.parse(configData.config)
-                        : configData.config;
-                    req.systemConfig = config;
-                    // Update cache
-                    _configCache = { data: config, timestamp: now };
-                }
-            }
-            finally {
-                conn.release();
+            conn = yield (0, db_1.getConnection)();
+            const [configRows] = yield conn.query('SELECT config FROM system_config LIMIT 1');
+            const configData = configRows[0];
+            if (configData && configData.config) {
+                systemConfig = typeof configData.config === 'string'
+                    ? JSON.parse(configData.config)
+                    : configData.config;
+                req.systemConfig = systemConfig;
+                _configCache = { data: systemConfig, timestamp: now };
             }
         }
-        // If user is authenticated, set up filter options
+        // If system config failed to load entirely, block request to prevent downstream faults
+        if (!req.systemConfig) {
+            console.error('❌ System configuration not found in DB.');
+            return res.status(500).json({
+                error: 'SYSTEM_CONFIG_ERROR',
+                message: 'Failed to load system configuration'
+            });
+        }
+        // 2. Resolve User Filter Options & Salesman Context
         if (req.user) {
             const userRole = req.user.role;
             const systemConfig = req.systemConfig;
-            // PERF: Get salesman ID from cache (avoids opening a 2nd DB connection per request)
+            const userId = String(req.user.id);
             let salesmanId;
-            const userId = req.user.id;
             const cached = _salesmanCache.get(userId);
             if (cached && (now - cached.timestamp) < SALESMAN_CACHE_TTL) {
-                salesmanId = cached.salesmanId;
+                salesmanId = cached.salesmanId || undefined;
             }
             else {
+                // If connection wasn't opened for config, get one now
+                if (!conn) {
+                    conn = yield (0, db_1.getConnection)();
+                }
                 try {
-                    const conn2 = yield (0, db_1.getConnection)();
-                    try {
-                        const [salesmanRows] = yield conn2.query('SELECT id FROM salesmen WHERE userId = ? LIMIT 1', [userId]);
-                        salesmanId = ((_a = salesmanRows[0]) === null || _a === void 0 ? void 0 : _a.id) || undefined;
-                        _salesmanCache.set(userId, { salesmanId, timestamp: now });
-                    }
-                    finally {
-                        conn2.release();
-                    }
+                    const [salesmanRows] = yield conn.query('SELECT id FROM salesmen WHERE userId = ? LIMIT 1', [userId]);
+                    const dbSalesmanId = ((_a = salesmanRows[0]) === null || _a === void 0 ? void 0 : _a.id) || null;
+                    _salesmanCache.set(userId, { salesmanId: dbSalesmanId, timestamp: now });
+                    salesmanId = dbSalesmanId || undefined;
                 }
                 catch (e) {
-                    // Column might not exist yet
+                    // Fallback to null (sentinel) in case column/table is missing during migrations
+                    _salesmanCache.set(userId, { salesmanId: null, timestamp: now });
                     salesmanId = undefined;
-                    _salesmanCache.set(userId, { salesmanId: undefined, timestamp: now });
                 }
             }
             req.userFilterOptions = {
-                userId: req.user.id,
-                userName: req.user.name || req.user.username,
+                userId: userId,
+                userName: req.user.username, // Using canonical unique username instead of human-friendly name
                 userRole: userRole,
                 salesmanId: salesmanId,
                 canSeeAll: (0, dataFiltering_1.canSeeAllData)(userRole, systemConfig),
@@ -115,13 +126,9 @@ const loadSystemConfig = (req, res, next) => __awaiter(void 0, void 0, void 0, f
                 canSeeSalesmanData: (0, dataFiltering_1.isExemptFromSalesmanIsolation)(userRole, systemConfig)
             };
         }
-        // Set fiscal year filter from JWT token
-        // JWT stores fiscal year as FLAT fields (fiscalYearId, fiscalYearStart, etc.)
-        // set by authController.ts lines 178-182. Also support nested fiscalYear object
-        // for forward-compatibility.
+        // 3. Set Fiscal Year Filter from JWT Token
         const user = req.user;
         if (user === null || user === void 0 ? void 0 : user.fiscalYear) {
-            // Nested object format (future-proof)
             const fy = user.fiscalYear;
             req.fiscalYearFilter = {
                 id: fy.id,
@@ -132,7 +139,6 @@ const loadSystemConfig = (req, res, next) => __awaiter(void 0, void 0, void 0, f
             };
         }
         else if ((user === null || user === void 0 ? void 0 : user.fiscalYearId) && (user === null || user === void 0 ? void 0 : user.fiscalYearStart) && (user === null || user === void 0 ? void 0 : user.fiscalYearEnd)) {
-            // Flat fields format (current JWT structure from authController)
             const toDateStr = (v) => typeof v === 'string' ? v.slice(0, 10) : new Date(v).toISOString().slice(0, 10);
             req.fiscalYearFilter = {
                 id: user.fiscalYearId,
@@ -142,7 +148,7 @@ const loadSystemConfig = (req, res, next) => __awaiter(void 0, void 0, void 0, f
                 status: user.fiscalYearStatus || 'OPEN'
             };
         }
-        // Set branch context from JWT token (resolved at login time)
+        // 4. Set Branch Context from JWT Token
         if ((_b = req.user) === null || _b === void 0 ? void 0 : _b.branchId) {
             req.branchContext = {
                 branchId: req.user.branchId || null,
@@ -155,23 +161,30 @@ const loadSystemConfig = (req, res, next) => __awaiter(void 0, void 0, void 0, f
         next();
     }
     catch (error) {
-        console.error('Error loading system config:', error);
-        // Continue without config - better than blocking the request
-        next();
+        console.error('❌ Error loading system config:', error);
+        return res.status(500).json({
+            error: 'SYSTEM_CONFIG_ERROR',
+            message: 'Failed to load system configuration'
+        });
+    }
+    finally {
+        if (conn) {
+            conn.release();
+        }
     }
 });
 exports.loadSystemConfig = loadSystemConfig;
 /**
- * Middleware to validate transaction amount
- * Use this before allowing invoice/transaction creation
+ * Middleware to validate transaction amount.
+ * Saves approval status on req and req.body for backwards compatibility.
  */
 const validateTransactionAmountMiddleware = (amountField = 'total') => {
     return (req, res, next) => {
-        var _a, _b;
+        var _a, _b, _c;
         if (!req.user || !req.systemConfig) {
             return next();
         }
-        const amount = req.body[amountField];
+        const amount = (_a = req.body) === null || _a === void 0 ? void 0 : _a[amountField];
         if (typeof amount !== 'number') {
             return next();
         }
@@ -181,22 +194,21 @@ const validateTransactionAmountMiddleware = (amountField = 'total') => {
             return res.status(403).json({
                 error: 'TRANSACTION_LIMIT_EXCEEDED',
                 message: validation.reason || 'Transaction amount exceeds your limit',
-                limit: ((_b = (_a = req.systemConfig) === null || _a === void 0 ? void 0 : _a.transactionLimits) === null || _b === void 0 ? void 0 : _b[userRole]) || 0
+                limit: ((_c = (_b = req.systemConfig) === null || _b === void 0 ? void 0 : _b.transactionLimits) === null || _c === void 0 ? void 0 : _c[userRole]) || 0
             });
         }
         // Check if approval is needed
         if ((0, dataFiltering_1.needsApproval)(amount, req.systemConfig)) {
-            // Add flag to request body to mark as pending approval
-            req.body._needsApproval = true;
-            req.body._approvalStatus = 'PENDING';
+            req.approvalRequired = true;
+            req.body = Object.assign(Object.assign({}, req.body), { _needsApproval: true, _approvalStatus: 'PENDING' });
         }
         next();
     };
 };
 exports.validateTransactionAmountMiddleware = validateTransactionAmountMiddleware;
 /**
- * Middleware to check if user can modify a record
- * Use this for UPDATE and DELETE operations
+ * Middleware to check if user can modify a record.
+ * Restricts modifications to owners (matched by canonical username) or those with modify-all permissions.
  */
 const canModifyRecordMiddleware = (getRecordCreator) => {
     return (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
@@ -208,7 +220,7 @@ const canModifyRecordMiddleware = (getRecordCreator) => {
             if (!recordCreator) {
                 return res.status(404).json({ error: 'Record not found' });
             }
-            // Check if user owns the record
+            // Check if user owns the record (stable, unique username check)
             if (recordCreator === req.userFilterOptions.userName) {
                 return next();
             }
@@ -234,14 +246,14 @@ exports.canModifyRecordMiddleware = canModifyRecordMiddleware;
  */
 function getInvoiceCreator(req) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a;
-        const invoiceId = req.params.id || req.body.id;
+        var _a, _b;
+        const invoiceId = req.params.id || ((_a = req.body) === null || _a === void 0 ? void 0 : _a.id);
         if (!invoiceId)
             return null;
         const conn = yield (0, db_1.getConnection)();
         try {
             const [rows] = yield conn.query('SELECT createdBy FROM invoices WHERE id = ? LIMIT 1', [invoiceId]);
-            return ((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.createdBy) || null;
+            return ((_b = rows[0]) === null || _b === void 0 ? void 0 : _b.createdBy) || null;
         }
         finally {
             conn.release();
@@ -253,14 +265,14 @@ function getInvoiceCreator(req) {
  */
 function getJournalCreator(req) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a;
-        const journalId = req.params.id || req.body.id;
+        var _a, _b;
+        const journalId = req.params.id || ((_a = req.body) === null || _a === void 0 ? void 0 : _a.id);
         if (!journalId)
             return null;
         const conn = yield (0, db_1.getConnection)();
         try {
             const [rows] = yield conn.query('SELECT createdBy FROM journal_entries WHERE id = ? LIMIT 1', [journalId]);
-            return ((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.createdBy) || null;
+            return ((_b = rows[0]) === null || _b === void 0 ? void 0 : _b.createdBy) || null;
         }
         finally {
             conn.release();
@@ -272,14 +284,14 @@ function getJournalCreator(req) {
  */
 function getChequeCreator(req) {
     return __awaiter(this, void 0, void 0, function* () {
-        var _a;
-        const chequeId = req.params.id || req.body.id;
+        var _a, _b;
+        const chequeId = req.params.id || ((_a = req.body) === null || _a === void 0 ? void 0 : _a.id);
         if (!chequeId)
             return null;
         const conn = yield (0, db_1.getConnection)();
         try {
             const [rows] = yield conn.query('SELECT createdBy FROM cheques WHERE id = ? LIMIT 1', [chequeId]);
-            return ((_a = rows[0]) === null || _a === void 0 ? void 0 : _a.createdBy) || null;
+            return ((_b = rows[0]) === null || _b === void 0 ? void 0 : _b.createdBy) || null;
         }
         finally {
             conn.release();
@@ -287,10 +299,12 @@ function getChequeCreator(req) {
     });
 }
 /**
- * Middleware for role-based access (enhanced version)
+ * Middleware for role-based access checking.
+ * Fail-secure: Defaults to denying access (level 0) for undefined roles.
  */
 const requireMinimumRole = (minRole) => {
     return (req, res, next) => {
+        var _a, _b;
         if (!req.user) {
             return res.status(401).json({ error: 'Unauthorized' });
         }
@@ -307,7 +321,9 @@ const requireMinimumRole = (minRole) => {
             'MAINTENANCE': 1,
             'PURCHASING': 2
         };
-        if (roleHierarchy[userRole] < roleHierarchy[minRole]) {
+        const userLevel = (_a = roleHierarchy[userRole]) !== null && _a !== void 0 ? _a : 0;
+        const minLevel = (_b = roleHierarchy[minRole]) !== null && _b !== void 0 ? _b : 99; // Default deny if minRole is invalid
+        if (userLevel < minLevel) {
             return res.status(403).json({
                 error: 'INSUFFICIENT_ROLE',
                 message: `This action requires ${minRole} role or higher`,
@@ -365,12 +381,12 @@ function cleanupOldAttempts(maxAgeHours = 24) {
     });
 }
 // Clean up every hour
-setInterval(() => cleanupOldAttempts(24), 60 * 60 * 1000);
-// ═══════════════════════════════════════════════════════════
-// Lock Date Enforcement Middleware (Odoo-style Continuous Accounting)
-// Prevents write operations on dates that fall within locked periods.
-// ═══════════════════════════════════════════════════════════
-const lockDateValidator_1 = require("../utils/lockDateValidator");
+const cleanupAttemptsInterval = setInterval(() => cleanupOldAttempts(24), 60 * 60 * 1000);
+// Hook to clear cleanup intervals on testing or shutdown
+const closePolicyCleanup = () => {
+    clearInterval(cleanupAttemptsInterval);
+};
+exports.closePolicyCleanup = closePolicyCleanup;
 /**
  * Factory that returns a middleware enforcing lock date checks.
  *

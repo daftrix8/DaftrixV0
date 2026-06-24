@@ -19,9 +19,11 @@ const fiscalYearUtils_1 = require("../utils/fiscalYearUtils");
 const policyEnforcement_1 = require("../utils/policyEnforcement");
 const branchFilter_1 = require("../utils/branchFilter");
 const invoiceNumberGenerator_1 = require("../utils/invoiceNumberGenerator");
+const journalValidationUtils_1 = require("../utils/journalValidationUtils");
 // GET all journal entries with pagination, filtering, and fiscal year isolation
 const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a, _b, _c, _d;
+    const authReq = req;
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 200;
@@ -33,6 +35,19 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const createdBy = req.query.createdBy;
         const costCenterId = req.query.costCenterId;
         const transactionFilter = req.query.transactionFilter;
+        // Sorting parameters with strict whitelisting to prevent SQL injection
+        const sortBy = req.query.sortBy || 'date';
+        const sortOrder = (req.query.sortOrder || 'DESC').toUpperCase() === 'ASC' ? 'ASC' : 'DESC';
+        const allowedSortCols = {
+            date: 'j.date',
+            referenceId: 'j.referenceId',
+            description: 'j.description',
+            createdBy: 'j.createdBy',
+            notes: 'j.notes',
+            debit: '(SELECT COALESCE(SUM(jl.debit), 0) FROM journal_lines jl WHERE jl.journalId = j.id)',
+            credit: '(SELECT COALESCE(SUM(jl.credit), 0) FROM journal_lines jl WHERE jl.journalId = j.id)'
+        };
+        const sortSql = allowedSortCols[sortBy] || 'j.date';
         const offset = (page - 1) * limit;
         const conn = yield (0, db_1.getConnection)();
         let whereConditions = [];
@@ -46,10 +61,13 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
         if (needsAccountPreResolve) {
             let acctFilter;
             if (accountFilter === 'CASH') {
-                acctFilter = "a.code LIKE '101%' OR (a.type = 'ASSET' AND (a.name LIKE '%صندوق%' OR a.name LIKE '%خزينة%' OR a.name LIKE '%نقدية%'))";
+                // Include 101% codes AND any account linked to a bank with bankType='TREASURY'
+                // (POS drawers may have 102xx codes but are still treasury/cash accounts)
+                acctFilter = "a.code LIKE '101%' OR (a.type = 'ASSET' AND (a.name LIKE '%صندوق%' OR a.name LIKE '%خزينة%' OR a.name LIKE '%نقدية%')) OR a.id IN (SELECT accountId FROM banks WHERE bankType = 'TREASURY')";
             }
             else if (accountFilter === 'BANK') {
-                acctFilter = "a.code LIKE '102%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND a.name LIKE '%بنك%')";
+                // Include 102% codes but EXCLUDE accounts that are actually treasury-type
+                acctFilter = "(a.code LIKE '102%' OR a.type = 'BANK' OR (a.type = 'ASSET' AND a.name LIKE '%بنك%')) AND a.id NOT IN (SELECT accountId FROM banks WHERE bankType = 'TREASURY')";
             }
             else if (accountFilter === 'CHEQUES') {
                 acctFilter = "a.code LIKE '106%' OR a.code LIKE '107%'";
@@ -124,7 +142,35 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 countParams.push(`%${categoryId}%`);
             }
         }
-        if (costCenterId) {
+        // Resolve branch vs cost center scope
+        let isBranchSelection = false;
+        if (costCenterId && costCenterId !== 'ALL') {
+            const [branchRows] = yield conn.query('SELECT 1 FROM branches WHERE id = ?', [costCenterId]);
+            if (branchRows && branchRows.length > 0) {
+                isBranchSelection = true;
+            }
+        }
+        const { branchId: userBranchId, isPrivileged } = (0, branchFilter_1.resolveBranchScope)(authReq);
+        let effectiveBranchId = null;
+        if (!isPrivileged && userBranchId) {
+            effectiveBranchId = userBranchId;
+        }
+        else if (isBranchSelection) {
+            effectiveBranchId = costCenterId;
+        }
+        // Apply comprehensive branch filter if effectiveBranchId is resolved
+        if (effectiveBranchId) {
+            whereConditions.push(`(
+                j.branchId = ?
+                OR EXISTS (SELECT 1 FROM journal_lines jlf WHERE jlf.journalId = j.id AND jlf.costCenterId = ?)
+                OR EXISTS (SELECT 1 FROM journal_lines jlf JOIN banks bk ON jlf.accountId = bk.accountId WHERE jlf.journalId = j.id AND bk.branchId = ?)
+                OR EXISTS (SELECT 1 FROM invoices inv WHERE inv.id = j.referenceId AND (inv.branchId = ? OR inv.warehouseId IN (SELECT id FROM warehouses WHERE branchId = ?)))
+            )`);
+            params.push(effectiveBranchId, effectiveBranchId, effectiveBranchId, effectiveBranchId, effectiveBranchId);
+            countParams.push(effectiveBranchId, effectiveBranchId, effectiveBranchId, effectiveBranchId, effectiveBranchId);
+        }
+        // If the costCenterId is a cost center (not a branch), apply the cost center filter
+        if (costCenterId && costCenterId !== 'ALL' && !isBranchSelection) {
             whereConditions.push('EXISTS (SELECT 1 FROM journal_lines jlf WHERE jlf.journalId = j.id AND jlf.costCenterId = ?)');
             params.push(costCenterId);
             countParams.push(costCenterId);
@@ -244,29 +290,15 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
         // When startDate/endDate are also provided, they are already applied above.
         // The fiscal year filter acts as an outer clamp to prevent cross-year data leakage.
         // Without this, a user on fiscal year 2023-2024 could search and see 2025 journal entries.
-        const authReq = req;
         if (authReq.fiscalYearFilter) {
             whereConditions.push('j.date >= ? AND j.date <= ?');
             params.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
             countParams.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
         }
-        // BRANCH ISOLATION — non-privileged users see only their branch's journal entries
-        {
-            const branchConditions = [];
-            const branchParams = [];
-            (0, branchFilter_1.appendBranchFilter)(branchConditions, branchParams, authReq, 'j');
-            if (branchConditions.length > 0) {
-                whereConditions.push(branchConditions[0]);
-                params.push(...branchParams);
-                countParams.push(...branchParams);
-            }
-        }
-        // DEDUP: Keep only one journal entry per referenceId to prevent duplicates
-        // For entries with the same referenceId, keep the latest (largest id)
-        // NOTE: Some MySQL/MariaDB versions have issues with correlated subqueries referencing
-        // outer table aliases. We wrap this in a flag so we can retry without it if needed.
-        const dedupCondition = `(j.referenceId IS NULL OR j.referenceId = '' OR j.referenceId = 'MANUAL' OR NOT EXISTS (SELECT 1 FROM journal_entries j2 WHERE j2.referenceId = j.referenceId AND j2.referenceId IS NOT NULL AND j2.referenceId != '' AND j2.referenceId != 'MANUAL' AND j2.id > j.id))`;
-        whereConditions.push(dedupCondition);
+        // DEDUP logic removed because a single invoice/referenceId can legitimately have
+        // multiple journal entries (e.g. split payments, revenue, COGS).
+        // If we only keep the latest entry per referenceId, we silently hide cash movements.
+        // Old superseded entries are explicitly deleted by invoiceController anyway.
         const whereClause = whereConditions.length > 0 ? ' WHERE ' + whereConditions.join(' AND ') : '';
         // PERF: Simple LEFT JOIN on primary key only (index-based, instant lookup).
         // We try to COALESCE journal_entries.notes with the linked invoice notes.
@@ -281,7 +313,7 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
                 FROM journal_entries j
                 LEFT JOIN invoices i2 ON i2.id = j.referenceId
                 ${whereClause}
-                ORDER BY j.date DESC, j.id DESC LIMIT ? OFFSET ?`;
+                ORDER BY ${sortSql} ${sortOrder}, j.id DESC LIMIT ? OFFSET ?`;
             // Compact debug line — only in dev mode, single line per request
             if (process.env.NODE_ENV === 'development') {
                 console.log(`[journalController] filters=${transactionFilter || '-'}/${accountFilter || '-'} conditions=${whereConditions.length} fy=${req.fiscalYearFilter ? 'yes' : 'NO'}`);
@@ -302,16 +334,14 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
             if (queryErr.code === 'ER_BAD_FIELD_ERROR' ||
                 ((_a = queryErr.message) === null || _a === void 0 ? void 0 : _a.includes('Unknown column'))) {
                 console.warn(`[journalController] ER_BAD_FIELD_ERROR — retrying with simplified query. Error: ${queryErr.message}`);
-                // Strip the DEDUP condition and notes column for maximum compatibility
-                const safeConditions = whereConditions.filter(c => c !== dedupCondition);
-                const safeWhereClause = safeConditions.length > 0 ? ' WHERE ' + safeConditions.join(' AND ') : '';
-                // Also strip DEDUP params (DEDUP has no params, so countParams/params stay the same)
+                // Strip notes column for maximum compatibility
+                const safeWhereClause = whereConditions.length > 0 ? ' WHERE ' + whereConditions.join(' AND ') : '';
                 [[countResult], [rows]] = yield Promise.all([
                     conn.query(`SELECT COUNT(*) as total FROM journal_entries j${safeWhereClause}`, countParams),
                     conn.query(`SELECT j.id, j.date, j.description, j.referenceId, j.createdBy,
                          j.currencyCode, j.exchangeRate, j.denominations
                          FROM journal_entries j${safeWhereClause}
-                         ORDER BY j.date DESC, j.id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]),
+                         ORDER BY ${sortSql} ${sortOrder}, j.id DESC LIMIT ? OFFSET ?`, [...params, limit, offset]),
                 ]);
             }
             else {
@@ -362,7 +392,12 @@ const getJournalEntries = (req, res) => __awaiter(void 0, void 0, void 0, functi
             createdBy: row.createdBy,
             currencyCode: row.currencyCode || 'EGP',
             exchangeRate: parseFloat(row.exchangeRate) || 1,
-            denominations: row.denominations ? (typeof row.denominations === 'string' ? JSON.parse(row.denominations) : row.denominations) : undefined,
+            denominations: (() => { try {
+                return row.denominations && row.denominations !== 'NULL' && typeof row.denominations === 'string' ? JSON.parse(row.denominations) : row.denominations || undefined;
+            }
+            catch (_a) {
+                return undefined;
+            } })(),
             notes: row.notes || undefined,
             lines: linesMap.get(row.id) || []
         }));
@@ -401,14 +436,20 @@ const createJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const { date, description, notes, lines, currencyCode, exchangeRate, denominations, referenceId: reqReferenceId } = req.body;
         const authReq = req;
         const createdBy = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.username) || ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
-        // Validate balanced entry
-        const totalDebit = lines.reduce((sum, l) => sum + (Number(l.debit) || 0), 0);
-        const totalCredit = lines.reduce((sum, l) => sum + (Number(l.credit) || 0), 0);
-        if (Math.abs(totalDebit - totalCredit) > 0.01) {
-            conn.release();
-            return res.status(400).json({ error: 'Journal entry must be balanced. Total debits must equal total credits.' });
+        // Validate balanced entry using strict double-entry rule
+        let balancedLines;
+        try {
+            balancedLines = (0, journalValidationUtils_1.assertBalanced)(lines);
         }
-        if (!lines || lines.length < 2) {
+        catch (err) {
+            conn.release();
+            return res.status(400).json({
+                error: err.message,
+                code: err.code || 'UNBALANCED_ENTRY',
+                context: err.context
+            });
+        }
+        if (!balancedLines || balancedLines.length < 2) {
             conn.release();
             return res.status(400).json({ error: 'Journal entry must have at least 2 lines.' });
         }
@@ -448,14 +489,14 @@ const createJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [id, date, description, notes || null, finalReferenceId, createdBy, currencyCode || 'EGP', exchangeRate || 1,
             denominations ? JSON.stringify(denominations) : null, (0, branchFilter_1.resolveBranchIdForWrite)(req)]);
         // PERF: Batch insert all lines + batch update account balances (was 2N queries, now 3)
-        const lineValues = lines.map((line) => [
+        const lineValues = balancedLines.map((line) => [
             id, line.accountId, line.accountName, line.debit || 0, line.credit || 0,
             line.costCenterId || null, line.foreignDebit || 0, line.foreignCredit || 0,
             line.currencyCode || null, line.exchangeRate || null
         ]);
         yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, costCenterId, foreignDebit, foreignCredit, currencyCode, exchangeRate) VALUES ?`, [lineValues]);
         // Batch-load account types for all lines in ONE query
-        const uniqueAccountIds = [...new Set(lines.map((l) => l.accountId).filter(Boolean))];
+        const uniqueAccountIds = [...new Set(balancedLines.map((l) => l.accountId).filter(Boolean))];
         const accountTypeMap = new Map();
         if (uniqueAccountIds.length > 0) {
             const [accTypeRows] = yield conn.query(`SELECT id, type FROM accounts WHERE id IN (?)`, [uniqueAccountIds]);
@@ -464,7 +505,7 @@ const createJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
             }
         }
         // Batch-update all account balances
-        for (const line of lines) {
+        for (const line of balancedLines) {
             const accType = accountTypeMap.get(line.accountId);
             let balanceChange = 0;
             if (accType === 'ASSET' || accType === 'EXPENSE') {
@@ -483,7 +524,7 @@ const createJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         }
         catch (e) { }
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'journals', updatedBy: createdBy });
-        res.status(201).json({ id, date, description, referenceId: null, createdBy, currencyCode: currencyCode || 'EGP', exchangeRate: exchangeRate || 1, lines });
+        res.status(201).json({ id, date, description, referenceId: null, createdBy, currencyCode: currencyCode || 'EGP', exchangeRate: exchangeRate || 1, lines: balancedLines });
     }
     catch (error) {
         yield conn.rollback();
@@ -504,12 +545,18 @@ const updateJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const { date, description, notes, lines, currencyCode, exchangeRate, denominations } = req.body;
         const authReq = req;
         const updatedBy = ((_a = authReq.user) === null || _a === void 0 ? void 0 : _a.username) || ((_b = authReq.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
-        // Validate balanced entry
-        const totalDebit = lines.reduce((sum, l) => sum + (Number(l.debit) || 0), 0);
-        const totalCredit = lines.reduce((sum, l) => sum + (Number(l.credit) || 0), 0);
-        if (Math.abs(totalDebit - totalCredit) > 0.01) {
+        // Validate balanced entry using strict double-entry rule
+        let balancedLines;
+        try {
+            balancedLines = (0, journalValidationUtils_1.assertBalanced)(lines);
+        }
+        catch (err) {
             conn.release();
-            return res.status(400).json({ error: 'Journal entry must be balanced.' });
+            return res.status(400).json({
+                error: err.message,
+                code: err.code || 'UNBALANCED_ENTRY',
+                context: err.context
+            });
         }
         // === FISCAL YEAR GUARD ===
         const fyCheck = yield (0, fiscalYearUtils_1.validateFiscalYearOpen)(date);
@@ -556,14 +603,14 @@ const updateJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         // 3. Update the entry header
         yield conn.query('UPDATE journal_entries SET date = ?, description = ?, notes = ?, currencyCode = ?, exchangeRate = ?, denominations = ? WHERE id = ?', [date, description, notes || null, currencyCode, exchangeRate || 1, denominations ? JSON.stringify(denominations) : null, id]);
         // 4. PERF: Batch insert new lines + batch update balances (was 2N queries, now 3)
-        const updateLineValues = lines.map((line) => [
+        const updateLineValues = balancedLines.map((line) => [
             id, line.accountId, line.accountName, line.debit || 0, line.credit || 0,
             line.costCenterId || null, line.foreignDebit || 0, line.foreignCredit || 0,
             line.currencyCode || null, line.exchangeRate || null
         ]);
         yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit, costCenterId, foreignDebit, foreignCredit, currencyCode, exchangeRate) VALUES ?`, [updateLineValues]);
         // Batch-load account types
-        const updateAccountIds = [...new Set(lines.map((l) => l.accountId).filter(Boolean))];
+        const updateAccountIds = [...new Set(balancedLines.map((l) => l.accountId).filter(Boolean))];
         const updateAccTypeMap = new Map();
         if (updateAccountIds.length > 0) {
             const [accTypeRows] = yield conn.query(`SELECT id, type FROM accounts WHERE id IN (?)`, [updateAccountIds]);
@@ -571,7 +618,7 @@ const updateJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 updateAccTypeMap.set(row.id, row.type);
             }
         }
-        for (const line of lines) {
+        for (const line of balancedLines) {
             const accType = updateAccTypeMap.get(line.accountId);
             let balanceChange = 0;
             if (accType === 'ASSET' || accType === 'EXPENSE') {
@@ -590,7 +637,7 @@ const updateJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         }
         catch (e) { }
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'journals', updatedBy });
-        res.json({ id, date, description, lines, currencyCode, exchangeRate });
+        res.json({ id, date, description, lines: balancedLines, currencyCode, exchangeRate });
     }
     catch (error) {
         yield conn.rollback();
@@ -660,6 +707,41 @@ const deleteJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
                 yield conn.query('DELETE FROM invoice_lines WHERE invoiceId = ?', [linkedInv.id]);
                 yield conn.query('DELETE FROM invoices WHERE id = ?', [linkedInv.id]);
                 console.log(`🗑️ CASCADE: Deleted linked ${linkedInv.type} invoice ${linkedInv.id} (${linkedInv.total})`);
+            }
+            // 4b. CASCADE: Delete linked POS expense, cash movement, and employee advance if exists
+            const [expRows] = yield conn.query(`SELECT * FROM pos_expenses WHERE id = ?`, [entry.referenceId]);
+            const expense = expRows[0];
+            if (expense) {
+                console.log(`🗑️ CASCADE: Found linked POS expense ${expense.id} for journal entry ${id}. Deleting linked records...`);
+                // 1. Delete employee advance if exists
+                if (expense.entityType === 'EMPLOYEE' && expense.entityId) {
+                    const dateStr = expense.createdAt instanceof Date
+                        ? expense.createdAt.toISOString().split('T')[0]
+                        : String(expense.createdAt).split('T')[0];
+                    const [advances] = yield conn.query(`SELECT id FROM employee_advances
+                         WHERE employeeId = ? AND amount = ? AND status = 'ACTIVE'
+                           AND (issueDate = ? OR ABS(DATEDIFF(issueDate, ?)) <= 1)`, [expense.entityId, expense.amount, dateStr, dateStr]);
+                    if (advances.length > 0) {
+                        const advanceIds = advances.map((a) => a.id);
+                        const ph = advanceIds.map(() => '?').join(',');
+                        yield conn.query(`DELETE FROM employee_advances WHERE id IN (${ph})`, advanceIds);
+                    }
+                }
+                // 2. Delete linked cash movement from pos_cash_movements
+                yield conn.query(`DELETE FROM pos_cash_movements
+                     WHERE shiftId = ? AND type = 'EXPENSE' AND referenceId = ?`, [expense.shiftId, expense.id]).catch(() => { });
+                // Fallback delete
+                yield conn.query(`DELETE FROM pos_cash_movements
+                     WHERE shiftId = ? AND type = 'EXPENSE' AND amount = ?
+                     ORDER BY createdAt DESC LIMIT 1`, [expense.shiftId, expense.amount]).catch(() => { });
+                // 3. Delete linked invoice (supplier/customer payment voucher) if exists
+                yield conn.query(`DELETE FROM invoice_lines WHERE invoiceId IN (SELECT id FROM invoices WHERE referenceInvoiceId = ?)`, [expense.id]).catch(() => { });
+                yield conn.query(`DELETE FROM invoices WHERE referenceInvoiceId = ?`, [expense.id]).catch(() => { });
+                // 4. Delete the POS expense itself
+                yield conn.query(`DELETE FROM pos_expenses WHERE id = ?`, [expense.id]);
+                // 5. Recalculate shift totals so expectedCash and variance stay accurate
+                const { recalculateShiftTotals } = require('./posController');
+                yield recalculateShiftTotals(conn, expense.shiftId, deletedBy);
             }
         }
         yield conn.commit();

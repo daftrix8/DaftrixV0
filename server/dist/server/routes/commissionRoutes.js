@@ -32,4 +32,7 @@ router.post('/customers/bulk', (0, authMiddleware_1.requirePermission)('master.s
 router.delete('/customers/:id', (0, authMiddleware_1.requirePermission)('master.salesmen'), commissionController_1.unassignCustomer);
 // =================== REPORTS ===================
 router.get('/report/salesman', (0, authMiddleware_1.requirePermission)('salesteam.commissions'), commissionController_1.getSalesmanCommissionReport);
+// =================== MEMBERSHIP COMMISSIONS ===================
+router.get('/memberships', (0, authMiddleware_1.requirePermission)('salesteam.commissions'), commissionController_1.getMembershipCommissions);
+router.post('/memberships/:id/pay', (0, authMiddleware_1.requirePermission)('salesteam.commissions'), commissionController_1.payMembershipCommission);
 exports.default = router;

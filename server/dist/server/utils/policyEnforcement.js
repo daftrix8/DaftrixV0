@@ -31,6 +31,7 @@ exports.validateCreditLimit = validateCreditLimit;
 exports.validateTransaction = validateTransaction;
 exports.validateTransactionAsync = validateTransactionAsync;
 exports.validateTransactionFull = validateTransactionFull;
+exports.enforceOverdraftCheck = enforceOverdraftCheck;
 const db_1 = require("../db");
 /**
  * Validate fiscal lock date
@@ -271,8 +272,11 @@ function validateModifyOthersData(originalCreator, currentUser, currentUserRole,
     if (originalCreator === currentUser) {
         return { valid: true };
     }
-    // MASTER_ADMIN can always modify
-    if (currentUserRole === 'MASTER_ADMIN') {
+    // Administrative roles (MASTER_ADMIN, ADMIN, GENERAL_MANAGER) can always modify others' data
+    const normalizedRole = currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase();
+    if (normalizedRole === 'MASTER_ADMIN' ||
+        normalizedRole === 'ADMIN' ||
+        normalizedRole === 'GENERAL_MANAGER') {
         return { valid: true };
     }
     // Check if modification of others' data is enabled
@@ -342,14 +346,16 @@ function validateNegativeStock(lines, transactionType, config, existingConn, war
                 // query BOTH filtered and unfiltered totals. Cross-check against
                 // product_stocks and products.stock caches. Use MAX to prevent
                 // false lockouts when any single source drifts or is incomplete.
-                // Always get product name + total movements across all warehouses
-                const [totalRows] = yield conn.query(`SELECT COALESCE(SUM(sm.qty_change), 0) as totalStock, p.stock as globalStock, p.name
+                const [totalRows] = yield conn.query(`SELECT COALESCE(SUM(sm.qty_change), 0) as totalStock, p.stock as globalStock, p.name, p.type
                  FROM products p
                  LEFT JOIN stock_movements sm ON sm.product_id = p.id
                  WHERE p.id = ?`, [line.productId]);
                 const totalRow = totalRows[0];
                 if (!(totalRow === null || totalRow === void 0 ? void 0 : totalRow.name)) {
                     productName = `Unknown (${line.productId})`;
+                    continue;
+                }
+                if (totalRow.type === 'SERVICE' || totalRow.type === 'خدمة') {
                     continue;
                 }
                 productName = totalRow.name;
@@ -524,6 +530,37 @@ function validateTransactionFull(context, config, existingConn) {
         const asyncResult = yield validateTransactionAsync(context, config, existingConn);
         if (!asyncResult.valid)
             return asyncResult;
+        return { valid: true };
+    });
+}
+/**
+ * Enforce overdraft check for bank/cash accounts
+ * التحقق من رصيد الحسابات البنكية أو الخزينة لمنع السحب على المكشوف
+ */
+function enforceOverdraftCheck(accountIds, config, conn) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!config || !config.preventBankOverdraft)
+            return { valid: true };
+        const uniqueIds = Array.from(new Set(accountIds.filter(Boolean)));
+        if (uniqueIds.length === 0)
+            return { valid: true };
+        const [rows] = yield conn.query(`SELECT a.id, a.name, a.code, a.type,
+            COALESCE(a.openingBalance, 0) + 
+            COALESCE((SELECT SUM(jl.debit) - SUM(jl.credit) FROM journal_lines jl WHERE jl.accountId = a.id), 0) as balance
+         FROM accounts a WHERE a.id IN (?)`, [uniqueIds]);
+        for (const row of rows) {
+            const isCashOrBank = row.type === 'ASSET' && (row.code.startsWith('101') || row.code.startsWith('102') ||
+                row.name.includes('خزينة') || row.name.includes('صندوق') || row.name.includes('بنك'));
+            if (!isCashOrBank)
+                continue;
+            if (Number(row.balance) < 0) {
+                return {
+                    valid: false,
+                    error: `رصيد الحساب غير كافٍ لإجراء هذه العملية. الحساب: ${row.name}، الرصيد المتبقي بعد العملية: ${Number(row.balance).toFixed(2)}`,
+                    errorCode: 'INSUFFICIENT_BANK_BALANCE'
+                };
+            }
+        }
         return { valid: true };
     });
 }

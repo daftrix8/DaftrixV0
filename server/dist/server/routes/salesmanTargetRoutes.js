@@ -11,6 +11,8 @@ const router = express_1.default.Router();
 router.get('/stats', (0, authMiddleware_1.requirePermission)('salesteam.view'), salesmanTargetController_1.getAllSalesmanStats);
 // Get stats for a specific salesman
 router.get('/stats/:salesmanId', (0, authMiddleware_1.requirePermission)('salesteam.view'), salesmanTargetController_1.getSalesmanStats);
+// Get detailed transaction activity for a specific salesman
+router.get('/stats/:salesmanId/details', (0, authMiddleware_1.requirePermission)('salesteam.view'), salesmanTargetController_1.getSalesmanActivityDetails);
 // Get all targets (bare path — used by SalesmanReports.tsx for commission rate hierarchy)
 router.get('/', (0, authMiddleware_1.requirePermission)('salesteam.view'), salesmanTargetController_1.getAllActiveTargets);
 // Get all active targets

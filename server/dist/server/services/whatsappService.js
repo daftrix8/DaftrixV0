@@ -8,18 +8,23 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.formatEgyptianPhone = formatEgyptianPhone;
 exports.getSettings = getSettings;
 exports.isWhatsAppEnabled = isWhatsAppEnabled;
 exports.sendTextMessage = sendTextMessage;
 exports.sendTemplateMessage = sendTemplateMessage;
+exports.uploadMedia = uploadMedia;
 exports.sendDocument = sendDocument;
 exports.getMessageLogs = getMessageLogs;
 exports.updateMessageStatus = updateMessageStatus;
 exports.logInboundMessage = logInboundMessage;
 const db_1 = require("../db");
 const uuid_1 = require("uuid");
+const fs_1 = __importDefault(require("fs"));
 // ═══════════════════════════════════════════════════════════
 // WhatsApp Cloud API Service
 // Direct HTTP calls to Meta Graph API — no third-party libs
@@ -192,17 +197,53 @@ function sendTemplateMessage(payload) {
         });
     });
 }
+/** Upload a local file to Meta Media API and return the media ID */
+function uploadMedia(filePath, filename) {
+    return __awaiter(this, void 0, void 0, function* () {
+        var _a;
+        const creds = yield resolveCredentials();
+        if (!creds) {
+            throw new Error('WhatsApp credentials not configured');
+        }
+        const url = `${BASE_URL}/${API_VERSION}/${creds.phoneNumberId}/media`;
+        const fileBuffer = fs_1.default.readFileSync(filePath);
+        const fileBlob = new Blob([fileBuffer], { type: 'application/pdf' });
+        const formData = new FormData();
+        formData.append('messaging_product', 'whatsapp');
+        formData.append('file', fileBlob, filename);
+        formData.append('type', 'application/pdf');
+        const response = yield fetch(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${creds.accessToken}`,
+            },
+            body: formData,
+        });
+        const data = yield response.json();
+        if (!response.ok) {
+            const errorMsg = ((_a = data === null || data === void 0 ? void 0 : data.error) === null || _a === void 0 ? void 0 : _a.message) || `HTTP ${response.status}`;
+            throw new Error(`Meta Media Upload failed: ${errorMsg}`);
+        }
+        return data.id;
+    });
+}
 function sendDocument(payload) {
     return __awaiter(this, void 0, void 0, function* () {
+        const documentObj = {
+            filename: payload.filename,
+            caption: payload.caption || '',
+        };
+        if (payload.mediaId) {
+            documentObj.id = payload.mediaId;
+        }
+        else {
+            documentObj.link = payload.documentUrl;
+        }
         const body = {
             messaging_product: 'whatsapp',
             to: payload.to,
             type: 'document',
-            document: {
-                link: payload.documentUrl,
-                filename: payload.filename,
-                caption: payload.caption || '',
-            },
+            document: documentObj,
         };
         return sendToMeta(body, {
             toPhone: payload.to,

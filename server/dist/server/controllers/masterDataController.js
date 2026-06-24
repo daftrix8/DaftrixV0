@@ -98,7 +98,9 @@ const createCrudHandlers = (tableName) => ({
             const keys = Object.keys(data).filter(k => k !== 'id');
             // Duplicate Name Check
             if (data.name) {
-                const [existing] = yield db_1.pool.query(`SELECT id FROM ${tableName} WHERE name = ? AND id != ? LIMIT 1`, [data.name, id]);
+                const normalizedName = data.name.trim();
+                const compactedName = normalizedName.replace(/\s+/g, ' ');
+                const [existing] = yield db_1.pool.query(`SELECT id FROM ${tableName} WHERE (TRIM(name) = ? OR REPLACE(TRIM(name), "  ", " ") = ?) AND id != ? LIMIT 1`, [normalizedName, compactedName, id]);
                 if (existing.length > 0) {
                     return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
                 }
@@ -137,7 +139,9 @@ const createCrudHandlers = (tableName) => ({
             const keys = Object.keys(data).filter(k => k !== 'id' && !COMPUTED_FIELDS.has(k));
             // Duplicate Name Check
             if (data.name) {
-                const [existing] = yield db_1.pool.query(`SELECT id FROM ${tableName} WHERE name = ? AND id != ? LIMIT 1`, [data.name, id]);
+                const normalizedName = data.name.trim();
+                const compactedName = normalizedName.replace(/\s+/g, ' ');
+                const [existing] = yield db_1.pool.query(`SELECT id FROM ${tableName} WHERE (TRIM(name) = ? OR REPLACE(TRIM(name), "  ", " ") = ?) AND id != ? LIMIT 1`, [normalizedName, compactedName, id]);
                 if (existing.length > 0) {
                     return res.status(400).json({ code: 'DUPLICATE_NAME', message: 'هذا الاسم مسجل مسبقاً، يرجى اختيار اسم آخر.' });
                 }

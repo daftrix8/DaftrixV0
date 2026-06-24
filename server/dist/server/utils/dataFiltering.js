@@ -29,30 +29,34 @@ exports.getUserSalesmanId = getUserSalesmanId;
  * Determines if a user can see all data based on their role and system configuration
  */
 function canSeeAllData(userRole, systemConfig) {
+    const role = (userRole || '').toUpperCase();
     // If data isolation is not enabled, everyone can see all data
     if (!(systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.enableUserDataIsolation)) {
         return true;
     }
     // MASTER_ADMIN always sees everything
-    if (userRole === 'MASTER_ADMIN') {
+    if (role === 'MASTER_ADMIN') {
         return true;
     }
     // Check if this role is in the whitelist
     const allowedRoles = (systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.whoCanSeeAllData) || ['MASTER_ADMIN', 'ADMIN', 'GENERAL_MANAGER'];
-    return allowedRoles.includes(userRole);
+    const normalizedAllowedRoles = allowedRoles.map(r => r.toUpperCase());
+    return normalizedAllowedRoles.includes(role);
 }
 /**
  * Determines if a user can modify data created by others
  */
 function canModifyOthersData(userRole, systemConfig) {
+    const role = (userRole || '').toUpperCase();
     // If modify others is not enabled, only creators can modify
     if (!(systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.enableModifyOthersData)) {
         // But MASTER_ADMIN, ADMIN, and GENERAL_MANAGER always can
-        return userRole === 'MASTER_ADMIN' || userRole === 'ADMIN' || userRole === 'GENERAL_MANAGER';
+        return role === 'MASTER_ADMIN' || role === 'ADMIN' || role === 'GENERAL_MANAGER';
     }
     // Check if this role is in the whitelist
     const allowedRoles = (systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.whoCanModifyOthersData) || ['MASTER_ADMIN', 'ADMIN', 'GENERAL_MANAGER'];
-    return allowedRoles.includes(userRole);
+    const normalizedAllowedRoles = allowedRoles.map(r => r.toUpperCase());
+    return normalizedAllowedRoles.includes(role);
 }
 /**
  * Builds SQL WHERE clause for filtering data by user.
@@ -99,8 +103,9 @@ function buildUserFilterClause(tableName, options, additionalConditions = '') {
  * Validates if user can create a transaction based on amount limits
  */
 function validateTransactionAmount(amount, userRole, systemConfig) {
+    const normalizedRole = (userRole || '').toUpperCase();
     // MASTER_ADMIN, ADMIN, and GENERAL_MANAGER have no limits
-    if (userRole === 'MASTER_ADMIN' || userRole === 'ADMIN' || userRole === 'GENERAL_MANAGER') {
+    if (normalizedRole === 'MASTER_ADMIN' || normalizedRole === 'ADMIN' || normalizedRole === 'GENERAL_MANAGER') {
         return { allowed: true };
     }
     // Check if limits are enabled
@@ -110,7 +115,7 @@ function validateTransactionAmount(amount, userRole, systemConfig) {
     // Get limit for this role
     const limits = systemConfig === null || systemConfig === void 0 ? void 0 : systemConfig.transactionLimits;
     let limit = 0;
-    switch (userRole) {
+    switch (normalizedRole) {
         case 'CASHIER':
         case 'SALES':
             limit = (limits === null || limits === void 0 ? void 0 : limits.SALES) || 0;
@@ -202,8 +207,14 @@ function escapeSqlString(value) {
  * Builds parameterized query filter
  */
 function buildParameterizedFilter(options) {
-    const { userRole, userName, systemConfig } = options;
-    if (!userRole || !userName || canSeeAllData(userRole, systemConfig)) {
+    const { userRole, userName, systemConfig, canSeeAll } = options;
+    if (!userRole || !userName) {
+        return { clause: '', params: [] };
+    }
+    const effectiveCanSeeAll = canSeeAll !== undefined
+        ? canSeeAll
+        : canSeeAllData(userRole, systemConfig);
+    if (effectiveCanSeeAll) {
         return { clause: '', params: [] };
     }
     return {
@@ -225,6 +236,8 @@ function checkSecurityPolicies(systemConfig) {
  * Role hierarchy check - useful for permission checks
  */
 function hasHigherOrEqualRole(userRole, requiredRole) {
+    const uRole = (userRole || '').toUpperCase();
+    const reqRole = (requiredRole || '').toUpperCase();
     const roleHierarchy = {
         'MASTER_ADMIN': 5,
         'GENERAL_MANAGER': 4,
@@ -237,7 +250,7 @@ function hasHigherOrEqualRole(userRole, requiredRole) {
         'MAINTENANCE': 1,
         'PURCHASING': 2
     };
-    return roleHierarchy[userRole] >= roleHierarchy[requiredRole];
+    return roleHierarchy[uRole] >= roleHierarchy[reqRole];
 }
 /**
  * Get all entities that should be filtered by user

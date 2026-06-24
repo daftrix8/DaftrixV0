@@ -9,7 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getSalesmanStats = exports.getAllSalesmanStats = exports.getTargetProgressReport = exports.updateTargetAchievement = exports.deleteSalesmanTarget = exports.updateSalesmanTarget = exports.createSalesmanTarget = exports.getAllActiveTargets = exports.getSalesmanTargets = void 0;
+exports.getSalesmanActivityDetails = exports.getSalesmanStats = exports.getAllSalesmanStats = exports.getTargetProgressReport = exports.updateTargetAchievement = exports.deleteSalesmanTarget = exports.updateSalesmanTarget = exports.createSalesmanTarget = exports.getAllActiveTargets = exports.getSalesmanTargets = void 0;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -379,6 +379,11 @@ const getAllSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, func
             dateFilter += ' AND i.date <= ?';
             dateParams.push(endDate);
         }
+        const settlementDateFilter = dateFilter.replace(/i\.date/g, 'vs.settlementDate');
+        const queryParams = [];
+        for (let i = 0; i < 11; i++) {
+            queryParams.push(...dateParams);
+        }
         // Get all salesmen with their stats
         const [rows] = yield conn.query(`
             SELECT 
@@ -457,43 +462,47 @@ const getAllSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, func
                 ), 0) as invoiceCount,
                 
                 -- Total Collections (إجمالي التحصيل)
-                -- المحصل = المبيعات النقدية + المدفوع جزئياً من الآجل
+                -- Sum of Receipts and Cash Sales in the period
                 COALESCE((
-                    SELECT SUM(
-                        CASE 
-                            WHEN i.paymentMethod = 'CASH' THEN i.total
-                            WHEN i.paymentMethod IN ('CREDIT', 'MIXED') THEN COALESCE(i.paidAmount, 0)
-                            ELSE COALESCE(i.paidAmount, 0)
-                        END
-                    )
+                    SELECT SUM(i.total)
                     FROM invoices i 
                     WHERE i.salesmanId = s.id 
                     AND i.status = 'POSTED'
-                    AND i.type IN ('INVOICE_SALE', 'SALE_INVOICE')
+                    AND (
+                        i.type = 'RECEIPT'
+                        OR (i.type IN ('INVOICE_SALE', 'SALE_INVOICE') AND i.paymentMethod = 'CASH')
+                    )
                     ${dateFilter}
                 ), 0) as totalCollections,
                 
                 -- Treasury Collections (التحصيل من الخزينة) - Skipped if table doesn't exist
                 0 as treasuryCollections,
                 
-                -- Customer Debt (مديونية العملاء الذين لديهم فواتير مع المندوب)
-                -- Calculate from partners who have invoices with this salesman
-                COALESCE((
-                    SELECT SUM(p.balance)
-                    FROM partners p 
-                    WHERE p.balance > 0
-                    AND p.isCustomer = 1
-                    AND (
-                        p.salesmanId = s.id 
-                        OR p.id IN (
-                            SELECT DISTINCT i.partnerId 
-                            FROM invoices i 
-                            WHERE i.salesmanId = s.id 
-                            AND i.type IN ('INVOICE_SALE', 'SALE_INVOICE')
-                            AND i.status = 'POSTED'
+                -- Customer Debt (الديون الناتجة عن الفترة)
+                -- Net Credit Sales in the period - Receipts in the period
+                GREATEST(0, 
+                    COALESCE((
+                        SELECT SUM(
+                            CASE 
+                                WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN i.total 
+                                WHEN i.type = 'RETURN_SALE' THEN -i.total
+                                ELSE 0 
+                            END
                         )
-                    )
-                ), 0) as totalCustomerDebt,
+                        FROM invoices i 
+                        WHERE i.salesmanId = s.id 
+                        AND i.status = 'POSTED'
+                        AND i.paymentMethod = 'CREDIT'
+                        ${dateFilter}
+                    ), 0) - COALESCE((
+                        SELECT SUM(i.total)
+                        FROM invoices i 
+                        WHERE i.salesmanId = s.id 
+                        AND i.status = 'POSTED'
+                        AND i.type = 'RECEIPT'
+                        ${dateFilter}
+                    ), 0)
+                ) as totalCustomerDebt,
                 
                 -- Customer Count (عدد العملاء)
                 COALESCE((
@@ -525,16 +534,16 @@ const getAllSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, func
                 COALESCE((
                     SELECT SUM(ABS(vs.cashDifference))
                     FROM vehicle_settlements vs
-                    JOIN vehicles v ON vs.vehicleId = v.id
-                    WHERE v.salesmanId = s.id
+                    WHERE vs.salesmanId = s.id
                     AND vs.cashDifference < 0
                     AND vs.status IN ('SUBMITTED', 'APPROVED')
+                    ${settlementDateFilter}
                 ), 0) as settlementDeficit
 
 
             FROM salesmen s
             ORDER BY s.name
-        `, [...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams]);
+        `, queryParams);
         // Calculate deficit for each salesman
         const statsWithDeficit = rows.map((row) => (Object.assign(Object.assign({}, row), { totalSales: Number(row.totalSales) || 0, totalCashSales: Number(row.totalCashSales) || 0, totalCreditSales: Number(row.totalCreditSales) || 0, totalChequeSales: Number(row.totalChequeSales) || 0, totalBankSales: Number(row.totalBankSales) || 0, invoiceCount: Number(row.invoiceCount) || 0, totalCollections: Number(row.totalCollections) || 0, treasuryCollections: Number(row.treasuryCollections) || 0, totalCustomerDebt: Number(row.totalCustomerDebt) || 0, customerCount: Number(row.customerCount) || 0, totalDiscounts: Number(row.totalDiscounts) || 0 })));
         // Finalize stats with calculated values
@@ -579,6 +588,12 @@ const getSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, functio
             dateFilter += ' AND i.date <= ?';
             dateParams.push(endDate);
         }
+        const settlementDateFilter = dateFilter.replace(/i\.date/g, 'vs.settlementDate');
+        const queryParams = [];
+        for (let i = 0; i < 9; i++) {
+            queryParams.push(...dateParams);
+        }
+        queryParams.push(salesmanId);
         // Get salesman stats
         const [rows] = yield conn.query(`
             SELECT 
@@ -635,38 +650,44 @@ const getSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 ), 0) as invoiceCount,
                 
                 -- Total Collections (إجمالي التحصيل)
+                -- Sum of Receipts and Cash Sales in the period
                 COALESCE((
-                    SELECT SUM(
-                        CASE 
-                            WHEN i.paymentMethod = 'CASH' THEN i.total
-                            WHEN i.paymentMethod IN ('CREDIT', 'MIXED') THEN COALESCE(i.paidAmount, 0)
-                            ELSE COALESCE(i.paidAmount, 0)
-                        END
-                    )
+                    SELECT SUM(i.total)
                     FROM invoices i 
                     WHERE i.salesmanId = s.id 
                     AND i.status = 'POSTED'
-                    AND i.type IN ('INVOICE_SALE', 'SALE_INVOICE')
+                    AND (
+                        i.type = 'RECEIPT'
+                        OR (i.type IN ('INVOICE_SALE', 'SALE_INVOICE') AND i.paymentMethod = 'CASH')
+                    )
                     ${dateFilter}
                 ), 0) as totalCollections,
                 
-                -- Customer Debt (مديونية العملاء الذين لديهم فواتير مع المندوب)
-                COALESCE((
-                    SELECT SUM(p.balance)
-                    FROM partners p 
-                    WHERE p.balance > 0
-                    AND p.isCustomer = 1
-                    AND (
-                        p.salesmanId = s.id 
-                        OR p.id IN (
-                            SELECT DISTINCT i.partnerId 
-                            FROM invoices i 
-                            WHERE i.salesmanId = s.id 
-                            AND i.type IN ('INVOICE_SALE', 'SALE_INVOICE')
-                            AND i.status = 'POSTED'
+                -- Customer Debt (الديون الناتجة عن الفترة)
+                -- Net Credit Sales in the period - Receipts in the period
+                GREATEST(0, 
+                    COALESCE((
+                        SELECT SUM(
+                            CASE 
+                                WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN i.total 
+                                WHEN i.type = 'RETURN_SALE' THEN -i.total
+                                ELSE 0 
+                            END
                         )
-                    )
-                ), 0) as totalCustomerDebt,
+                        FROM invoices i 
+                        WHERE i.salesmanId = s.id 
+                        AND i.status = 'POSTED'
+                        AND i.paymentMethod = 'CREDIT'
+                        ${dateFilter}
+                    ), 0) - COALESCE((
+                        SELECT SUM(i.total)
+                        FROM invoices i 
+                        WHERE i.salesmanId = s.id 
+                        AND i.status = 'POSTED'
+                        AND i.type = 'RECEIPT'
+                        ${dateFilter}
+                    ), 0)
+                ) as totalCustomerDebt,
                 
                 -- Customer Count
                 COALESCE((
@@ -698,21 +719,23 @@ const getSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 COALESCE((
                     SELECT SUM(ABS(vs.cashDifference))
                     FROM vehicle_settlements vs
-                    JOIN vehicles v ON vs.vehicleId = v.id
-                    WHERE v.salesmanId = s.id
+                    WHERE vs.salesmanId = s.id
                     AND vs.cashDifference < 0
                     AND vs.status IN ('SUBMITTED', 'APPROVED')
+                    ${settlementDateFilter}
                 ), 0) as settlementDeficit
 
             FROM salesmen s
             WHERE s.id = ?
-        `, [...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, ...dateParams, salesmanId]);
+        `, queryParams);
         conn.release();
         if (!rows || rows.length === 0) {
             return res.status(404).json({ error: 'Salesman not found' });
         }
         const row = rows[0];
-        const stats = Object.assign(Object.assign({}, row), { totalSales: Number(row.totalSales) || 0, totalCashSales: Number(row.totalCashSales) || 0, totalCreditSales: Number(row.totalCreditSales) || 0, invoiceCount: Number(row.invoiceCount) || 0, totalCollections: Number(row.totalCollections) || 0, totalCustomerDebt: Number(row.totalCustomerDebt) || 0, customerCount: Number(row.customerCount) || 0, totalDeficit: Number(row.settlementDeficit) || 0, totalDiscounts: Number(row.totalDiscounts) || 0 });
+        const stats = Object.assign(Object.assign({}, row), { totalSales: Number(row.totalSales) || 0, totalCashSales: Number(row.totalCashSales) || 0, totalCreditSales: Number(row.totalCreditSales) || 0, invoiceCount: Number(row.invoiceCount) || 0, totalCollections: Number(row.totalCollections) || 0, totalCustomerDebt: Number(row.totalCustomerDebt) || 0, customerCount: Number(row.customerCount) || 0, settlementDeficit: Number(row.settlementDeficit) || 0, totalDeficit: row.salesmanType === 'COLLECTION'
+                ? (Number(row.settlementDeficit) || 0)
+                : Math.max(0, (Number(row.totalCreditSales) || 0) - (Number(row.totalCollections) || 0)), totalDiscounts: Number(row.totalDiscounts) || 0 });
         res.json(stats);
     }
     catch (error) {
@@ -721,3 +744,144 @@ const getSalesmanStats = (req, res) => __awaiter(void 0, void 0, void 0, functio
     }
 });
 exports.getSalesmanStats = getSalesmanStats;
+// Helper to fetch salesman invoices
+function fetchSalesmanInvoices(conn, salesmanId, dateFilter, dateParams) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const [rows] = yield conn.query(`
+        SELECT id, number, date, partnerId, partnerName, type, paymentMethod, total, paidAmount, status, globalDiscount, discount
+        FROM invoices i
+        WHERE i.salesmanId = ?
+          AND i.status = 'POSTED'
+          AND i.type IN ('INVOICE_SALE', 'SALE_INVOICE', 'RETURN_SALE')
+          ${dateFilter}
+        ORDER BY i.date DESC
+    `, [salesmanId, ...dateParams]);
+        return rows;
+    });
+}
+// Helper to fetch salesman collections
+function fetchSalesmanCollections(conn, salesmanId, dateFilter, dateParams) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const [rows] = yield conn.query(`
+        SELECT i.id, i.number, i.date, i.partnerName, i.paymentMethod, i.type, i.referenceInvoiceId,
+               CASE 
+                   WHEN i.type = 'RECEIPT' THEN i.total 
+                   ELSE i.total 
+               END as collectedAmount
+        FROM invoices i
+        WHERE i.salesmanId = ?
+          AND i.status = 'POSTED'
+          AND (
+              i.type = 'RECEIPT'
+              OR (i.type IN ('INVOICE_SALE', 'SALE_INVOICE') AND i.paymentMethod = 'CASH')
+          )
+          ${dateFilter}
+        ORDER BY i.date DESC
+    `, [salesmanId, ...dateParams]);
+        return rows;
+    });
+}
+// Helper to fetch serviced customers
+function fetchServicedCustomers(conn, salesmanId, dateFilter, dateParams) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const [rows] = yield conn.query(`
+        SELECT p.id, p.name, p.phone, p.balance as currentBalance,
+               COUNT(DISTINCT CASE WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN i.id END) as salesCount,
+               COALESCE(SUM(CASE WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') THEN i.total END), 0) as totalPurchased,
+               COALESCE(SUM(CASE WHEN i.type = 'RETURN_SALE' THEN i.total END), 0) as totalReturned,
+               COALESCE(SUM(
+                   CASE 
+                       WHEN i.type = 'RECEIPT' THEN i.total 
+                       WHEN i.type IN ('INVOICE_SALE', 'SALE_INVOICE') AND i.paymentMethod = 'CASH' THEN i.total
+                       ELSE 0
+                   END
+               ), 0) as totalCollected
+        FROM partners p
+        JOIN invoices i ON i.partnerId = p.id
+        WHERE i.salesmanId = ?
+          AND i.status = 'POSTED'
+          ${dateFilter}
+        GROUP BY p.id, p.name, p.phone, p.balance
+        ORDER BY totalPurchased DESC
+    `, [salesmanId, ...dateParams]);
+        return rows;
+    });
+}
+// Helper to calculate activity metrics
+function calculateActivityMetrics(invoices, collections) {
+    const sales = invoices.filter((inv) => inv.type !== 'RETURN_SALE');
+    const returns = invoices.filter((inv) => inv.type === 'RETURN_SALE');
+    const totalSales = sales.reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+    const totalReturns = returns.reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+    const netSales = totalSales - totalReturns;
+    const cashSalesTotal = sales.filter((inv) => inv.paymentMethod === 'CASH').reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+    const creditSalesTotal = sales.filter((inv) => inv.paymentMethod === 'CREDIT').reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+    const bankSalesTotal = sales.filter((inv) => inv.paymentMethod === 'BANK').reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+    const chequeSalesTotal = sales.filter((inv) => inv.paymentMethod === 'CHEQUE').reduce((sum, inv) => sum + (Number(inv.total) || 0), 0);
+    const totalCollections = collections.reduce((sum, col) => sum + (Number(col.collectedAmount) || 0), 0);
+    const cashCollections = collections.filter((col) => col.paymentMethod === 'CASH').reduce((sum, col) => sum + (Number(col.collectedAmount) || 0), 0);
+    const bankCollections = collections.filter((col) => col.paymentMethod === 'BANK').reduce((sum, col) => sum + (Number(col.collectedAmount) || 0), 0);
+    const chequeCollections = collections.filter((col) => col.paymentMethod === 'CHEQUE').reduce((sum, col) => sum + (Number(col.collectedAmount) || 0), 0);
+    return {
+        totalSales,
+        totalReturns,
+        netSales,
+        invoiceCount: sales.length,
+        totalCollections,
+        cashCollections,
+        bankCollections,
+        chequeCollections,
+        cashSalesTotal,
+        creditSalesTotal,
+        bankSalesTotal,
+        chequeSalesTotal
+    };
+}
+// Get detailed salesman performance & transaction-level activity
+const getSalesmanActivityDetails = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const { salesmanId } = req.params;
+    const authReq = req;
+    const { startDate, endDate } = req.query;
+    try {
+        const conn = yield (0, db_1.getConnection)();
+        const [salesmanCheck] = yield conn.query('SELECT id, name, type, phone, commissionRate FROM salesmen WHERE id = ? OR userId = ? LIMIT 1', [salesmanId, salesmanId]);
+        if (!salesmanCheck || salesmanCheck.length === 0) {
+            conn.release();
+            return res.status(404).json({ error: 'Salesman not found' });
+        }
+        const salesman = salesmanCheck[0];
+        let dateFilter = '';
+        const dateParams = [];
+        if (authReq.fiscalYearFilter) {
+            dateFilter += ' AND i.date >= ? AND i.date <= ?';
+            dateParams.push(authReq.fiscalYearFilter.startDate, authReq.fiscalYearFilter.endDate);
+        }
+        if (startDate) {
+            dateFilter += ' AND i.date >= ?';
+            dateParams.push(startDate);
+        }
+        if (endDate) {
+            dateFilter += ' AND i.date <= ?';
+            dateParams.push(endDate);
+        }
+        const [invoices, collections, customers] = yield Promise.all([
+            fetchSalesmanInvoices(conn, salesman.id, dateFilter, dateParams),
+            fetchSalesmanCollections(conn, salesman.id, dateFilter, dateParams),
+            fetchServicedCustomers(conn, salesman.id, dateFilter, dateParams)
+        ]);
+        conn.release();
+        const metrics = calculateActivityMetrics(invoices, collections);
+        res.json({
+            salesman,
+            metrics,
+            invoices,
+            collections,
+            customers
+        });
+    }
+    catch (error) {
+        console.error('Error fetching salesman activity details:', error);
+        return (0, errorHandler_1.handleControllerError)(res, error, 'salesman activity details');
+    }
+});
+exports.getSalesmanActivityDetails = getSalesmanActivityDetails;

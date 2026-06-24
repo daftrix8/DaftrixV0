@@ -20,6 +20,7 @@ exports.setItemNote = setItemNote;
 exports.setItemSerials = setItemSerials;
 exports.removeItem = removeItem;
 exports.setItemTradeInAction = setItemTradeInAction;
+exports.setItemWarrantyAndInstallation = setItemWarrantyAndInstallation;
 exports.addCustomTradeInToCart = addCustomTradeInToCart;
 exports.addTradeInProductToCart = addTradeInProductToCart;
 exports.computeCartTotals = computeCartTotals;
@@ -48,11 +49,11 @@ function computeLineTotal(quantity, price, discount, discountType) {
 }
 /** Add a product to the cart. Returns a new cart array (immutable). */
 function addItemToCart(cart, params) {
-    const { productId, variantId, productName, price, stock, warrantyMonths, availableUnits, trackSerials } = params;
+    const { productId, variantId, productName, price, stock, isService, warrantyMonths, availableUnits, trackSerials, categoryId } = params;
     const existing = cart.find(item => item.productId === productId && item.variantId === variantId);
     const currentQty = (existing === null || existing === void 0 ? void 0 : existing.quantity) || 0;
-    // Stock guard — preserve referential identity to avoid unnecessary re-renders
-    if (stock <= 0 || currentQty >= stock)
+    // Stock guard — service products bypass stock checks (they don't track inventory)
+    if (!isService && (stock <= 0 || currentQty >= stock))
         return cart;
     if (existing) {
         return cart.map(item => (item.productId === productId && item.variantId === variantId)
@@ -70,7 +71,10 @@ function addItemToCart(cart, params) {
             warrantyMonths: warrantyMonths || undefined,
             availableUnits,
             trackSerials,
-            serials: trackSerials ? [] : undefined
+            serials: trackSerials ? [] : undefined,
+            categoryId,
+            hasWarranty: false,
+            inBranchInstallation: false
         }];
 }
 /** Update quantity by delta. Removes item if qty drops to 0. */
@@ -139,6 +143,13 @@ function setItemTradeInAction(cart, cartLineId, action) {
         ? item
         : Object.assign(Object.assign({}, item), { tradeInAction: action }));
 }
+/** Set warranty and in-branch installation toggles on a cart line. */
+function setItemWarrantyAndInstallation(cart, cartLineId, hasWarranty, inBranchInstallation, warrantyMonths) {
+    return cart.map(item => item.cartLineId !== cartLineId
+        ? item
+        : Object.assign(Object.assign({}, item), { hasWarranty,
+            inBranchInstallation, warrantyMonths: warrantyMonths !== undefined ? warrantyMonths : item.warrantyMonths }));
+}
 /** Add a Customer's Own Item as a Trade-In (bypasses stock, posts to Trade-In Expense). */
 function addCustomTradeInToCart(cart, description, value, condition, notes) {
     const combinedNotes = [
@@ -164,15 +175,30 @@ function addCustomTradeInToCart(cart, description, value, condition, notes) {
 }
 /** Add a real Product to the cart as a Trade-In (negative quantity, adds back to stock). */
 function addTradeInProductToCart(cart, product, // Using any for Product to avoid deep type imports here, will cast appropriately
-value, condition, notes) {
+value, condition, notes, variantId) {
+    var _a;
     const combinedNotes = [
         condition ? `الحالة: ${condition}` : '',
         notes ? `ملاحظات: ${notes}` : ''
     ].filter(Boolean).join(' | ');
+    let variantName = '';
+    if (variantId && product.variants) {
+        const variant = product.variants.find((v) => v.id === variantId);
+        if (variant) {
+            const attributesText = (_a = variant.attributes) === null || _a === void 0 ? void 0 : _a.map((attr) => attr.value).join(' - ');
+            if (attributesText) {
+                variantName = ` - ${attributesText}`;
+            }
+            else if (variant.sku) {
+                variantName = ` - ${variant.sku}`;
+            }
+        }
+    }
     const newItem = {
         cartLineId: generateCartLineId(),
         productId: product.id,
-        productName: `مبادلة: ${product.name}`,
+        variantId,
+        productName: `مبادلة: ${product.name}${variantName}`,
         quantity: -1,
         price: value,
         cost: product.cost || 0,

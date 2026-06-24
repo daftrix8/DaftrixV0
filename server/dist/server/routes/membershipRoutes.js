@@ -4,6 +4,8 @@ const express_1 = require("express");
 const memberships_1 = require("../controllers/memberships");
 const authMiddleware_1 = require("../middleware/authMiddleware");
 const router = (0, express_1.Router)();
+// Public endpoint for customer virtual card (unauthenticated)
+router.get('/public/:id', memberships_1.getPublicMembershipCard);
 // Secure all membership routes
 router.use(authMiddleware_1.authenticateToken);
 // Settings — MUST be before /:id to avoid being caught by the wildcard

@@ -19,6 +19,12 @@ exports.getEnhancedSyncStatus = exports.getSettingsDelta = exports.getStockMovem
 const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
 const dataFiltering_1 = require("../utils/dataFiltering");
+const eventBus_1 = require("../utils/eventBus");
+const realtimeState_1 = require("../utils/realtimeState");
+// Simple server-side cache for counts to prevent DB overload on polling fallback
+let cachedCounts = { products: 0, partners: 0, invoices: 0 };
+let lastCountsFetch = 0;
+const COUNTS_CACHE_TTL = 30000; // 30 seconds
 /**
  * Common delta query helper
  */
@@ -197,28 +203,66 @@ exports.getVehiclesDelta = getVehiclesDelta;
 // ==========================================
 const getSyncStatus = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const [rows] = yield (0, db_1.safePoolQuery)(`
-            SELECT 
-                (SELECT COUNT(*) FROM products) as productCount,
-                (SELECT COUNT(*) FROM partners) as partnerCount,
-                (SELECT COUNT(*) FROM invoices) as invoiceCount,
-                (SELECT MAX(updatedAt) FROM products) as lastProduct,
-                (SELECT MAX(updatedAt) FROM partners) as lastPartner,
-                (SELECT MAX(updatedAt) FROM invoices) as lastInvoice
-        `);
-        const data = rows[0];
+        const now = Date.now();
+        if (now - lastCountsFetch > COUNTS_CACHE_TTL) {
+            try {
+                const [rows] = yield (0, db_1.safePoolQuery)(`
+                    SELECT 
+                        (SELECT COUNT(*) FROM products) as productCount,
+                        (SELECT COUNT(*) FROM partners) as partnerCount,
+                        (SELECT COUNT(*) FROM invoices) as invoiceCount
+                `);
+                if (rows && rows[0]) {
+                    cachedCounts = {
+                        products: rows[0].productCount || 0,
+                        partners: rows[0].partnerCount || 0,
+                        invoices: rows[0].invoiceCount || 0
+                    };
+                    lastCountsFetch = now;
+                }
+            }
+            catch (dbErr) {
+                console.warn('⚠️ [getSyncStatus] DB count fetch failed, using cached values:', dbErr);
+            }
+        }
+        const user = req.user;
+        if (user) {
+            const connectionId = `http-poll-${user.id}`;
+            const userName = user.name || user.username || `User ${user.id}`;
+            const role = user.role || 'USER';
+            (0, realtimeState_1.addActiveUser)(connectionId, String(user.id), userName, role, 'sse');
+            const currentView = req.query.currentView;
+            if (currentView) {
+                (0, realtimeState_1.updateActiveUserView)(connectionId, currentView);
+            }
+        }
+        const rawUsers = (0, realtimeState_1.getRawActiveUsersMap)();
+        const onlineUsers = Array.from(rawUsers.values()).map(u => ({
+            userId: u.userId,
+            userName: u.userName,
+            currentView: u.currentView,
+            editingResource: u.editingResource,
+            transport: u.transport,
+            connectedAt: u.connectedAt
+        }));
         res.json({
-            counts: {
-                products: data.productCount || 0,
-                partners: data.partnerCount || 0,
-                invoices: data.invoiceCount || 0,
-            },
+            counts: cachedCounts,
             lastUpdates: {
-                products: data.lastProduct,
-                partners: data.lastPartner,
-                invoices: data.lastInvoice,
+                products: eventBus_1.eventBus.lastUpdates.products,
+                partners: eventBus_1.eventBus.lastUpdates.partners,
+                invoices: eventBus_1.eventBus.lastUpdates.invoices,
+                accounts: eventBus_1.eventBus.lastUpdates.accounts,
+                permits: eventBus_1.eventBus.lastUpdates.permits,
+                cheques: eventBus_1.eventBus.lastUpdates.cheques,
+                mfg: eventBus_1.eventBus.lastUpdates.mfg,
+                crm: eventBus_1.eventBus.lastUpdates.crm,
+                memberships: eventBus_1.eventBus.lastUpdates.memberships,
+                settings: eventBus_1.eventBus.lastUpdates.settings,
+                chat: eventBus_1.eventBus.lastUpdates.chat,
+                global: eventBus_1.eventBus.lastUpdates.global,
             },
             serverTime: new Date().toISOString(),
+            onlineUsers,
         });
     }
     catch (error) {

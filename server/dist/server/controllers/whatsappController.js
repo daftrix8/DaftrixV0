@@ -42,7 +42,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.receiveWebhook = exports.verifyWebhook = exports.getMessageLogs = exports.testConnection = exports.updateWhatsAppSettings = exports.getWhatsAppSettings = void 0;
+exports.sendWhatsAppTextMessage = exports.sendInvoicePDFViaWhatsApp = exports.receiveWebhook = exports.verifyWebhook = exports.getMessageLogs = exports.testConnection = exports.updateWhatsAppSettings = exports.getWhatsAppSettings = void 0;
 const db_1 = require("../db");
 const uuid_1 = require("uuid");
 const whatsappService = __importStar(require("../services/whatsappService"));
@@ -239,3 +239,110 @@ function maskToken(token) {
         return '••••••';
     return '••••••' + token.slice(-6);
 }
+/** POST /api/whatsapp/send-invoice-pdf — Receive uploaded PDF and send via WhatsApp API or fallback to Web */
+const sendInvoicePDFViaWhatsApp = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { phone, invoiceId, caption } = req.body;
+        const file = req.file;
+        if (!phone) {
+            return res.status(400).json({ error: 'رقم الهاتف مطلوب' });
+        }
+        if (!file) {
+            return res.status(400).json({ error: 'ملف PDF مطلوب' });
+        }
+        const formattedPhone = whatsappService.formatEgyptianPhone(phone);
+        // Construct public url for the file
+        const protocol = req.protocol;
+        const host = req.get('host');
+        const fileUrl = `${protocol}://${host}/uploads/whatsapp/${file.filename}`;
+        const isEnabled = yield whatsappService.isWhatsAppEnabled();
+        if (isEnabled) {
+            try {
+                // 1. Upload local PDF file directly to Meta's servers
+                const mediaId = yield whatsappService.uploadMedia(file.path, file.originalname || `Invoice_${invoiceId}.pdf`);
+                // 2. Deliver via Meta Cloud API using the media ID
+                const result = yield whatsappService.sendDocument({
+                    to: formattedPhone,
+                    mediaId,
+                    filename: file.originalname || `Invoice_${invoiceId}.pdf`,
+                    caption: caption || 'فاتورة المبيعات الخاصة بك 📄',
+                    referenceType: 'invoice',
+                    referenceId: invoiceId,
+                });
+                if (result.success) {
+                    return res.json({
+                        success: true,
+                        method: 'api',
+                        message: 'تم إرسال الفاتورة بنجاح عبر واتساب ✅',
+                        wamid: result.wamid,
+                    });
+                }
+                else {
+                    throw new Error(result.error);
+                }
+            }
+            catch (uploadOrSendError) {
+                console.warn('⚠️ [WhatsApp] Meta Media Send failed, falling back to manual redirect link:', uploadOrSendError);
+                return res.json({
+                    success: true,
+                    method: 'web',
+                    fileUrl: `/uploads/whatsapp/${file.filename}`,
+                    warning: `فشل الإرسال التلقائي: ${uploadOrSendError.message || 'خطأ غير معروف'}. تم التحويل للإرسال اليدوي`,
+                });
+            }
+        }
+        else {
+            // Fallback to Web link
+            return res.json({
+                success: true,
+                method: 'web',
+                fileUrl: `/uploads/whatsapp/${file.filename}`,
+            });
+        }
+    }
+    catch (err) {
+        console.error('❌ [WhatsApp] sendInvoicePDFViaWhatsApp error:', err);
+        return res.status(500).json({ error: 'فشل إرسال الفاتورة عبر واتساب' });
+    }
+});
+exports.sendInvoicePDFViaWhatsApp = sendInvoicePDFViaWhatsApp;
+/** POST /api/whatsapp/send-text — Send a direct text message */
+const sendWhatsAppTextMessage = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { phone, text, referenceType, referenceId } = req.body;
+        if (!phone || !text) {
+            return res.status(400).json({ error: 'رقم الهاتف والرسالة مطلوبان' });
+        }
+        const formattedPhone = whatsappService.formatEgyptianPhone(phone);
+        const isEnabled = yield whatsappService.isWhatsAppEnabled();
+        if (isEnabled) {
+            const result = yield whatsappService.sendTextMessage({
+                to: formattedPhone,
+                text,
+                referenceType: referenceType || 'membership',
+                referenceId: referenceId || undefined,
+            });
+            if (result.success) {
+                return res.json({ success: true, method: 'api', wamid: result.wamid });
+            }
+            else {
+                return res.json({
+                    success: true,
+                    method: 'web',
+                    warning: `فشل الإرسال التلقائي: ${result.error}. تم التحويل للإرسال اليدوي`,
+                });
+            }
+        }
+        else {
+            return res.json({
+                success: true,
+                method: 'web',
+            });
+        }
+    }
+    catch (err) {
+        console.error('❌ [WhatsApp] sendWhatsAppTextMessage error:', err);
+        return res.status(500).json({ error: 'فشل إرسال رسالة واتساب' });
+    }
+});
+exports.sendWhatsAppTextMessage = sendWhatsAppTextMessage;

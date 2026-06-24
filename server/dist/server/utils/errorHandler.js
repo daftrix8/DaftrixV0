@@ -98,6 +98,12 @@ const handleControllerError = (res, error, context) => {
             message: error.message
         });
     }
+    if (errorMessage.includes('رصيد الحساب غير كافٍ') || errorMessage.includes('insufficient_bank_balance')) {
+        return res.status(400).json({
+            code: 'INSUFFICIENT_BANK_BALANCE',
+            message: error.message
+        });
+    }
     if (errorMessage.includes('insufficient') || errorMessage.includes('غير كافية') || errorMessage.includes('الكمية')) {
         return res.status(400).json({
             code: 'INSUFFICIENT_QUANTITY',
@@ -140,7 +146,25 @@ exports.handleControllerError = handleControllerError;
  * Validation error for invoice total mismatch
  */
 const validateInvoiceTotal = (lines, providedTotal, taxAmount = 0, globalDiscount = 0, whtAmount = 0, shippingFee = 0) => {
-    // Calculate line totals
+    // Per-line validation: line.total must match (qty × price - lineDiscount) within tolerance
+    for (const line of lines) {
+        const qty = parseFloat(line.quantity) || 0;
+        const price = parseFloat(line.price) || 0;
+        const lineDiscount = parseFloat(line.discount) || 0;
+        const providedLineTotal = parseFloat(line.total);
+        // Only validate if all three values are explicitly provided
+        if (!isNaN(providedLineTotal) && qty !== 0 && price !== 0) {
+            const expectedLineTotal = qty * price - lineDiscount;
+            if (Math.abs(providedLineTotal - expectedLineTotal) > 1.00) {
+                return {
+                    valid: false,
+                    calculated: 0,
+                    message: `\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0633\u0637\u0631 \u063a\u064a\u0631 \u0645\u062a\u0637\u0627\u0628\u0642: \u0627\u0644\u0645\u062d\u0633\u0648\u0628 ${expectedLineTotal.toFixed(2)} (\u0643\u0645\u064a\u0629 ${qty} × \u0633\u0639\u0631 ${price} - \u062e\u0635\u0645 ${lineDiscount}), \u0627\u0644\u0645\u0633\u062a\u0644\u0645 ${providedLineTotal.toFixed(2)}`
+                };
+            }
+        }
+    }
+    // Calculate line totals (using the derived qty×price if total is absent or invalid)
     const lineTotal = lines.reduce((sum, line) => {
         const qty = parseFloat(line.quantity) || 0;
         const price = parseFloat(line.price) || 0;
@@ -158,12 +182,20 @@ const validateInvoiceTotal = (lines, providedTotal, taxAmount = 0, globalDiscoun
         - (parseFloat(String(whtAmount)) || 0);
     const providedTotalNum = parseFloat(String(providedTotal)) || 0;
     const difference = Math.abs(calculatedTotal - providedTotalNum);
+    // Negative totals are NEVER valid in any invoice type (returns use positive amounts and type='RETURN_SALE')
+    if (calculatedTotal < 0) {
+        return {
+            valid: false,
+            calculated: Math.round(calculatedTotal * 100) / 100,
+            message: `\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0641\u0627\u062a\u0648\u0631\u0629 \u0644\u0627 \u064a\u0645\u0643\u0646 \u0623\u0646 \u064a\u0643\u0648\u0646 \u0628\u0627\u0644\u0633\u0627\u0644\u0628. \u064a\u0631\u062c\u0649 \u0645\u0631\u0627\u062c\u0639\u0629 \u0627\u0644\u062e\u0635\u0648\u0645\u0627\u062a.`
+        };
+    }
     // Allow 1.00 tolerance for rounding errors (generous for Arabic currency)
     if (difference > 1.00) {
         return {
             valid: false,
             calculated: Math.round(calculatedTotal * 100) / 100,
-            message: `إجمالي الفاتورة غير متطابق: المحسوب ${calculatedTotal.toFixed(2)}, المستلم ${providedTotalNum.toFixed(2)}`
+            message: `\u0625\u062c\u0645\u0627\u0644\u064a \u0627\u0644\u0641\u0627\u062a\u0648\u0631\u0629 \u063a\u064a\u0631 \u0645\u062a\u0637\u0627\u0628\u0642: \u0627\u0644\u0645\u062d\u0633\u0648\u0628 ${calculatedTotal.toFixed(2)}, \u0627\u0644\u0645\u0633\u062a\u0644\u0645 ${providedTotalNum.toFixed(2)}`
         };
     }
     return { valid: true, calculated: Math.round(calculatedTotal * 100) / 100 };

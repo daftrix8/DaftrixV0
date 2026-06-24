@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+const express_1 = require("express");
+const contractController_1 = require("../controllers/contractController");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const router = (0, express_1.Router)();
+router.get('/', (0, authMiddleware_1.requirePermission)('operations.view'), contractController_1.getContracts);
+router.get('/:id', (0, authMiddleware_1.requirePermission)('operations.view'), contractController_1.getContract);
+router.post('/', (0, authMiddleware_1.requirePermission)('operations.manage'), contractController_1.createContract);
+router.put('/:id', (0, authMiddleware_1.requirePermission)('operations.manage'), contractController_1.updateContract);
+router.delete('/:id', (0, authMiddleware_1.requirePermission)('operations.manage'), contractController_1.deleteContract);
+router.post('/:id/renew', (0, authMiddleware_1.requirePermission)('operations.manage'), contractController_1.renewContract);
+exports.default = router;

@@ -23,7 +23,7 @@ class MembershipBilling {
      * Generates a new invoice for a membership (creation or renewal)
      */
     static generateInvoice(membershipId_1, customerId_1, customerName_1, packageId_1, userId_1, conn_1) {
-        return __awaiter(this, arguments, void 0, function* (membershipId, customerId, customerName, packageId, userId, conn, isPaid = false, treasuryAccountId) {
+        return __awaiter(this, arguments, void 0, function* (membershipId, customerId, customerName, packageId, userId, conn, isPaid = false, treasuryAccountId, salesmanId, branchId) {
             // We require conn to be passed from the transaction
             try {
                 // Get package details
@@ -44,12 +44,12 @@ class MembershipBilling {
                 yield conn.query(`
                 INSERT INTO invoices (
                     id, number, date, type, partnerId, partnerName, total, status, 
-                    paymentMethod, posted, dueDate, notes, createdBy
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    paymentMethod, posted, dueDate, notes, createdBy, salesmanId, branchId
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `, [
                     invoiceId, invNumber, dateEngine_1.DateEngine.format(dateEngine_1.DateEngine.now(), 'YYYY-MM-DD HH:mm:ss'), types_1.TransactionType.INVOICE_SALE,
                     customerId, customerName, pkg.price, createDraftInvoices ? types_1.InvoiceStatus.DRAFT : types_1.InvoiceStatus.POSTED, types_1.PaymentMethod.CASH,
-                    createDraftInvoices ? 0 : 1, dateEngine_1.DateEngine.todayStr(), 'اشتراك: ' + pkg.name, userId || 'System'
+                    createDraftInvoices ? 0 : 1, dateEngine_1.DateEngine.todayStr(), 'اشتراك: ' + pkg.name, userId || 'System', salesmanId || null, branchId || null
                 ]);
                 // Create Invoice Line
                 yield conn.query(`
@@ -62,8 +62,8 @@ class MembershipBilling {
                 if (status === types_1.InvoiceStatus.POSTED) {
                     yield (0, invoiceController_1.syncRevenueCogsJournal)(conn, invoiceId, invNumber, types_1.TransactionType.INVOICE_SALE, dateEngine_1.DateEngine.format(dateEngine_1.DateEngine.now(), 'YYYY-MM-DD HH:mm:ss'), customerName, safePrice, [{ quantity: 1, cost: 0, returnCondition: null }], userId || 'System', false, // reserveOnSale
                     false, // isCashInvoice
-                    0 // globalDiscount
-                    );
+                    0, // globalDiscount
+                    branchId || null);
                     // If paid immediately, generate a RECEIPT to clear the debt and hit the Treasury Journal
                     if (isPaid) {
                         const receiptId = (0, crypto_1.randomUUID)();
@@ -73,12 +73,12 @@ class MembershipBilling {
                         yield conn.query(`
                         INSERT INTO invoices (
                             id, number, date, type, partnerId, partnerName, total, status, 
-                            paymentMethod, posted, notes, createdBy, sourceInvoiceId
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            paymentMethod, posted, notes, createdBy, sourceInvoiceId, salesmanId, branchId
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     `, [
                             receiptId, receiptNumber, receiptDate, 'RECEIPT',
                             customerId, customerName, safePrice, types_1.InvoiceStatus.POSTED,
-                            types_1.PaymentMethod.CASH, 1, 'سداد اشتراك: ' + pkg.name, userId || 'System', invoiceId
+                            types_1.PaymentMethod.CASH, 1, 'سداد اشتراك: ' + pkg.name, userId || 'System', invoiceId, salesmanId || null, branchId || null
                         ]);
                         // 2. Update the parent invoice paid amount
                         yield conn.query('UPDATE invoices SET paidAmount = ? WHERE id = ?', [safePrice, invoiceId]);
@@ -110,7 +110,7 @@ class MembershipBilling {
                                 partnerAccOut = accs[0];
                         }
                         catch (e) { }
-                        yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy) VALUES (?, ?, ?, ?, ?)`, [journalId, receiptDate, `سند قبض نقدي #${receiptNumber} - ${customerName}`, receiptId, userId || 'System']);
+                        yield conn.query(`INSERT INTO journal_entries (id, date, description, referenceId, createdBy, branchId) VALUES (?, ?, ?, ?, ?, ?)`, [journalId, receiptDate, `سند قبض نقدي #${receiptNumber} - ${customerName}`, receiptId, userId || 'System', branchId || null]);
                         yield conn.query(`INSERT INTO journal_lines (journalId, accountId, accountName, debit, credit) VALUES (?, ?, ?, ?, ?), (?, ?, ?, ?, ?)`, [
                             journalId, cashAcc.id, cashAcc.name, safePrice, 0,
                             journalId, partnerAccOut.id, partnerAccOut.name, 0, safePrice

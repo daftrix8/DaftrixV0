@@ -32,6 +32,15 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
 var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
@@ -42,6 +51,9 @@ const express_1 = require("express");
 const jsonwebtoken_1 = __importDefault(require("jsonwebtoken"));
 const crypto_1 = __importDefault(require("crypto"));
 const eventBus_1 = require("../utils/eventBus");
+const chatHelpers_1 = require("../utils/chatHelpers");
+const authMiddleware_1 = require("../middleware/authMiddleware");
+const realtimeState_1 = require("../utils/realtimeState");
 const router = (0, express_1.Router)();
 // Short-lived SSE tickets (H10 security fix)
 // Map<ticket, { user, expiresAt }>
@@ -132,6 +144,7 @@ router.get('/events', (req, res) => {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
         'Connection': 'keep-alive',
+        'Content-Encoding': 'none', // Prevents proxy compression and buffering
         'X-Accel-Buffering': 'no', // Disable Nginx buffering
         'X-Content-Type-Options': 'nosniff',
         'Access-Control-Allow-Origin': '*',
@@ -152,6 +165,8 @@ router.get('/events', (req, res) => {
         lastEventId: 0,
     };
     sseClients.set(clientId, client);
+    // Track active user in unified registry
+    (0, realtimeState_1.addActiveUser)(clientId, user.id, client.userName, client.role, 'sse');
     console.log(`📡 SSE client connected: ${client.userName} (${clientId}) — Total: ${sseClients.size}`);
     // Send connection confirmation with named event
     sendSSEEvent(client, 'connected', {
@@ -161,6 +176,8 @@ router.get('/events', (req, res) => {
         serverTime: new Date().toISOString(),
         transport: 'sse',
     });
+    // Send initial active POS carts list
+    sendSSEEvent(client, 'pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
     // ── Missed Event Recovery ──
     // If client sends Last-Event-ID, replay missed events
     const lastEventIdHeader = req.headers['last-event-id'];
@@ -179,13 +196,37 @@ router.get('/events', (req, res) => {
     req.socket.setTimeout(0);
     req.socket.setNoDelay(true);
     req.socket.setKeepAlive(true);
+    // Hostinger kills long-lived connections after ~120s (confirmed from 500 errors
+    // in production analytics — all at exactly ~120,800ms response time).
+    // Gracefully close at 100s so the client's EventSource auto-reconnects cleanly
+    // instead of Hostinger sending a 500 error.
+    const SSE_MAX_CONNECTION_LIFETIME_MS = 100000; // 100 seconds
+    const lifetimeTimer = setTimeout(() => {
+        try {
+            // Send a reconnect hint so the client knows this is intentional
+            sendSSEEvent(client, 'reconnect', { reason: 'connection_lifetime', retryMs: 1000 });
+            res.end();
+        }
+        catch (_a) {
+            // Already closed
+        }
+    }, SSE_MAX_CONNECTION_LIFETIME_MS);
     // Clean up on disconnect
-    req.on('close', () => {
+    const cleanup = () => {
+        clearTimeout(lifetimeTimer);
         sseClients.delete(clientId);
+        (0, realtimeState_1.removeActiveUser)(clientId);
+    };
+    req.on('close', () => {
+        cleanup();
         console.log(`📡 SSE client disconnected: ${client.userName} (${clientId}) — Total: ${sseClients.size}`);
+        eventBus_1.eventBus.broadcast('chat:system', {
+            message: `${client.userName} غادر المحادثة`,
+            type: 'leave'
+        });
     });
     req.on('error', () => {
-        sseClients.delete(clientId);
+        cleanup();
     });
 });
 /**
@@ -193,7 +234,7 @@ router.get('/events', (req, res) => {
  * Client→server actions when using SSE transport.
  * Auth via Bearer token in Authorization header.
  */
-router.post('/action', (req, res) => {
+router.post('/action', authMiddleware_1.authenticateToken, (req, res) => {
     const { event, data } = req.body;
     const user = req.user;
     if (!event) {
@@ -202,49 +243,113 @@ router.post('/action', (req, res) => {
     // Handle all action types
     switch (event) {
         case 'user:viewing':
-            eventBus_1.eventBus.broadcast('users:viewing', {
-                userId: user === null || user === void 0 ? void 0 : user.id,
-                userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username),
-                view: data === null || data === void 0 ? void 0 : data.view,
-            });
+            if (user === null || user === void 0 ? void 0 : user.id) {
+                (0, realtimeState_1.updateActiveUserViewByUserId)(user.id, data === null || data === void 0 ? void 0 : data.view);
+            }
             break;
         case 'chat:send': {
-            const chatMsg = Object.assign(Object.assign({}, data), { userId: user === null || user === void 0 ? void 0 : user.id, userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username), timestamp: new Date().toISOString() });
+            const chatMsg = Object.assign(Object.assign({}, data), { userId: user === null || user === void 0 ? void 0 : user.id, userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username), timestamp: new Date().toISOString(), type: 'message' });
             eventBus_1.eventBus.broadcast('chat:message', chatMsg);
             // Persist to database (fire-and-forget)
             Promise.resolve().then(() => __importStar(require('../db'))).then(({ pool }) => {
-                pool.query('INSERT INTO chat_messages (id, userId, userName, message, type, timestamp) VALUES (?, ?, ?, ?, ?, NOW())', [chatMsg.id, chatMsg.userId, chatMsg.userName, chatMsg.message, 'message']).catch((err) => console.error('❌ SSE chat save error:', err.message));
+                pool.query('INSERT INTO chat_messages (id, userId, userName, message, type, replyTo, attachment, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, NOW())', [
+                    chatMsg.id,
+                    chatMsg.userId,
+                    chatMsg.userName,
+                    chatMsg.message,
+                    'message',
+                    chatMsg.replyTo ? JSON.stringify(chatMsg.replyTo) : null,
+                    chatMsg.attachment ? JSON.stringify(chatMsg.attachment) : null
+                ]).catch((err) => console.error('❌ SSE chat save error:', err.message));
             }).catch(() => { });
             break;
         }
         case 'chat:private': {
-            const privateMsg = Object.assign(Object.assign({}, data), { userId: user === null || user === void 0 ? void 0 : user.id, userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username), timestamp: new Date().toISOString() });
+            const privateMsg = Object.assign(Object.assign({}, data), { userId: user === null || user === void 0 ? void 0 : user.id, userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username), timestamp: new Date().toISOString(), type: 'private' });
             eventBus_1.eventBus.broadcast('chat:private', privateMsg);
             // Persist to database (fire-and-forget)
             Promise.resolve().then(() => __importStar(require('../db'))).then(({ pool }) => {
-                pool.query('INSERT INTO chat_messages (id, userId, userName, message, type, targetUserId, timestamp) VALUES (?, ?, ?, ?, ?, ?, NOW())', [privateMsg.id || `pm-${Date.now()}`, privateMsg.userId, privateMsg.userName, privateMsg.message, 'private', privateMsg.targetUserId]).catch((err) => console.error('❌ SSE private chat save error:', err.message));
+                pool.query('INSERT INTO chat_messages (id, userId, userName, message, type, targetUserId, replyTo, attachment, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())', [
+                    privateMsg.id || `pm-${Date.now()}`,
+                    privateMsg.userId,
+                    privateMsg.userName,
+                    privateMsg.message,
+                    'private',
+                    privateMsg.targetUserId,
+                    privateMsg.replyTo ? JSON.stringify(privateMsg.replyTo) : null,
+                    privateMsg.attachment ? JSON.stringify(privateMsg.attachment) : null
+                ]).catch((err) => console.error('❌ SSE private chat save error:', err.message));
+            }).catch(() => { });
+            break;
+        }
+        case 'chat:group': {
+            const groupMsg = Object.assign(Object.assign({}, data), { userId: user === null || user === void 0 ? void 0 : user.id, userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username), timestamp: new Date().toISOString(), type: 'group' });
+            eventBus_1.eventBus.broadcast('chat:group', groupMsg);
+            // Persist to database (fire-and-forget)
+            Promise.resolve().then(() => __importStar(require('../db'))).then(({ pool }) => {
+                pool.query('INSERT INTO chat_messages (id, userId, userName, message, type, groupId, replyTo, attachment, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NOW())', [
+                    groupMsg.id || `gm-${Date.now()}`,
+                    groupMsg.userId,
+                    groupMsg.userName,
+                    groupMsg.message,
+                    'group',
+                    groupMsg.groupId,
+                    groupMsg.replyTo ? JSON.stringify(groupMsg.replyTo) : null,
+                    groupMsg.attachment ? JSON.stringify(groupMsg.attachment) : null
+                ]).catch((err) => console.error('❌ SSE group chat save error:', err.message));
             }).catch(() => { });
             break;
         }
         case 'chat:typing':
             eventBus_1.eventBus.broadcast('chat:typing', Object.assign(Object.assign({}, data), { userId: user === null || user === void 0 ? void 0 : user.id, userName: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) }));
             break;
-        case 'lock:request':
-            // Handle edit locks
-            eventBus_1.eventBus.broadcast('lock:acquired', {
-                type: data === null || data === void 0 ? void 0 : data.type,
-                id: data === null || data === void 0 ? void 0 : data.id,
-                lockedBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username),
-                userId: user === null || user === void 0 ? void 0 : user.id,
+        case 'chat:react': {
+            const { messageId, emoji, action } = data;
+            if (user === null || user === void 0 ? void 0 : user.id) {
+                (0, chatHelpers_1.handleReaction)(user.id, messageId, emoji, action)
+                    .then((result) => {
+                    eventBus_1.eventBus.broadcast('chat:react', {
+                        messageId,
+                        emoji,
+                        userId: user.id,
+                        userName: user.name || user.username,
+                        action,
+                        reactions: result.reactions,
+                        type: result.type,
+                        messageSenderId: result.messageSenderId,
+                        targetUserId: result.targetUserId,
+                        groupId: result.groupId
+                    });
+                })
+                    .catch((err) => console.error('❌ SSE reaction error:', err.message));
+            }
+            break;
+        }
+        case 'pos:cart:sync':
+            (0, realtimeState_1.savePOSCartState)(user.id, data);
+            eventBus_1.eventBus.broadcast('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
+            break;
+        case 'pos:cart:remote-update':
+            (0, realtimeState_1.savePOSCartState)(data.cashierId, Object.assign(Object.assign({}, data.cartState), { cashierId: data.cashierId, updatedByAdmin: user.name || user.username }));
+            eventBus_1.eventBus.broadcast('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
+            eventBus_1.eventBus.broadcast('pos:cart:remote-update-received', {
+                cashierId: data.cashierId,
+                cartState: data.cartState,
+                adminName: user.name || user.username
             });
-            res.json({ ok: true, success: true });
+            break;
+        case 'lock:request': {
+            if (!(user === null || user === void 0 ? void 0 : user.id)) {
+                return res.status(401).json({ error: 'User info missing' });
+            }
+            const result = (0, realtimeState_1.acquireEditLockByUserId)(data === null || data === void 0 ? void 0 : data.type, data === null || data === void 0 ? void 0 : data.id, user.id, user.name || user.username);
+            res.json({ ok: result.success, success: result.success, lockedBy: result.lockedBy });
             return;
+        }
         case 'lock:release':
-            eventBus_1.eventBus.broadcast('lock:released', {
-                type: data === null || data === void 0 ? void 0 : data.type,
-                id: data === null || data === void 0 ? void 0 : data.id,
-                userId: user === null || user === void 0 ? void 0 : user.id,
-            });
+            if (user === null || user === void 0 ? void 0 : user.id) {
+                (0, realtimeState_1.releaseEditLockByUserId)(data === null || data === void 0 ? void 0 : data.type, data === null || data === void 0 ? void 0 : data.id, user.id);
+            }
             break;
         default:
             // Forward any event through EventBus
@@ -286,6 +391,9 @@ function sendSSEEvent(client, event, data, eventId) {
         message += `event: ${event}\n`;
         message += `data: ${JSON.stringify(data)}\n\n`;
         client.res.write(message);
+        if (typeof client.res.flush === 'function') {
+            client.res.flush();
+        }
         client.lastEventId = id;
     }
     catch (err) {
@@ -307,12 +415,120 @@ function broadcastSSE(event, data) {
 // ═══════════════════════════════════════════
 /**
  * Subscribe to ALL EventBus broadcasts and push to SSE clients
- * using proper named events (not just generic 'message').
+ * using proper named events. Handles private routing.
  */
 eventBus_1.eventBus.on('broadcast', ({ event, data }) => {
     if (sseClients.size === 0)
-        return; // Skip if no SSE clients
-    broadcastSSE(event, data);
+        return;
+    if (event === 'chat:private') {
+        // Only route to intended receiver or sender
+        for (const client of sseClients.values()) {
+            if (String(client.userId) === String(data.targetUserId) || String(client.userId) === String(data.userId)) {
+                sendSSEEvent(client, event, data);
+            }
+        }
+    }
+    else if (event === 'chat:typing') {
+        const targetId = data.targetUserId || '';
+        const isGroup = targetId.startsWith('custom-') || targetId.startsWith('branch-') || targetId === 'global' || targetId.includes('-group');
+        if (isGroup) {
+            Promise.resolve().then(() => __importStar(require('../db'))).then((_a) => __awaiter(void 0, [_a], void 0, function* ({ pool }) {
+                try {
+                    const [members] = yield pool.query('SELECT userId FROM chat_group_members WHERE groupId = ?', [targetId]);
+                    const memberIds = new Set(members.map((m) => m.userId));
+                    const eventId = addToHistory(event, data);
+                    for (const client of sseClients.values()) {
+                        if (memberIds.has(String(client.userId)) && String(client.userId) !== String(data.userId)) {
+                            sendSSEEvent(client, event, data, eventId);
+                        }
+                    }
+                }
+                catch (err) {
+                    console.error('❌ Error broadcasting SSE group typing indicator:', err.message);
+                }
+            })).catch(() => { });
+        }
+        else {
+            for (const client of sseClients.values()) {
+                if (String(client.userId) === String(data.targetUserId)) {
+                    sendSSEEvent(client, event, data);
+                }
+            }
+        }
+    }
+    else if (event === 'chat:group') {
+        // Resolve group members asynchronously, then push to matching SSE clients
+        Promise.resolve().then(() => __importStar(require('../db'))).then(({ pool }) => {
+            pool.query('SELECT userId FROM chat_group_members WHERE groupId = ?', [data.groupId])
+                .then(([members]) => {
+                const memberIds = new Set(members.map((m) => m.userId));
+                const eventId = addToHistory(event, data);
+                for (const client of sseClients.values()) {
+                    if (memberIds.has(String(client.userId))) {
+                        sendSSEEvent(client, event, data, eventId);
+                    }
+                }
+            })
+                .catch((err) => console.error('❌ SSE group broadcast error:', err.message));
+        }).catch(() => { });
+    }
+    else if (event === 'notification:receive') {
+        if (data.targetUserId) {
+            for (const client of sseClients.values()) {
+                if (String(client.userId) === String(data.targetUserId)) {
+                    sendSSEEvent(client, event, data);
+                }
+            }
+        }
+        else {
+            for (const client of sseClients.values()) {
+                if (String(client.userId) !== String(data.senderId)) {
+                    sendSSEEvent(client, event, data);
+                }
+            }
+        }
+    }
+    else if (event === 'pos:cart:remote-update-received') {
+        for (const client of sseClients.values()) {
+            if (String(client.userId) === String(data.cashierId)) {
+                sendSSEEvent(client, event, data);
+            }
+        }
+    }
+    else if (event === 'chat:react' || event === 'chat:edit' || event === 'chat:pin' || event === 'chat:read') {
+        const type = data.type || data.chatMode;
+        const targetUserId = data.targetUserId;
+        const messageSenderId = data.messageSenderId || data.userId;
+        const groupId = data.groupId || data.targetId;
+        if (type === 'private') {
+            for (const client of sseClients.values()) {
+                if (String(client.userId) === String(targetUserId) || String(client.userId) === String(messageSenderId)) {
+                    sendSSEEvent(client, event, data);
+                }
+            }
+        }
+        else if (type === 'group') {
+            Promise.resolve().then(() => __importStar(require('../db'))).then(({ pool }) => {
+                pool.query('SELECT userId FROM chat_group_members WHERE groupId = ?', [groupId])
+                    .then(([members]) => {
+                    const memberIds = new Set(members.map((m) => m.userId));
+                    const eventId = addToHistory(event, data);
+                    for (const client of sseClients.values()) {
+                        if (memberIds.has(String(client.userId))) {
+                            sendSSEEvent(client, event, data, eventId);
+                        }
+                    }
+                })
+                    .catch((err) => console.error(`❌ SSE group ${event} broadcast error:`, err.message));
+            }).catch(() => { });
+        }
+        else {
+            broadcastSSE(event, data);
+        }
+    }
+    else {
+        broadcastSSE(event, data);
+    }
 });
 // ═══════════════════════════════════════════
 // HEARTBEAT & CLEANUP

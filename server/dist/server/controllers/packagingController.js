@@ -330,8 +330,8 @@ const packTask = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
             if (task.warehouse_id) {
                 yield conn.query(`
                     UPDATE product_stocks
-                    SET quantity = GREATEST(0, quantity - ?)
-                    WHERE product_id = ? AND warehouse_id = ?
+                    SET stock = GREATEST(0, stock - ?)
+                    WHERE productId = ? AND warehouseId = ?
                 `, [totalQtyToDeduct, mat.material_product_id, task.warehouse_id]);
             }
             // Update main products.stock
