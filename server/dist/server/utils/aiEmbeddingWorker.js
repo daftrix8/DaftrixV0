@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -11,7 +44,6 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.startEmbeddingWorker = startEmbeddingWorker;
 const db_1 = require("../db");
-const aiSearch_1 = require("./aiSearch");
 // Run every 5 minutes and process up to 100 missing embeddings
 let embeddingInterval = null;
 let isProcessing = false;
@@ -39,8 +71,10 @@ function startEmbeddingWorker() {
         }
         isProcessing = true;
         try {
+            // Lazy load aiSearch to prevent loading @xenova/transformers on start if disabled
+            const { getEmbedding, InMemoryVectorDB } = yield Promise.resolve().then(() => __importStar(require('./aiSearch')));
             // Ensure vector DB is loaded into RAM
-            yield aiSearch_1.InMemoryVectorDB.loadDB(db_1.pool);
+            yield InMemoryVectorDB.loadDB(db_1.pool);
             // Find products without an embedding
             // Use pool.query() which auto-releases the connection (no leak risk)
             const [rows] = yield db_1.pool.query(`SELECT p.id, p.categoryId, p.name, c.name as categoryName 
@@ -63,11 +97,11 @@ function startEmbeddingWorker() {
                 if (!combinedText)
                     continue;
                 // Generate 384-dimensional mathematical vector representing semantic meaning
-                const vectorFields = yield (0, aiSearch_1.getEmbedding)(combinedText);
+                const vectorFields = yield getEmbedding(combinedText);
                 // Save it back to the database as a JSON array
                 yield db_1.pool.query(`UPDATE products SET embedding = ? WHERE id = ?`, [JSON.stringify(vectorFields), row.id]);
                 // Immediately synchronize the RAM embedding matrix so searching is instant
-                aiSearch_1.InMemoryVectorDB.addOrUpdateVector(row.id, vectorFields, row.categoryId || null);
+                InMemoryVectorDB.addOrUpdateVector(row.id, vectorFields, row.categoryId || null);
             }
             console.log(`✅ AI Worker finished vectorizing ${rows.length} products.`);
             consecutiveFailures = 0; // Reset on success
