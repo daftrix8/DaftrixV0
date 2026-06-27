@@ -19,16 +19,37 @@ if (!ADMIN_PASSWORD) {
     console.warn('⚠️ [SECURITY] ADMIN_PASSWORD not set in .env — database reset/rollover will be disabled.');
 }
 /**
- * Verify admin password — constant-time comparison to prevent timing attacks
+ * Verify admin password or currently logged in user's password
  */
-function verifyPassword(password) {
-    if (!ADMIN_PASSWORD || !password)
+function verifyAdminOrUserPassword(password, userId, conn) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!password)
+            return false;
+        // 1. Check env ADMIN_PASSWORD if set
+        if (ADMIN_PASSWORD) {
+            if (password.length === ADMIN_PASSWORD.length) {
+                const crypto = require('crypto');
+                const isMatch = crypto.timingSafeEqual(Buffer.from(password, 'utf8'), Buffer.from(ADMIN_PASSWORD, 'utf8'));
+                if (isMatch)
+                    return true;
+            }
+        }
+        // 2. Fallback check: check user's database password
+        if (userId) {
+            const [rows] = yield conn.query('SELECT password FROM users WHERE id = ? LIMIT 1', [userId]);
+            const dbUser = rows[0];
+            if (dbUser && dbUser.password) {
+                const bcrypt = require('bcryptjs');
+                if (dbUser.password.startsWith('$2')) {
+                    return yield bcrypt.compare(password, dbUser.password);
+                }
+                else {
+                    return password === dbUser.password;
+                }
+            }
+        }
         return false;
-    // Use constant-time comparison
-    if (password.length !== ADMIN_PASSWORD.length)
-        return false;
-    const crypto = require('crypto');
-    return crypto.timingSafeEqual(Buffer.from(password, 'utf8'), Buffer.from(ADMIN_PASSWORD, 'utf8'));
+    });
 }
 /**
  * Helper function to safely delete from a table
@@ -54,12 +75,15 @@ function safeDelete(conn, table) {
 const resetDatabase = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { password, mode = 'TRANSACTIONS' } = req.body;
-        // Verify password
-        if (!verifyPassword(password)) {
-            return res.status(403).json({ message: 'Invalid password' });
-        }
+        const user = req.user;
         console.log(`🔄 Starting database reset(${mode})...`);
         const conn = yield (0, db_1.getConnection)();
+        // Verify password
+        const isValidPassword = yield verifyAdminOrUserPassword(password, user === null || user === void 0 ? void 0 : user.id, conn);
+        if (!isValidPassword) {
+            conn.release();
+            return res.status(403).json({ message: 'Invalid password' });
+        }
         // Disable foreign key checks temporarily
         yield conn.query('SET FOREIGN_KEY_CHECKS = 0');
         // ====================================
@@ -280,8 +304,13 @@ exports.resetDatabase = resetDatabase;
 const fiscalYearRollover = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const { password, newYearName } = req.body;
+        const user = req.user;
+        // Step 2: Get connection (moved up to verify password against DB if needed)
+        const conn = yield (0, db_1.getConnection)();
         // Verify password
-        if (!verifyPassword(password)) {
+        const isValidPassword = yield verifyAdminOrUserPassword(password, user === null || user === void 0 ? void 0 : user.id, conn);
+        if (!isValidPassword) {
+            conn.release();
             return res.status(403).json({ message: 'Invalid password' });
         }
         console.log('🔄 Starting Fiscal Year Rollover...');
@@ -296,9 +325,13 @@ const fiscalYearRollover = (req, res) => __awaiter(void 0, void 0, void 0, funct
             },
             status: (code) => mockRes
         };
-        yield (0, backupController_1.createBackup)(mockReq, mockRes);
-        // Step 2: Get connection
-        const conn = yield (0, db_1.getConnection)();
+        try {
+            yield (0, backupController_1.createBackup)(mockReq, mockRes);
+        }
+        catch (backupErr) {
+            conn.release();
+            throw backupErr;
+        }
         // Disable foreign key checks
         yield conn.query('SET FOREIGN_KEY_CHECKS = 0');
         // Step 3: Calculate closing balances and update opening balances

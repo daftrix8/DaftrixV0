@@ -689,6 +689,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                 const isPurchaseType = inv.type === 'INVOICE_PURCHASE' || inv.type === 'RETURN_SALE';
                 // Build context for full validation
                 const isExistingPosted = existingData && (existingData.posted || existingData.status === 'POSTED');
+                const u = req.user;
                 const context = {
                     type: inv.type,
                     date: inv.date,
@@ -699,7 +700,7 @@ const syncTransaction = (req, res) => __awaiter(void 0, void 0, void 0, function
                     warehouseId: inv.warehouseId,
                     posted: inv.posted,
                     createdBy: existingData === null || existingData === void 0 ? void 0 : existingData.createdBy,
-                    currentUser,
+                    currentUser: u ? `${u.username || ''}|${u.name || ''}` : currentUser,
                     currentUserRole,
                     // Credit back old quantities when re-saving a posted invoice —
                     // the update will reverse them before applying the new lines.

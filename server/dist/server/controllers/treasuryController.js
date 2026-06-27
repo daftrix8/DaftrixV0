@@ -9,7 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.cleanupDuplicateBankAccounts = exports.recalculateBankBalances = exports.updateCheque = exports.getCheques = exports.deleteBank = exports.resyncBankGL = exports.updateBank = exports.createBank = exports.getBanks = exports.createReceipt = void 0;
+exports.reorderBanks = exports.cleanupDuplicateBankAccounts = exports.recalculateBankBalances = exports.updateCheque = exports.getCheques = exports.deleteBank = exports.resyncBankGL = exports.updateBank = exports.createBank = exports.getBanks = exports.createReceipt = void 0;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const auditController_1 = require("./auditController");
@@ -77,7 +77,7 @@ const createReceipt = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 partnerId: partnerId,
                 notes: notes,
                 createdBy: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'Mobile App',
-                currentUser: (user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'Mobile App',
+                currentUser: user ? `${user.username || ''}|${user.name || ''}` : ((user === null || user === void 0 ? void 0 : user.name) || (user === null || user === void 0 ? void 0 : user.username) || 'Mobile App'),
                 currentUserRole
             };
             // Note: Use connection to pass to validation, wait for result.
@@ -266,18 +266,18 @@ const getBanks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         if (branchId && !isPrivileged) {
             // Branch-locked user: own branch + shared banks
             try {
-                const [rows] = yield db_1.pool.query('SELECT * FROM banks WHERE branchId = ? OR branchId IS NULL', [branchId]);
+                const [rows] = yield db_1.pool.query('SELECT * FROM banks WHERE branchId = ? OR branchId IS NULL ORDER BY sortOrder ASC, isPrimary DESC, name ASC', [branchId]);
                 banks = rows;
             }
             catch (_b) {
                 // branchId column may not exist yet — fall through to unfiltered
-                const [rows] = yield db_1.pool.query('SELECT * FROM banks');
+                const [rows] = yield db_1.pool.query('SELECT * FROM banks ORDER BY sortOrder ASC, isPrimary DESC, name ASC');
                 banks = rows;
             }
         }
         else {
             // Admin or no branch assignment — show all
-            const [rows] = yield db_1.pool.query('SELECT * FROM banks');
+            const [rows] = yield db_1.pool.query('SELECT * FROM banks ORDER BY sortOrder ASC, isPrimary DESC, name ASC');
             banks = rows;
         }
         // --- VIRTUAL TREASURIES ---
@@ -339,12 +339,8 @@ const getBanks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
                     let debits = 0;
                     let credits = 0;
                     for (const mov of movements) {
-                        // If the bank belongs to a specific branch, only sum that branch's transactions or shared ones
-                        // If the bank has no branchId (global), sum all transactions
-                        if (!bank.branchId || mov.branchId === bank.branchId || mov.branchId === null) {
-                            debits += mov.d;
-                            credits += mov.c;
-                        }
+                        debits += mov.d;
+                        credits += mov.c;
                     }
                     // Expose openingBalance (raw) separately from balance (computed live)
                     // The frontend must send openingBalance back on edit — NOT balance —
@@ -1036,3 +1032,35 @@ const cleanupDuplicateBankAccounts = (req, res) => __awaiter(void 0, void 0, voi
     }
 });
 exports.cleanupDuplicateBankAccounts = cleanupDuplicateBankAccounts;
+/**
+ * Reorder banks and safes
+ * POST /api/treasury/banks/reorder
+ */
+const reorderBanks = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const connection = yield (0, db_1.getConnection)();
+    try {
+        yield connection.beginTransaction();
+        const { orders } = req.body; // Array of { id: string, sortOrder: number }
+        if (!Array.isArray(orders)) {
+            connection.release();
+            return res.status(400).json({ error: 'orders must be an array of { id, sortOrder }' });
+        }
+        for (const item of orders) {
+            yield connection.query('UPDATE banks SET sortOrder = ? WHERE id = ?', [Number(item.sortOrder) || 0, item.id]);
+        }
+        yield connection.commit();
+        const user = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
+        yield (0, auditController_1.logAction)(user, 'BANK', 'REORDER', 'إعادة ترتيب البنوك والخزائن', `تم تحديث ترتيب ${orders.length} حساب`);
+        eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'banks', updatedBy: user });
+        res.json({ success: true, message: 'تم حفظ الترتيب الجديد بنجاح' });
+    }
+    catch (error) {
+        yield connection.rollback();
+        return (0, errorHandler_1.handleControllerError)(res, error, 'reorderBanks');
+    }
+    finally {
+        connection.release();
+    }
+});
+exports.reorderBanks = reorderBanks;

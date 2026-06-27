@@ -110,10 +110,11 @@ const getPublicBranding = (_req, res) => __awaiter(void 0, void 0, void 0, funct
                 loginTextColor: additionalConfig.loginTextColor || '',
                 loginCardColor: additionalConfig.loginCardColor || '',
                 appFontSize: additionalConfig.appFontSize || 16,
+                themeColor: additionalConfig.themeColor || 'teal',
             });
         }
         else {
-            res.json({ appName: '', appLogoUrl: '', companyName: '', logo: '', companySlogan: '', loginAccentColor: '', loginBgGradient: '', loginTextColor: '', loginCardColor: '', appFontSize: 16 });
+            res.json({ appName: '', appLogoUrl: '', companyName: '', logo: '', companySlogan: '', loginAccentColor: '', loginBgGradient: '', loginTextColor: '', loginCardColor: '', appFontSize: 16, themeColor: 'teal' });
         }
     }
     catch (error) {

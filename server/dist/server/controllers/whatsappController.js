@@ -42,34 +42,35 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendWhatsAppTextMessage = exports.sendInvoicePDFViaWhatsApp = exports.receiveWebhook = exports.verifyWebhook = exports.getMessageLogs = exports.testConnection = exports.updateWhatsAppSettings = exports.getWhatsAppSettings = void 0;
+exports.sendWhatsAppTextMessage = exports.sendInvoicePDFViaWhatsApp = exports.receiveWebhook = exports.verifyWebhook = exports.getMessageLogs = exports.testConnection = exports.initializeWhatsAppInstance = exports.getWhatsAppState = exports.logoutWhatsAppInstance = exports.updateWhatsAppSettings = exports.getWhatsAppSettings = void 0;
 const db_1 = require("../db");
 const uuid_1 = require("uuid");
 const whatsappService = __importStar(require("../services/whatsappService"));
 // ═══════════════════════════════════════════════════════════
 // WhatsApp Controller
-// Settings CRUD, test connection, message logs, webhooks
+// Settings CRUD, connection state, QR code initialization, logs, webhooks
 // ═══════════════════════════════════════════════════════════
 // ── Settings ───────────────────────────────────────────────
-/** GET /api/whatsapp/settings — Returns settings with masked access token */
+/** GET /api/whatsapp/settings — Returns settings with masked API key */
 const getWhatsAppSettings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
         const settings = yield whatsappService.getSettings();
         if (!settings) {
             return res.json({
                 isEnabled: false,
-                phoneNumberId: '',
-                accessToken: '',
-                wabaId: '',
+                provider: 'EMBEDDED',
+                apiUrl: '',
+                instanceName: '',
+                apiKey: '',
                 webhookToken: '',
                 sendOnInvoiceConfirm: true,
                 sendOnPaymentRecord: true,
                 sendPOSReceipt: false,
             });
         }
-        // Mask access token — never expose the full value
-        const maskedToken = maskToken(settings.accessToken);
-        return res.json(Object.assign(Object.assign({}, settings), { accessToken: maskedToken }));
+        // Mask API key — never expose the full value
+        const maskedKey = maskToken(settings.apiKey);
+        return res.json(Object.assign(Object.assign({}, settings), { apiKey: maskedKey }));
     }
     catch (err) {
         console.error('❌ [WhatsApp] getSettings error:', err);
@@ -80,20 +81,20 @@ exports.getWhatsAppSettings = getWhatsAppSettings;
 /** PUT /api/whatsapp/settings — Upsert settings row */
 const updateWhatsAppSettings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const { isEnabled, phoneNumberId, accessToken, wabaId, webhookToken, sendOnInvoiceConfirm, sendOnPaymentRecord, sendPOSReceipt, } = req.body;
+        const { isEnabled, provider, apiUrl, instanceName, apiKey, webhookToken, sendOnInvoiceConfirm, sendOnPaymentRecord, sendPOSReceipt, } = req.body;
         const existing = yield whatsappService.getSettings();
         if (existing) {
-            // Build update — only update accessToken if a new value was sent (not the masked one)
-            const isNewToken = accessToken && !accessToken.startsWith('••');
-            const tokenValue = isNewToken ? accessToken : existing.accessToken;
+            const isNewKey = apiKey && !apiKey.startsWith('••');
+            const keyValue = isNewKey ? apiKey : existing.apiKey;
             yield db_1.pool.query(`UPDATE whatsapp_settings SET 
-         isEnabled = ?, phoneNumberId = ?, accessToken = ?, wabaId = ?, webhookToken = ?,
+         isEnabled = ?, provider = ?, apiUrl = ?, instanceName = ?, apiKey = ?, webhookToken = ?,
          sendOnInvoiceConfirm = ?, sendOnPaymentRecord = ?, sendPOSReceipt = ?
          WHERE id = ?`, [
                 isEnabled !== null && isEnabled !== void 0 ? isEnabled : existing.isEnabled,
-                phoneNumberId !== null && phoneNumberId !== void 0 ? phoneNumberId : existing.phoneNumberId,
-                tokenValue,
-                wabaId !== null && wabaId !== void 0 ? wabaId : existing.wabaId,
+                provider !== null && provider !== void 0 ? provider : existing.provider,
+                apiUrl !== null && apiUrl !== void 0 ? apiUrl : existing.apiUrl,
+                instanceName !== null && instanceName !== void 0 ? instanceName : existing.instanceName,
+                keyValue,
                 webhookToken !== null && webhookToken !== void 0 ? webhookToken : existing.webhookToken,
                 sendOnInvoiceConfirm !== null && sendOnInvoiceConfirm !== void 0 ? sendOnInvoiceConfirm : existing.sendOnInvoiceConfirm,
                 sendOnPaymentRecord !== null && sendOnPaymentRecord !== void 0 ? sendOnPaymentRecord : existing.sendOnPaymentRecord,
@@ -102,21 +103,35 @@ const updateWhatsAppSettings = (req, res) => __awaiter(void 0, void 0, void 0, f
             ]);
         }
         else {
-            // First-time insert
             const id = (0, uuid_1.v4)();
             yield db_1.pool.query(`INSERT INTO whatsapp_settings 
-         (id, isEnabled, phoneNumberId, accessToken, wabaId, webhookToken, sendOnInvoiceConfirm, sendOnPaymentRecord, sendPOSReceipt)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+         (id, isEnabled, provider, apiUrl, instanceName, apiKey, accessToken, webhookToken, sendOnInvoiceConfirm, sendOnPaymentRecord, sendPOSReceipt)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                 id,
                 isEnabled !== null && isEnabled !== void 0 ? isEnabled : false,
-                phoneNumberId || '',
-                accessToken || '',
-                wabaId || '',
+                provider || 'EMBEDDED',
+                apiUrl || '',
+                instanceName || '',
+                apiKey || '',
+                '', // accessToken default value to prevent DB constraint errors
                 webhookToken || '',
                 sendOnInvoiceConfirm !== null && sendOnInvoiceConfirm !== void 0 ? sendOnInvoiceConfirm : true,
                 sendOnPaymentRecord !== null && sendOnPaymentRecord !== void 0 ? sendOnPaymentRecord : true,
                 sendPOSReceipt !== null && sendPOSReceipt !== void 0 ? sendPOSReceipt : false,
             ]);
+        }
+        // Automatically try to set webhook if enabled (only for external Evolution API)
+        if (isEnabled && provider === 'EVOLUTION' && apiUrl && instanceName) {
+            try {
+                const protocol = req.protocol;
+                const host = req.get('host');
+                const webhookUrl = `${protocol}://${host}/api/whatsapp/webhook`;
+                yield whatsappService.setWebhook(webhookUrl);
+                console.log(`✅ [WhatsApp] Webhook auto-configured for instance ${instanceName}: ${webhookUrl}`);
+            }
+            catch (webhookErr) {
+                console.warn('⚠️ [WhatsApp] Webhook auto-configuration failed:', webhookErr.message);
+            }
         }
         return res.json({ success: true, message: 'تم حفظ إعدادات واتساب' });
     }
@@ -126,6 +141,65 @@ const updateWhatsAppSettings = (req, res) => __awaiter(void 0, void 0, void 0, f
     }
 });
 exports.updateWhatsAppSettings = updateWhatsAppSettings;
+/** POST /api/whatsapp/logout — Disconnect and clean session keys */
+const logoutWhatsAppInstance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const isEnabled = yield whatsappService.isWhatsAppEnabled();
+        if (!isEnabled) {
+            return res.status(400).json({ error: 'خدمة واتساب غير مفعّلة حالياً' });
+        }
+        const result = yield whatsappService.logoutInstance();
+        if (result.success) {
+            return res.json({ success: true, message: 'تم قطع الاتصال وحذف الجلسة بنجاح ✅' });
+        }
+        return res.status(400).json({ success: false, error: result.error });
+    }
+    catch (err) {
+        console.error('❌ [WhatsApp] logoutWhatsAppInstance error:', err);
+        return res.status(500).json({ error: 'فشل قطع الاتصال بالواتساب' });
+    }
+});
+exports.logoutWhatsAppInstance = logoutWhatsAppInstance;
+// ── Connection State & QR Code ─────────────────────────────
+/** GET /api/whatsapp/state — Get WhatsApp connection status */
+const getWhatsAppState = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const isEnabled = yield whatsappService.isWhatsAppEnabled();
+        if (!isEnabled) {
+            return res.json({ state: 'close', message: 'خدمة واتساب غير مفعّلة حالياً' });
+        }
+        const stateResult = yield whatsappService.getConnectionState();
+        return res.json(stateResult);
+    }
+    catch (err) {
+        console.error('❌ [WhatsApp] getWhatsAppState error:', err);
+        return res.status(500).json({ state: 'error', error: err.message || 'فشل في جلب حالة الاتصال' });
+    }
+});
+exports.getWhatsAppState = getWhatsAppState;
+/** POST /api/whatsapp/initialize — Initialize instance and return QR code */
+const initializeWhatsAppInstance = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const isEnabled = yield whatsappService.isWhatsAppEnabled();
+        if (!isEnabled) {
+            return res.status(400).json({ error: 'يرجى تفعيل خدمة واتساب أولاً وحفظ الإعدادات' });
+        }
+        const qrResult = yield whatsappService.getQRCode();
+        if (qrResult.success) {
+            return res.json({
+                success: true,
+                code: qrResult.code,
+                base64: qrResult.base64
+            });
+        }
+        return res.status(400).json({ success: false, error: qrResult.error });
+    }
+    catch (err) {
+        console.error('❌ [WhatsApp] initializeWhatsAppInstance error:', err);
+        return res.status(500).json({ error: 'فشل في إنشاء المثيل واسترجاع رمز QR' });
+    }
+});
+exports.initializeWhatsAppInstance = initializeWhatsAppInstance;
 // ── Test Connection ────────────────────────────────────────
 /** POST /api/whatsapp/test — Send a test text message */
 const testConnection = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
@@ -171,67 +245,56 @@ const getMessageLogs = (req, res) => __awaiter(void 0, void 0, void 0, function*
 });
 exports.getMessageLogs = getMessageLogs;
 // ── Webhook Handlers ───────────────────────────────────────
-/** GET /api/whatsapp/webhook — Meta verification handshake */
+/** GET /api/whatsapp/webhook — Meta verification handshake (kept for safety/stub) */
 const verifyWebhook = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const mode = req.query['hub.mode'];
-    const token = req.query['hub.verify_token'];
     const challenge = req.query['hub.challenge'];
-    // Resolve verify token: DB settings or .env fallback
-    const settings = yield whatsappService.getSettings();
-    const expectedToken = (settings === null || settings === void 0 ? void 0 : settings.webhookToken) || process.env.WHATSAPP_WEBHOOK_VERIFY_TOKEN || '';
-    if (mode === 'subscribe' && token === expectedToken) {
-        console.log('✅ [WhatsApp] Webhook verified');
+    if (challenge) {
         return res.status(200).send(challenge);
     }
-    console.warn('⚠️ [WhatsApp] Webhook verification failed');
-    return res.sendStatus(403);
+    return res.sendStatus(200);
 });
 exports.verifyWebhook = verifyWebhook;
-/** POST /api/whatsapp/webhook — Receive status updates + inbound messages */
+/** POST /api/whatsapp/webhook — Receive Evolution API status updates + inbound messages */
 const receiveWebhook = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    // Always respond 200 to Meta — never return errors or Meta will retry
+    var _a, _b, _c;
+    // Always return 200 immediately to prevent webhook retries
     res.sendStatus(200);
     try {
         const body = req.body;
-        if ((body === null || body === void 0 ? void 0 : body.object) !== 'whatsapp_business_account')
+        const event = body === null || body === void 0 ? void 0 : body.event;
+        const data = body === null || body === void 0 ? void 0 : body.data;
+        if (!event || !data)
             return;
-        for (const entry of body.entry || []) {
-            for (const change of entry.changes || []) {
-                const value = change.value;
-                if (!value)
-                    continue;
-                // Handle delivery status updates
-                yield processStatusUpdates(value.statuses || []);
-                // Handle inbound customer messages
-                yield processInboundMessages(value.messages || []);
+        // Handle Inbound Messages
+        if (event === 'messages.upsert') {
+            // Only log inbound customer messages (ignore our own outbound triggers)
+            if (((_a = data === null || data === void 0 ? void 0 : data.key) === null || _a === void 0 ? void 0 : _a.fromMe) === false) {
+                yield whatsappService.logInboundMessage(data);
+            }
+        }
+        // Handle Message Status Delivery Reports
+        else if (event === 'messages.update') {
+            const wamid = (_b = data === null || data === void 0 ? void 0 : data.key) === null || _b === void 0 ? void 0 : _b.id;
+            const statusNum = (_c = data === null || data === void 0 ? void 0 : data.update) === null || _c === void 0 ? void 0 : _c.status;
+            let statusStr = '';
+            if (statusNum === 1 || statusNum === 2) {
+                // 1 = server ack/sent, 2 = delivered to device
+                statusStr = statusNum === 2 ? 'delivered' : 'sent';
+            }
+            else if (statusNum === 3 || statusNum === 4) {
+                // 3 = read by recipient, 4 = played audio
+                statusStr = 'read';
+            }
+            if (wamid && statusStr) {
+                yield whatsappService.updateMessageStatus(wamid, statusStr);
             }
         }
     }
     catch (err) {
-        // Log but don't crash — webhook already returned 200
-        console.error('❌ [WhatsApp] Webhook processing error:', err);
+        console.error('❌ [WhatsApp Webhook] Processing error:', err);
     }
 });
 exports.receiveWebhook = receiveWebhook;
-// ── Webhook Processing ─────────────────────────────────────
-function processStatusUpdates(statuses) {
-    return __awaiter(this, void 0, void 0, function* () {
-        for (const status of statuses) {
-            if (!(status === null || status === void 0 ? void 0 : status.id) || !(status === null || status === void 0 ? void 0 : status.status))
-                continue;
-            yield whatsappService.updateMessageStatus(status.id, status.status);
-        }
-    });
-}
-function processInboundMessages(messages) {
-    return __awaiter(this, void 0, void 0, function* () {
-        for (const message of messages) {
-            if (!(message === null || message === void 0 ? void 0 : message.id))
-                continue;
-            yield whatsappService.logInboundMessage(message);
-        }
-    });
-}
 // ── Helpers ────────────────────────────────────────────────
 /** Mask a token to ••••••XXXXXX (last 6 chars visible) */
 function maskToken(token) {
@@ -242,7 +305,7 @@ function maskToken(token) {
 /** POST /api/whatsapp/send-invoice-pdf — Receive uploaded PDF and send via WhatsApp API or fallback to Web */
 const sendInvoicePDFViaWhatsApp = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const { phone, invoiceId, caption } = req.body;
+        const { phone, invoiceId, caption, referenceType = 'invoice', referenceId } = req.body;
         const file = req.file;
         if (!phone) {
             return res.status(400).json({ error: 'رقم الهاتف مطلوب' });
@@ -258,18 +321,21 @@ const sendInvoicePDFViaWhatsApp = (req, res) => __awaiter(void 0, void 0, void 0
         const isEnabled = yield whatsappService.isWhatsAppEnabled();
         if (isEnabled) {
             try {
-                // 1. Upload local PDF file directly to Meta's servers
-                const mediaId = yield whatsappService.uploadMedia(file.path, file.originalname || `Invoice_${invoiceId}.pdf`);
-                // 2. Deliver via Meta Cloud API using the media ID
+                // Deliver via Evolution API directly from the public file url
+                const actualReferenceId = referenceId || invoiceId;
                 const result = yield whatsappService.sendDocument({
                     to: formattedPhone,
-                    mediaId,
-                    filename: file.originalname || `Invoice_${invoiceId}.pdf`,
-                    caption: caption || 'فاتورة المبيعات الخاصة بك 📄',
-                    referenceType: 'invoice',
-                    referenceId: invoiceId,
+                    documentUrl: fileUrl,
+                    filename: file.originalname || `Doc_${actualReferenceId || Date.now()}.pdf`,
+                    caption: caption || 'المستند الخاص بك 📄',
+                    referenceType: referenceType,
+                    referenceId: actualReferenceId,
                 });
                 if (result.success) {
+                    if (res.headersSent) {
+                        console.warn('⚠️ [WhatsApp] sendInvoicePDFViaWhatsApp: Headers already sent, skipping success response.');
+                        return;
+                    }
                     return res.json({
                         success: true,
                         method: 'api',
@@ -281,18 +347,24 @@ const sendInvoicePDFViaWhatsApp = (req, res) => __awaiter(void 0, void 0, void 0
                     throw new Error(result.error);
                 }
             }
-            catch (uploadOrSendError) {
-                console.warn('⚠️ [WhatsApp] Meta Media Send failed, falling back to manual redirect link:', uploadOrSendError);
+            catch (sendError) {
+                console.warn('⚠️ [WhatsApp] Evolution Media Send failed, falling back to manual redirect link:', sendError);
+                if (res.headersSent) {
+                    console.warn('⚠️ [WhatsApp] sendInvoicePDFViaWhatsApp: Headers already sent, skipping fallback response.');
+                    return;
+                }
                 return res.json({
                     success: true,
                     method: 'web',
                     fileUrl: `/uploads/whatsapp/${file.filename}`,
-                    warning: `فشل الإرسال التلقائي: ${uploadOrSendError.message || 'خطأ غير معروف'}. تم التحويل للإرسال اليدوي`,
+                    warning: `فشل الإرسال التلقائي: ${sendError.message || 'خطأ غير معروف'}. تم التحويل للإرسال اليدوي`,
                 });
             }
         }
         else {
-            // Fallback to Web link
+            // Fallback to Web link (WhatsApp Web redirect link)
+            if (res.headersSent)
+                return;
             return res.json({
                 success: true,
                 method: 'web',
@@ -302,6 +374,8 @@ const sendInvoicePDFViaWhatsApp = (req, res) => __awaiter(void 0, void 0, void 0
     }
     catch (err) {
         console.error('❌ [WhatsApp] sendInvoicePDFViaWhatsApp error:', err);
+        if (res.headersSent)
+            return;
         return res.status(500).json({ error: 'فشل إرسال الفاتورة عبر واتساب' });
     }
 });
@@ -322,6 +396,10 @@ const sendWhatsAppTextMessage = (req, res) => __awaiter(void 0, void 0, void 0, 
                 referenceType: referenceType || 'membership',
                 referenceId: referenceId || undefined,
             });
+            if (res.headersSent) {
+                console.warn('⚠️ [WhatsApp] sendWhatsAppTextMessage: Headers already sent, skipping response.');
+                return;
+            }
             if (result.success) {
                 return res.json({ success: true, method: 'api', wamid: result.wamid });
             }
@@ -334,6 +412,8 @@ const sendWhatsAppTextMessage = (req, res) => __awaiter(void 0, void 0, void 0, 
             }
         }
         else {
+            if (res.headersSent)
+                return;
             return res.json({
                 success: true,
                 method: 'web',
@@ -342,6 +422,8 @@ const sendWhatsAppTextMessage = (req, res) => __awaiter(void 0, void 0, void 0, 
     }
     catch (err) {
         console.error('❌ [WhatsApp] sendWhatsAppTextMessage error:', err);
+        if (res.headersSent)
+            return;
         return res.status(500).json({ error: 'فشل إرسال رسالة واتساب' });
     }
 });

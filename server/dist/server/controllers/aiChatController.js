@@ -60,6 +60,7 @@ const db_1 = require("../db");
 const errorHandler_1 = require("../utils/errorHandler");
 const aiActionRegistry_1 = require("./aiActionRegistry");
 const aiKnowledgeController_1 = require("./aiKnowledgeController");
+const brandConfig_1 = require("../config/brandConfig");
 // ═══════════════════════════════════════════════════════════
 // AI CHATBOT CONTROLLER — DaftriX ERP AI Intelligence Engine
 // Supports Gemini, Groq, Cloudflare, and OpenRouter
@@ -332,8 +333,8 @@ function generateAIContent(model, params) {
                     throw new Error('مفتاح OpenRouter غير مفعل');
                 apiUrl = 'https://openrouter.ai/api/v1/chat/completions';
                 headers['Authorization'] = `Bearer ${_aiConfig.openRouterApiKey}`;
-                headers['HTTP-Referer'] = 'https://daftrix.com';
-                headers['X-Title'] = 'DaftriX ERP';
+                headers['HTTP-Referer'] = brandConfig_1.SERVER_BRAND.website || 'https://erp.com';
+                headers['X-Title'] = `${brandConfig_1.SERVER_BRAND.name} AI`;
             }
             else if (provider === 'cloudflare') {
                 if (!(_aiConfig === null || _aiConfig === void 0 ? void 0 : _aiConfig.cloudflareAccountId) || !(_aiConfig === null || _aiConfig === void 0 ? void 0 : _aiConfig.cloudflareApiToken)) {
@@ -1953,7 +1954,7 @@ function getAccountingContext() {
     });
 }
 function getAppGuideContext() {
-    return `دليل استخدام نظام DaftriX ERP:
+    return `دليل استخدام نظام ${brandConfig_1.SERVER_BRAND.name}:
 
 📊 لوحة التحكم (الداشبورد): الصفحة الرئيسية — تعرض ملخص المبيعات والمخزون والخزينة. اضغط على أي بطاقة للتفاصيل.
 
@@ -2169,7 +2170,7 @@ function getBusinessProfile() {
             const s = stats[0];
             return `
 === معلومات الشركة ===
-اسم الشركة: ${(parsedCfg === null || parsedCfg === void 0 ? void 0 : parsedCfg.companyName) || 'DaftriX'}
+اسم الشركة: ${(parsedCfg === null || parsedCfg === void 0 ? void 0 : parsedCfg.companyName) || brandConfig_1.SERVER_BRAND.name}
 النشاط: ${(parsedCfg === null || parsedCfg === void 0 ? void 0 : parsedCfg.businessType) || 'تجارة'}
 عدد العملاء: ${s.totalCustomers}
 عدد الموردين: ${s.totalSuppliers}
@@ -2438,7 +2439,7 @@ function getCasualContext() {
     });
 }
 // ── SYSTEM PROMPT — Executive J.A.R.V.I.S Persona ──
-const SYSTEM_PROMPT = `أنت "Dax" (دكس) — المساعد الذكي لنظام DaftriX ERP.
+const SYSTEM_PROMPT = `أنت "Dax" (دكس) — المساعد الذكي لنظام ${brandConfig_1.SERVER_BRAND.name}.
 أنت حاد الذكاء، ودود بطبيعتك، ومباشر. أنت زميل في الشركة وليس مجرد بوت — فكّر في نفسك كالمستشار التنفيذي اللي دايماً موجود.
 
 TONE SWITCHING:
@@ -2838,7 +2839,7 @@ const handleAIChat = (req, res) => __awaiter(void 0, void 0, void 0, function* (
 4. يمكنك استخدام "النبض المالي الحي" أعلاه لإبقاء إجاباتك مرتبطة بالواقع المالي لليوم إذا لزم الأمر — لكن لا تكرره في كل رد.
 ===================\n`;
                 // Inject right after the first line
-                dynamicSystemPrompt = dynamicSystemPrompt.replace('المساعد الذكي لنظام DaftriX ERP', `المساعد الذكي لنظام DaftriX ERP${profileAddition}`);
+                dynamicSystemPrompt = dynamicSystemPrompt.replace(`المساعد الذكي لنظام ${brandConfig_1.SERVER_BRAND.name}`, `المساعد الذكي لنظام ${brandConfig_1.SERVER_BRAND.name}${profileAddition}`);
             }
         }
         catch (e) {
@@ -3744,7 +3745,7 @@ const handleDailyBrief = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 contents: [
                     { role: 'user', parts: [{ text: briefPrompt }] },
                 ],
-                systemInstruction: { parts: [{ text: 'أنت Dax، المساعد التنفيذي لنظام DaftriX ERP. اكتب ملخصات موجزة ومفيدة.' }] },
+                systemInstruction: { parts: [{ text: `أنت Dax، المساعد التنفيذي لنظام ${brandConfig_1.SERVER_BRAND.name}. اكتب ملخصات موجزة ومفيدة.` }] },
                 generationConfig: { maxOutputTokens: 400 },
             });
             const responseText = (_f = (_e = (_d = (_c = (_b = (_a = result === null || result === void 0 ? void 0 : result.response) === null || _a === void 0 ? void 0 : _a.candidates) === null || _b === void 0 ? void 0 : _b[0]) === null || _c === void 0 ? void 0 : _c.content) === null || _d === void 0 ? void 0 : _d.parts) === null || _e === void 0 ? void 0 : _e[0]) === null || _f === void 0 ? void 0 : _f.text;

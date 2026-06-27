@@ -134,6 +134,20 @@ class MembershipBilling {
             if (!providedConn)
                 yield conn.beginTransaction();
             try {
+                // Retrieve invoice to verify if it is fully paid
+                const [invoices] = yield conn.query('SELECT total, paidAmount FROM invoices WHERE id = ?', [invoiceId]);
+                if (invoices.length > 0) {
+                    const inv = invoices[0];
+                    const total = Number(inv.total || 0);
+                    const paidAmount = Number(inv.paidAmount || 0);
+                    // If paid amount is less than total (with 0.01 tolerance for rounding),
+                    // do not reactivate membership yet.
+                    if (paidAmount < total - 0.01) {
+                        if (!providedConn)
+                            yield conn.commit();
+                        return;
+                    }
+                }
                 const [memberships] = yield conn.query('SELECT id, status FROM memberships WHERE invoiceId = ? AND status = ?', [invoiceId, 'PENDING_PAYMENT']);
                 // Idempotency: If no memberships are PENDING_PAYMENT, we skip cleanly
                 for (const m of memberships) {
@@ -146,6 +160,78 @@ class MembershipBilling {
                 if (!providedConn)
                     yield conn.rollback();
                 throw error;
+            }
+            finally {
+                if (!providedConn)
+                    conn.release();
+            }
+        });
+    }
+    /**
+     * Process recurring billing for memberships (CRON)
+     * Finds active RECURRING memberships whose nextBillingDate has arrived,
+     * generates a new invoice, shifts billing dates, and optionally changes status to PENDING_PAYMENT.
+     */
+    static processRecurringBilling(providedConn) {
+        return __awaiter(this, void 0, void 0, function* () {
+            var _a, _b;
+            const conn = providedConn || (yield (0, db_1.getConnection)());
+            try {
+                const todayStr = dateEngine_1.DateEngine.todayStr();
+                const query = `
+                SELECT m.id, m.customerId, m.salesmanId, m.packageId, m.nextBillingDate, m.endDate,
+                       p.name as customerName,
+                       pk.name as packageName, pk.price, pk.durationDays, pk.commissionType, pk.commissionValue
+                FROM memberships m
+                JOIN partners p ON m.customerId = p.id
+                JOIN membership_packages pk ON m.packageId = pk.id
+                WHERE m.billingType = 'RECURRING'
+                  AND m.status = 'ACTIVE'
+                  AND m.nextBillingDate <= ?
+            `;
+                const [dueMemberships] = yield conn.query(query, [todayStr]);
+                const [settings] = yield conn.query('SELECT requireInvoicePayment FROM membership_settings WHERE id = 1');
+                const requireInvoicePayment = settings.length > 0 ? !!settings[0].requireInvoicePayment : true;
+                for (const m of dueMemberships) {
+                    const itemConn = providedConn || (yield (0, db_1.getConnection)());
+                    if (!providedConn)
+                        yield itemConn.beginTransaction();
+                    try {
+                        const [lockRows] = yield itemConn.query('SELECT status, nextBillingDate FROM memberships WHERE id = ? FOR UPDATE', [m.id]);
+                        const statusUpper = ((_a = lockRows[0]) === null || _a === void 0 ? void 0 : _a.status) ? lockRows[0].status.toUpperCase() : '';
+                        const nextBillingDateStr = ((_b = lockRows[0]) === null || _b === void 0 ? void 0 : _b.nextBillingDate) ? dateEngine_1.DateEngine.format(lockRows[0].nextBillingDate, 'YYYY-MM-DD') : '';
+                        if (lockRows.length === 0 || statusUpper !== 'ACTIVE' || nextBillingDateStr > todayStr) {
+                            if (!providedConn) {
+                                yield itemConn.rollback();
+                                itemConn.release();
+                            }
+                            continue;
+                        }
+                        const billingRes = yield this.generateInvoice(m.id, m.customerId, m.customerName, m.packageId, 'System Cron', itemConn, false, undefined, m.salesmanId, undefined // branchId is not tracked on memberships/partners, defaults to null in DB
+                        );
+                        const lastBillingDate = m.nextBillingDate;
+                        const nextBillingDate = dateEngine_1.DateEngine.addDays(lastBillingDate, m.durationDays).format('YYYY-MM-DD');
+                        const endDate = nextBillingDate;
+                        yield itemConn.query(`UPDATE memberships 
+                         SET lastBillingDate = ?, nextBillingDate = ?, endDate = ? 
+                         WHERE id = ?`, [lastBillingDate, nextBillingDate, endDate, m.id]);
+                        yield lifecycle_1.MembershipLifecycle.addLog(m.id, 'Billing Cycle Processed', `Generated invoice ${billingRes.invoiceId} for next cycle. Next billing: ${nextBillingDate}`, 'System Cron', { invoiceId: billingRes.invoiceId }, itemConn);
+                        if (requireInvoicePayment) {
+                            yield lifecycle_1.MembershipLifecycle.changeStatus(m.id, 'PENDING_PAYMENT', 'Billing Cycle Invoice Unpaid', `Invoice ${billingRes.invoiceId} generated. Waiting for payment.`, 'System Cron', itemConn);
+                        }
+                        if (!providedConn)
+                            yield itemConn.commit();
+                    }
+                    catch (err) {
+                        if (!providedConn)
+                            yield itemConn.rollback();
+                        console.error(`Failed to process recurring billing for membership ${m.id}:`, err);
+                    }
+                    finally {
+                        if (!providedConn)
+                            itemConn.release();
+                    }
+                }
             }
             finally {
                 if (!providedConn)

@@ -5,14 +5,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport"
     content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no, maximum-scale=1" />
-  <meta name="description" content="DaftriX ERP - نظام إدارة الموارد المؤسسية المتكامل" />
-  <meta name="theme-color" content="#0f766e" />
+  <meta name="description" content="نظام إدارة الموارد المؤسسية المتكامل" id="app-meta-desc" />
+  <meta name="theme-color" content="#0f766e" id="app-theme-color" />
   <!-- Preconnect to Google Fonts for faster loading -->
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link rel="dns-prefetch" href="https://fonts.googleapis.com" />
   <link rel="dns-prefetch" href="https://fonts.gstatic.com" />
-  <title>DaftriX ERP</title>
+  <title>ERP</title>
   <link rel="icon" type="image/webp" href="/logo.webp" id="app-favicon">
   <link rel="apple-touch-icon" href="/logo.webp">
   <link rel="stylesheet" href="/fonts/cairo.css">
@@ -22,9 +22,18 @@
   <script>
     // ⚡ Apply cached branding instantly (before React loads) to prevent flash
     (function() {
-      // Title
+      // Title — use cached brand name, fallback to generic
       var bn = localStorage.getItem('appBrandName');
       if (bn) document.title = bn;
+      // Meta description
+      var desc = document.getElementById('app-meta-desc');
+      if (desc && bn) desc.content = bn + ' - نظام إدارة الموارد المؤسسية المتكامل';
+      // Theme color — use cached primary color if available
+      var pc = localStorage.getItem('appBrandPrimaryColor');
+      if (pc) {
+        var tc = document.getElementById('app-theme-color');
+        if (tc) tc.content = pc;
+      }
       // Font size
       var fs = localStorage.getItem('appFontSize');
       if (fs && fs !== '16') document.documentElement.style.fontSize = fs + 'px';
@@ -39,14 +48,14 @@
       if (df) df.media = 'all';
     })();
   </script>
-  <script type="module" crossorigin src="/assets/index-BuYKZ1Y1.js"></script>
+  <script type="module" crossorigin src="/assets/index-CVlzw8XQ.js"></script>
 <link rel="modulepreload" crossorigin href="/assets/react-vendor-f5Bj76n5.js">
   <link rel="modulepreload" crossorigin href="/assets/socket-vendor-TjCxX7sJ.js">
-  <link rel="modulepreload" crossorigin href="/assets/icons-vendor-C8XLyQmd.js">
+  <link rel="modulepreload" crossorigin href="/assets/icons-vendor-CiR1f2zr.js">
   <link rel="modulepreload" crossorigin href="/assets/dnd-vendor-PcoJF5-4.js">
   <link rel="modulepreload" crossorigin href="/assets/zustand-vendor-CQxCPuJa.js">
 <link rel="modulepreload" crossorigin href="/assets/query-vendor-CXp60fSw.js">
-  <link rel="stylesheet" crossorigin href="/assets/index-CiHcqNO5.css">
+  <link rel="stylesheet" crossorigin href="/assets/index-C7F-0_KX.css">
 </head>
 
 <body>

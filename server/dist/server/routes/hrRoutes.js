@@ -258,6 +258,7 @@ router.put('/smart-attendance/reset-device/:employeeId', (0, authMiddleware_1.re
 // Analytics
 router.get('/smart-attendance/stats', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getStats);
 router.get('/smart-attendance/branch-qr/:branchId', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.generateBranchQr);
+router.get('/smart-attendance/branch-stats/:branchId', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getTodayBranchKioskStats);
 // Geofence locations (admin only)
 router.get('/smart-attendance/locations', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.listLocations);
 router.get('/smart-attendance/locations/:id', (0, authMiddleware_1.requirePermission)('hr.smart_register.view'), smartAttendanceController_1.getLocation);

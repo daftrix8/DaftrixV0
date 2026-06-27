@@ -463,13 +463,14 @@ const createJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const currentUserRole = authReq.user ? authReq.user.role : undefined;
         const systemConfig = authReq.systemConfig;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
+            const u = authReq.user;
             const context = {
                 type: 'JOURNAL',
                 date,
                 notes: description,
                 costCenterId: (_c = lines[0]) === null || _c === void 0 ? void 0 : _c.costCenterId,
                 createdBy,
-                currentUser: createdBy,
+                currentUser: u ? `${u.username || ''}|${u.name || ''}` : createdBy,
                 currentUserRole
             };
             const validationResult = yield (0, policyEnforcement_1.validateTransactionFull)(context, systemConfig, conn);
@@ -570,13 +571,14 @@ const updateJournalEntry = (req, res) => __awaiter(void 0, void 0, void 0, funct
         const currentUserRole = authReq.user ? authReq.user.role : undefined;
         const systemConfig = authReq.systemConfig;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
+            const u = authReq.user;
             const context = {
                 type: 'JOURNAL',
                 date,
                 notes: description,
                 costCenterId: (_c = lines[0]) === null || _c === void 0 ? void 0 : _c.costCenterId,
                 createdBy: existingJData === null || existingJData === void 0 ? void 0 : existingJData.createdBy,
-                currentUser: updatedBy,
+                currentUser: u ? `${u.username || ''}|${u.name || ''}` : updatedBy,
                 currentUserRole
             };
             const validationResult = yield (0, policyEnforcement_1.validateTransactionFull)(context, systemConfig, conn);

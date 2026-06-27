@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.heavyQueryLimiter = exports.uploadLimiter = exports.reportLimiter = exports.createLimiter = exports.authLimiter = exports.apiLimiter = void 0;
+exports.storefrontOrderLimiter = exports.storefrontDraftLimiter = exports.heavyQueryLimiter = exports.uploadLimiter = exports.reportLimiter = exports.createLimiter = exports.authLimiter = exports.apiLimiter = void 0;
 const express_rate_limit_1 = __importDefault(require("express-rate-limit"));
 // ═══════════════════════════════════════════════════════════
 // RATE LIMITING — INTERNAL ERP (NOT a public API)
@@ -106,9 +106,33 @@ exports.heavyQueryLimiter = (0, express_rate_limit_1.default)({
     windowMs: 60 * 1000, // 1 minute
     max: 60, // 60 heavy queries/min
     message: {
-        error: 'تم تجاوز عدد الاستعلامات الكبيرة. يرجى الانتظار قليلاً.',
+        error: 'تم تجاوز الاستعلامات الكبيرة. يرجى الانتظار قليلاً.',
         message_en: 'Too many database queries, please slow down.',
         retryAfter: '1 minute'
     },
+    validate: false,
+});
+// Storefront guest draft checkout rate limiter (15 requests per minute per IP to prevent spamming)
+exports.storefrontDraftLimiter = (0, express_rate_limit_1.default)({
+    windowMs: 60 * 1000, // 1 minute
+    max: 15, // 15 requests per minute — debounced saving is 1s, so 15 is plenty for normal user typing but blocks script abuse
+    message: {
+        error: 'تم تجاوز الحد الأقصى للمحاولات. يرجى الانتظار قليلاً.',
+        message_en: 'Too many draft updates, please wait.',
+        retryAfter: '1 minute'
+    },
+    skip: (req) => process.env.NODE_ENV === 'test',
+    validate: false,
+});
+// Storefront guest order submission rate limiter (3 orders per minute per IP to prevent spamming)
+exports.storefrontOrderLimiter = (0, express_rate_limit_1.default)({
+    windowMs: 60 * 1000, // 1 minute
+    max: 3, // 3 orders per minute — generous for humans, blocks bot floods
+    message: {
+        error: 'تم تجاوز الحد الأقصى للطلبات. يرجى المحاولة بعد قليل.',
+        message_en: 'Too many order submissions, please wait.',
+        retryAfter: '1 minute'
+    },
+    skip: (req) => process.env.NODE_ENV === 'test',
     validate: false,
 });

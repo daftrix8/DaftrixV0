@@ -8,6 +8,8 @@ const router = (0, express_1.Router)();
 router.get('/public/:id', memberships_1.getPublicMembershipCard);
 // Secure all membership routes
 router.use(authMiddleware_1.authenticateToken);
+// Analytics
+router.get('/analytics/metrics', memberships_1.getSubscriptionAnalytics);
 // Settings — MUST be before /:id to avoid being caught by the wildcard
 router.get('/settings/config', memberships_1.getMembershipSettings);
 router.post('/settings/config', memberships_1.updateMembershipSettings);

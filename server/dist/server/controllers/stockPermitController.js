@@ -246,13 +246,14 @@ const createStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const authReq = req;
         const systemConfig = authReq.systemConfig;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
+            const u = authReq.user;
             const context = {
                 type,
                 date,
                 notes: description,
                 warehouseId: type === 'STOCK_PERMIT_IN' ? destWarehouseId : sourceWarehouseId,
                 createdBy,
-                currentUser: createdBy,
+                currentUser: u ? `${u.username || ''}|${u.name || ''}` : createdBy,
                 currentUserRole,
                 lines: items.map((i) => ({
                     productId: i.productId,
@@ -636,13 +637,14 @@ const updateStockPermit = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const createdBy = req.user ? req.user.name : (req.body.user || 'System');
         const currentUserRole = req.user ? req.user.role : undefined;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
+            const u = req.user;
             const context = {
                 type: permit.type,
                 date: date || permit.date,
                 notes: description !== undefined ? description : permit.description,
                 warehouseId: permit.type === 'STOCK_PERMIT_IN' ? permit.destWarehouseId : permit.sourceWarehouseId,
                 createdBy: permit.createdBy,
-                currentUser: createdBy,
+                currentUser: u ? `${u.username || ''}|${u.name || ''}` : createdBy,
                 currentUserRole,
                 lines: items === null || items === void 0 ? void 0 : items.map((i) => ({
                     productId: i.productId,

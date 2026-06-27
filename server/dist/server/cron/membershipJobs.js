@@ -16,6 +16,7 @@ exports.initializeMembershipJobs = initializeMembershipJobs;
 const node_schedule_1 = __importDefault(require("node-schedule"));
 const expiration_1 = require("../services/membershipEngine/expiration");
 const freezes_1 = require("../services/membershipEngine/freezes");
+const billing_1 = require("../services/membershipEngine/billing");
 function initializeMembershipJobs() {
     // Run daily at midnight server time (00:00)
     node_schedule_1.default.scheduleJob('0 0 * * *', () => __awaiter(this, void 0, void 0, function* () {
@@ -33,6 +34,13 @@ function initializeMembershipJobs() {
         }
         catch (error) {
             console.error('[CRON] Error processing auto-unfreezes:', error);
+        }
+        try {
+            yield billing_1.MembershipBilling.processRecurringBilling();
+            console.log('[CRON] Membership recurring billing processed successfully.');
+        }
+        catch (error) {
+            console.error('[CRON] Error processing recurring billing:', error);
         }
     }));
     console.log('[CRON] Membership jobs initialized.');

@@ -134,6 +134,10 @@ function initializeWebSocket(httpServer) {
     }
     io.use((socket, next) => {
         const token = socket.handshake.auth.token;
+        const isStorefront = socket.handshake.auth.isStorefront === true || socket.handshake.auth.isStorefront === 'true';
+        if (isStorefront) {
+            return next();
+        }
         if (!token) {
             return next(new Error('Authentication error'));
         }
@@ -150,72 +154,98 @@ function initializeWebSocket(httpServer) {
         }
     });
     io.on('connection', (socket) => {
-        if (!socket.user) {
+        const isStorefront = socket.handshake.auth.isStorefront === true || socket.handshake.auth.isStorefront === 'true';
+        if (!socket.user && !isStorefront) {
             console.error('❌ Socket connected without user data. Disconnecting.');
             socket.disconnect();
             return;
         }
         const user = socket.user;
-        console.log(`✅ User connected: ${user.name} (${socket.id})`);
-        // Track active user in unified registry
-        (0, realtimeState_1.addActiveUser)(socket.id, user.id, user.name, user.role, 'websocket');
-        // Send initial active POS carts list
-        socket.emit('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
-        // ===== USER PRESENCE =====
+        if (user) {
+            console.log(`✅ User connected: ${user.name} (${socket.id})`);
+            (0, realtimeState_1.addActiveUser)(socket.id, user.id, user.name, user.role, 'websocket');
+            socket.emit('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
+        }
+        else {
+            console.log(`✅ Storefront client connected (${socket.id})`);
+        }
+        // ===== USER PRESENCE (Staff only) =====
         socket.on('user:viewing', (data) => {
+            if (!user)
+                return;
             (0, realtimeState_1.updateActiveUserView)(socket.id, data.view);
         });
-        // ===== EDIT LOCKS =====
+        // ===== EDIT LOCKS (Staff only) =====
         socket.on('lock:request', (data, callback) => {
+            if (!user)
+                return callback({ success: false, error: 'Unauthorized' });
             const result = (0, realtimeState_1.acquireEditLock)(data.type, data.id, socket.id);
             callback(result);
         });
         socket.on('lock:release', (data) => {
+            if (!user)
+                return;
             (0, realtimeState_1.releaseEditLock)(data.type, data.id, socket.id);
         });
-        // ===== REAL-TIME DATA UPDATES =====
+        // ===== REAL-TIME DATA UPDATES (Staff only) =====
         socket.on('invoice:created', (invoice) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('invoice:new', {
                 invoice,
-                createdBy: user.name
+                createdBy: user.name || 'System'
             });
         });
         socket.on('invoice:updated', (invoice) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('invoice:changed', {
                 invoice,
-                updatedBy: user.name
+                updatedBy: user.name || 'System'
             });
         });
         socket.on('invoice:deleted', (invoiceId) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('invoice:removed', {
                 id: invoiceId,
-                deletedBy: user.name
+                deletedBy: user.name || 'System'
             });
         });
         socket.on('product:updated', (product) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('product:changed', {
                 product,
-                updatedBy: user.name
+                updatedBy: user.name || 'System'
             });
         });
         socket.on('stock:changed', (data) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('stock:updated', {
                 productId: data.productId,
                 newStock: data.newStock,
-                changedBy: user.name
+                changedBy: user.name || 'System'
             });
         });
         socket.on('partner:updated', (partner) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('partner:changed', {
                 partner,
-                updatedBy: user.name
+                updatedBy: user.name || 'System'
             });
         });
         socket.on('pos:cart:sync', (data) => {
+            if (!user)
+                return;
             (0, realtimeState_1.savePOSCartState)(user.id, data);
             eventBus_1.eventBus.broadcast('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
         });
         socket.on('pos:cart:remote-update', (data) => {
+            if (!user)
+                return;
             (0, realtimeState_1.savePOSCartState)(data.cashierId, Object.assign(Object.assign({}, data.cartState), { cashierId: data.cashierId, updatedByAdmin: user.name }));
             eventBus_1.eventBus.broadcast('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
             eventBus_1.eventBus.broadcast('pos:cart:remote-update-received', {
@@ -224,23 +254,29 @@ function initializeWebSocket(httpServer) {
                 adminName: user.name
             });
         });
-        // ===== GENERIC ENTITY UPDATES =====
+        // ===== GENERIC ENTITY UPDATES (Staff only) =====
         socket.on('entity:changed', (data) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('entity:changed', {
                 entityType: data.entityType,
                 entity: data.entity,
-                updatedBy: user.name
+                updatedBy: user.name || 'System'
             });
         });
         socket.on('entity:deleted', (data) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('entity:deleted', {
                 entityType: data.entityType,
                 entityId: data.entityId,
-                deletedBy: user.name
+                deletedBy: user.name || 'System'
             });
         });
         // ===== REAL-TIME CHAT =====
         socket.on('chat:send', (message) => __awaiter(this, void 0, void 0, function* () {
+            if (!user)
+                return;
             const sanitize = (str) => String(str || '').replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c] || c));
             const chatMessage = Object.assign(Object.assign({}, message), { message: sanitize(message.message || ''), userId: user.id, userName: user.name, timestamp: new Date().toISOString() });
             eventBus_1.eventBus.broadcast('chat:message', chatMessage);
@@ -263,6 +299,8 @@ function initializeWebSocket(httpServer) {
         }));
         // ===== PRIVATE CHAT =====
         socket.on('chat:private', (data) => __awaiter(this, void 0, void 0, function* () {
+            if (!user)
+                return;
             const privateMessage = {
                 id: data.id,
                 userId: user.id,
@@ -294,6 +332,8 @@ function initializeWebSocket(httpServer) {
         }));
         // ===== GROUP CHAT =====
         socket.on('chat:group', (data) => __awaiter(this, void 0, void 0, function* () {
+            if (!user)
+                return;
             const groupMessage = {
                 id: data.id,
                 userId: user.id,
@@ -325,6 +365,8 @@ function initializeWebSocket(httpServer) {
             }
         }));
         socket.on('chat:typing', (data) => {
+            if (!user)
+                return;
             eventBus_1.eventBus.broadcast('chat:typing', {
                 userId: user.id,
                 userName: user.name,
@@ -333,6 +375,8 @@ function initializeWebSocket(httpServer) {
             });
         });
         socket.on('chat:react', (data) => __awaiter(this, void 0, void 0, function* () {
+            if (!user)
+                return;
             try {
                 const result = yield (0, chatHelpers_1.handleReaction)(user.id, data.messageId, data.emoji, data.action);
                 eventBus_1.eventBus.broadcast('chat:react', {
@@ -353,12 +397,16 @@ function initializeWebSocket(httpServer) {
             }
         }));
         // When a user joins, notify others
-        eventBus_1.eventBus.broadcast('chat:system', {
-            message: `${user.name} انضم للمحادثة`,
-            type: 'join'
-        });
+        if (user) {
+            eventBus_1.eventBus.broadcast('chat:system', {
+                message: `${user.name} انضم للمحادثة`,
+                type: 'join'
+            });
+        }
         // ===== NOTIFICATIONS =====
         socket.on('notification:send', (data) => {
+            if (!user)
+                return;
             const notification = {
                 message: data.message,
                 type: data.type,
@@ -373,25 +421,31 @@ function initializeWebSocket(httpServer) {
             }
         });
         socket.on('disconnect', () => {
-            console.log(`❌ User disconnected: ${user.name}`);
-            (0, realtimeState_1.removeActiveUser)(socket.id);
-            (0, realtimeState_1.deletePOSCartState)(user.id);
-            eventBus_1.eventBus.broadcast('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
-            // If the disconnected user was a manager/admin, we can unlock active carts locked by them
-            if (user.role === 'admin' || user.role === 'manager') {
-                Promise.resolve().then(() => __importStar(require('./db'))).then((_a) => __awaiter(this, [_a], void 0, function* ({ safePoolQuery }) {
-                    yield safePoolQuery(`UPDATE pos_active_carts 
-                         SET isLocked = 0, lockedBy = NULL, lastAdminMessage = NULL 
-                         WHERE isLocked = 1 AND lockedBy = ?`, [user.name]);
-                    const { fetchAllActiveCartsFromDb } = yield Promise.resolve().then(() => __importStar(require('./controllers/posActiveCartsController')));
-                    eventBus_1.eventBus.broadcast('pos:carts:list', yield fetchAllActiveCartsFromDb());
-                    eventBus_1.eventBus.broadcast('pos:cart:lock-released-all-for-admin', { adminName: user.name });
-                })).catch(err => console.error('Error auto-unlocking carts on disconnect:', err));
+            if (socket.user) {
+                const user = socket.user;
+                console.log(`❌ User disconnected: ${user.name}`);
+                (0, realtimeState_1.removeActiveUser)(socket.id);
+                (0, realtimeState_1.deletePOSCartState)(user.id);
+                eventBus_1.eventBus.broadcast('pos:carts:list', (0, realtimeState_1.getAllPOSCarts)());
+                // If the disconnected user was a manager/admin, we can unlock active carts locked by them
+                if (user.role === 'admin' || user.role === 'manager') {
+                    Promise.resolve().then(() => __importStar(require('./db'))).then((_a) => __awaiter(this, [_a], void 0, function* ({ safePoolQuery }) {
+                        yield safePoolQuery(`UPDATE pos_active_carts 
+                             SET isLocked = 0, lockedBy = NULL, lastAdminMessage = NULL 
+                             WHERE isLocked = 1 AND lockedBy = ?`, [user.name]);
+                        const { fetchAllActiveCartsFromDb } = yield Promise.resolve().then(() => __importStar(require('./controllers/posActiveCartsController')));
+                        eventBus_1.eventBus.broadcast('pos:carts:list', yield fetchAllActiveCartsFromDb());
+                        eventBus_1.eventBus.broadcast('pos:cart:lock-released-all-for-admin', { adminName: user.name });
+                    })).catch(err => console.error('Error auto-unlocking carts on disconnect:', err));
+                }
+                eventBus_1.eventBus.broadcast('chat:system', {
+                    message: `${user.name} غادر المحادثة`,
+                    type: 'leave'
+                });
             }
-            eventBus_1.eventBus.broadcast('chat:system', {
-                message: `${user.name} غادر المحادثة`,
-                type: 'leave'
-            });
+            else {
+                console.log(`❌ Storefront client disconnected (${socket.id})`);
+            }
         });
     });
     // Cleanup old locks every 5 minutes

@@ -181,6 +181,17 @@ const uploadsPath = fs_1.default.existsSync(path_1.default.join(process.cwd(), '
     : fs_1.default.existsSync(path_1.default.join(process.cwd(), '..', 'uploads'))
         ? path_1.default.join(process.cwd(), '..', 'uploads')
         : path_1.default.join(__dirname, '..', 'uploads'); // Fallback
+// Ensure directories exist to prevent ENOENT errors
+for (const p of [sitesPath, sitesPrivatePath, uploadsPath]) {
+    if (!fs_1.default.existsSync(p)) {
+        try {
+            fs_1.default.mkdirSync(p, { recursive: true });
+        }
+        catch (err) {
+            console.warn(`Failed to create directory at ${p}:`, err);
+        }
+    }
+}
 // CRITICAL: Load .env BEFORE any middleware imports that read process.env
 // authMiddleware.ts reads JWT_SECRET at module load time
 dotenv_1.default.config();
@@ -224,6 +235,7 @@ const capacityRoutes_1 = __importDefault(require("./routes/capacityRoutes"));
 const mrpRoutes_1 = __importDefault(require("./routes/mrpRoutes"));
 const packagingRoutes_1 = __importDefault(require("./routes/packagingRoutes"));
 const hrRoutes_1 = __importDefault(require("./routes/hrRoutes"));
+const phoneAttendanceRoutes_1 = __importDefault(require("./routes/phoneAttendanceRoutes"));
 const crmRoutes_1 = __importDefault(require("./routes/crmRoutes"));
 const knowledgeBaseRoutes_1 = __importDefault(require("./routes/knowledgeBaseRoutes"));
 const vehicleRoutes_1 = __importDefault(require("./routes/vehicleRoutes"));
@@ -245,7 +257,10 @@ const ceramicRoutes_1 = __importDefault(require("./routes/ceramicRoutes"));
 const authMiddleware_1 = require("./middleware/authMiddleware");
 const activityLogger_1 = require("./middleware/activityLogger");
 const errorHandler_1 = require("./middleware/errorHandler");
+const mailService_1 = require("./utils/mailService");
+const reservationJobs_1 = require("./cron/reservationJobs");
 const backupController_1 = require("./controllers/backupController");
+const aiEmbeddingWorker_1 = require("./utils/aiEmbeddingWorker");
 const loyaltyExpiryJob_1 = require("./controllers/loyaltyExpiryJob");
 // Initialize cron jobs
 (0, loyaltyExpiryJob_1.initLoyaltyExpiryJob)();
@@ -256,6 +271,50 @@ const loyaltyExpiryJob_1 = require("./controllers/loyaltyExpiryJob");
 __bootPhase = false;
 // Force Egyptian timezone (UTC+2 / EET) for all date operations
 process.env.TZ = 'Africa/Cairo';
+const configCache = {};
+function getSiteConfig(slug) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const cleanSlug = slug.replace(/[^a-zA-Z0-9-_]/g, '');
+        const cacheKey = cleanSlug;
+        const now = Date.now();
+        if (configCache[cacheKey] && configCache[cacheKey].expiresAt > now) {
+            return configCache[cacheKey].config;
+        }
+        let config = null;
+        try {
+            const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+            const [rows] = yield pool.query('SELECT configText FROM storefront_tenant_configs WHERE tenantSlug = ?', [cleanSlug]);
+            if (rows && rows.length > 0) {
+                config = JSON.parse(rows[0].configText);
+            }
+        }
+        catch (dbErr) {
+            console.warn(`[getSiteConfig] Database lookup failed for ${cleanSlug}, falling back to file:`, dbErr.message);
+        }
+        if (!config) {
+            const configPath = path_1.default.join(sitesPath, cleanSlug, 'config.json');
+            if (fs_1.default.existsSync(configPath)) {
+                try {
+                    config = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
+                    const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+                    yield pool.query('INSERT INTO storefront_tenant_configs (tenantSlug, configText) VALUES (?, ?) ON DUPLICATE KEY UPDATE configText = VALUES(configText)', [cleanSlug, JSON.stringify(config)]);
+                    console.log(`[getSiteConfig] Auto-backfilled ${cleanSlug} configuration to database.`);
+                }
+                catch (err) {
+                    console.error(`[getSiteConfig] Failed to read static config or backfill for ${cleanSlug}:`, err.message);
+                }
+            }
+        }
+        if (!config) {
+            config = { brandName: cleanSlug || 'Store', sections: ['hero', 'featured', 'about', 'newsletter'] };
+        }
+        configCache[cacheKey] = {
+            config,
+            expiresAt: now + 60000
+        };
+        return config;
+    });
+}
 const app = (0, express_1.default)();
 const PORT = process.env.PORT || 3001;
 // Database readiness flag — set to true after initDB() completes
@@ -526,17 +585,25 @@ app.use((0, compression_1.default)({
     }
 }));
 // Security headers (CSP, HSTS, X-Content-Type-Options, etc.)
-// Skip security headers for client storefronts to allow CDNs and inline event handlers
-app.use((req, res, next) => {
+// Apply customized, relaxed security headers for client storefronts to support CDNs and inline event handlers
+app.use((req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
     if (req.path.startsWith('/sites/')) {
-        return next();
+        return (0, securityMiddleware_1.storefrontSecurityHeaders)(req, res, next);
+    }
+    // Apply storefront security headers if request host is a custom storefront domain
+    const host = req.get('host') || '';
+    try {
+        const slug = yield getSlugForDomain(host);
+        if (slug) {
+            return (0, securityMiddleware_1.storefrontSecurityHeaders)(req, res, next);
+        }
+    }
+    catch (err) {
+        console.error('Error checking storefront domain for CSP headers:', err);
     }
     (0, securityMiddleware_1.securityHeaders)(req, res, next);
-});
+}));
 app.use((req, res, next) => {
-    if (req.path.startsWith('/sites/')) {
-        return next();
-    }
     (0, securityMiddleware_1.additionalSecurityHeaders)(req, res, next);
 });
 app.use(body_parser_1.default.json({ limit: '50mb' }));
@@ -768,18 +835,301 @@ const storefrontAuthMiddleware = (req, res, next) => __awaiter(void 0, void 0, v
         res.status(500).json({ error: `Storefront authentication failed: ${err.message}` });
     }
 });
+function resolveOrCreatePartner(pool, phone, name, address) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!phone)
+            return '';
+        const [existing] = yield pool.query("SELECT id FROM partners WHERE phone = ? LIMIT 1", [phone]);
+        if (existing && existing.length > 0) {
+            return existing[0].id;
+        }
+        const { randomUUID } = yield Promise.resolve().then(() => __importStar(require('crypto')));
+        const partnerId = randomUUID();
+        yield pool.query(`INSERT INTO partners (id, name, phone, type, address, status, creditLimit) 
+         VALUES (?, ?, ?, 'CUSTOMER', ?, 'ACTIVE', 0)`, [partnerId, name || 'Storefront Customer', phone, address || '']);
+        return partnerId;
+    });
+}
 // Storefront guest checkout order submission
-app.post('/api/storefront/:slug/order', storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    const { createInvoice } = yield Promise.resolve().then(() => __importStar(require('./controllers/invoiceController')));
-    if (!req.body.type) {
-        req.body.type = 'SALES'; // Default to Sales Invoice
+app.post('/api/storefront/:slug/order', rateLimiter_1.storefrontOrderLimiter, storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const { recoveryToken, customerPhone, customerName, deliveryAddress, paymentMethod, items, totals } = req.body;
+    // Input sanitization and validation (Stored XSS / Buffer Overflow prevention)
+    const cleanName = String(customerName || '').trim().replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c] || c));
+    const cleanPhone = String(customerPhone || '').trim().replace(/[^0-9+\s\-]/g, '');
+    const cleanAddress = String(deliveryAddress || '').trim().replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c] || c));
+    const cleanPaymentMethod = ['CASH', 'CARD', 'DEFERRED'].includes(String(paymentMethod).toUpperCase()) ? String(paymentMethod).toUpperCase() : 'CASH';
+    if (cleanName.length < 3 || cleanName.length > 100) {
+        return res.status(400).json({ error: 'الاسم يجب أن يكون بين ٣ و ١٠٠ حرف.' });
     }
+    if (cleanPhone.length < 7 || cleanPhone.length > 20) {
+        return res.status(400).json({ error: 'رقم الهاتف غير صالح. يجب أن يكون بين ٧ و ٢٠ رقماً.' });
+    }
+    if (cleanAddress.length < 5 || cleanAddress.length > 500) {
+        return res.status(400).json({ error: 'العنوان يجب أن يكون بين ٥ و ٥٠٠ حرف.' });
+    }
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        if (recoveryToken) {
+            yield pool.query(`UPDATE storefront_abandoned_checkouts SET status = 'COMPLETED' WHERE recoveryToken = ? AND slug = ?`, [recoveryToken, slug]);
+        }
+        else if (cleanPhone) {
+            yield pool.query(`UPDATE storefront_abandoned_checkouts SET status = 'COMPLETED' WHERE customerPhone = ? AND slug = ? AND status = 'PENDING'`, [cleanPhone, slug]);
+        }
+        const partnerId = yield resolveOrCreatePartner(pool, cleanPhone, cleanName, cleanAddress);
+        // Authoritative DB price and cost resolution to block storefront price manipulation exploits
+        const productIds = (items || []).map((item) => item.id || item.productId).filter(Boolean);
+        const variantIds = (items || []).map((item) => item.variantId).filter(Boolean);
+        const productsMap = new Map();
+        const variantsMap = new Map();
+        if (productIds.length > 0) {
+            const [pRows] = yield pool.query('SELECT id, price, cost FROM products WHERE id IN (?)', [productIds]);
+            for (const row of pRows) {
+                productsMap.set(row.id, { price: Number(row.price) || 0, cost: Number(row.cost) || 0 });
+            }
+        }
+        if (variantIds.length > 0) {
+            const [vRows] = yield pool.query('SELECT id, price, cost FROM product_variants WHERE id IN (?)', [variantIds]);
+            for (const row of vRows) {
+                variantsMap.set(row.id, { price: row.price !== null ? Number(row.price) : null, cost: row.cost !== null ? Number(row.cost) : null });
+            }
+        }
+        const lines = (items || []).map((item) => {
+            const pId = item.id || item.productId;
+            const vId = item.variantId || null;
+            const pInfo = productsMap.get(pId) || { price: 0, cost: 0 };
+            const vInfo = vId ? variantsMap.get(vId) : null;
+            const authoritativePrice = (vInfo && vInfo.price !== null) ? vInfo.price : pInfo.price;
+            const authoritativeCost = (vInfo && vInfo.cost !== null) ? vInfo.cost : pInfo.cost;
+            const requestedQty = Number(item.quantity) || 1;
+            const requestedDiscount = Number(item.discount) || 0;
+            return {
+                productId: pId,
+                variantId: vId,
+                productName: item.name || item.productName,
+                quantity: requestedQty,
+                price: authoritativePrice,
+                cost: authoritativeCost,
+                discount: requestedDiscount,
+                total: Number((requestedQty * authoritativePrice - requestedDiscount).toFixed(2))
+            };
+        });
+        const subtotal = lines.reduce((sum, l) => sum + l.total, 0);
+        const resolvedTotal = Number((subtotal + (Number(totals === null || totals === void 0 ? void 0 : totals.shippingFee) || 0) + (Number(totals === null || totals === void 0 ? void 0 : totals.taxAmount) || 0) - (Number(totals === null || totals === void 0 ? void 0 : totals.whtAmount) || 0)).toFixed(2));
+        req.body = {
+            id: req.body.id || undefined,
+            date: req.body.date || new Date().toISOString().slice(0, 10),
+            type: 'INVOICE_SALE',
+            partnerId: partnerId || null,
+            partnerName: cleanName,
+            total: resolvedTotal,
+            status: 'confirmed',
+            paymentMethod: cleanPaymentMethod,
+            notes: `Storefront order via guest checkout. Address: ${cleanAddress}`,
+            warehouseId: req.body.warehouseId || ((_a = req.user) === null || _a === void 0 ? void 0 : _a.warehouseId) || (yield getDefaultWarehouseId(pool)),
+            lines,
+            recoveryToken,
+            isStorefront: true
+        };
+    }
+    catch (err) {
+        console.warn('⚠️ Storefront order preprocessing failed:', err.message);
+    }
+    const { createInvoice } = yield Promise.resolve().then(() => __importStar(require('./controllers/invoiceController')));
     createInvoice(req, res);
 }));
 // Storefront guest coupon validation
 app.post('/api/storefront/:slug/validate-coupon', storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const { validateCoupon } = yield Promise.resolve().then(() => __importStar(require('./controllers/promotionController')));
     validateCoupon(req, res);
+}));
+// Storefront guest abandoned checkout capture
+function releaseReservations(conn, token) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!token)
+            return;
+        const [reservations] = yield conn.query('SELECT productId, variantId, warehouseId, quantity FROM checkout_stock_reservations WHERE recoveryToken = ?', [token]);
+        for (const res of reservations) {
+            const qty = Number(res.quantity) || 0;
+            if (qty <= 0)
+                continue;
+            yield conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, res.productId]);
+            yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
+             VALUES (UUID(), ?, ?, ?) 
+             ON DUPLICATE KEY UPDATE stock = stock + ?`, [res.productId, res.warehouseId, qty, qty]);
+            if (res.variantId) {
+                yield conn.query('UPDATE product_variants SET stock = stock + ? WHERE id = ?', [qty, res.variantId]);
+                yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock) 
+                 VALUES (UUID(), ?, ?, ?, ?) 
+                 ON DUPLICATE KEY UPDATE stock = stock + ?`, [res.variantId, res.productId, res.warehouseId, qty, qty]);
+            }
+        }
+        yield conn.query('DELETE FROM checkout_stock_reservations WHERE recoveryToken = ?', [token]);
+    });
+}
+function getDefaultWarehouseId(conn) {
+    return __awaiter(this, void 0, void 0, function* () {
+        const [rows] = yield conn.query("SELECT id FROM warehouses WHERE isActive = 1 LIMIT 1");
+        if (rows && rows.length > 0)
+            return rows[0].id;
+        const [allRows] = yield conn.query("SELECT id FROM warehouses LIMIT 1");
+        if (allRows && allRows.length > 0)
+            return allRows[0].id;
+        throw new Error('No warehouses configured in the database.');
+    });
+}
+app.post('/api/storefront/:slug/abandoned', rateLimiter_1.storefrontDraftLimiter, storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const { customerName, customerPhone, deliveryAddress, cartState, recoveryToken } = req.body;
+    const { randomUUID } = yield Promise.resolve().then(() => __importStar(require('crypto')));
+    // Input sanitization and validation (Stored XSS / Buffer Overflow prevention)
+    const cleanName = String(customerName || '').trim().replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c] || c));
+    const cleanPhone = String(customerPhone || '').trim().replace(/[^0-9+\s\-]/g, '');
+    const cleanAddress = String(deliveryAddress || '').trim().replace(/[<>&"']/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' }[c] || c));
+    if (cleanName.length < 2 || cleanName.length > 100) {
+        return res.status(400).json({ error: 'الاسم يجب أن يكون بين ٢ و ١٠٠ حرف.' });
+    }
+    if (cleanPhone.length < 7 || cleanPhone.length > 20) {
+        return res.status(400).json({ error: 'رقم الهاتف غير صالح. يجب أن يكون بين ٧ و ٢٠ رقماً.' });
+    }
+    if (cleanAddress && cleanAddress.length > 500) {
+        return res.status(400).json({ error: 'العنوان طويل جداً (بحد أقصى ٥٠٠ حرف).' });
+    }
+    const conn = yield db_1.pool.getConnection();
+    yield conn.beginTransaction();
+    try {
+        let tokenToUse = recoveryToken;
+        let isExisting = false;
+        if (tokenToUse) {
+            const [rows] = yield conn.query('SELECT id FROM storefront_abandoned_checkouts WHERE recoveryToken = ? AND slug = ? LIMIT 1', [tokenToUse, slug]);
+            if (rows.length > 0) {
+                isExisting = true;
+            }
+        }
+        if (!tokenToUse) {
+            tokenToUse = randomUUID();
+        }
+        // 1. Release previous reservations under this token to prevent self-blocking
+        if (isExisting) {
+            yield releaseReservations(conn, tokenToUse);
+        }
+        // 2. Save or update the draft checkout
+        if (isExisting) {
+            yield conn.query(`UPDATE storefront_abandoned_checkouts 
+                 SET customerName = ?, customerPhone = ?, deliveryAddress = ?, cartState = ?, status = 'PENDING', updatedAt = CURRENT_TIMESTAMP
+                 WHERE recoveryToken = ? AND slug = ?`, [cleanName, cleanPhone, cleanAddress || '', JSON.stringify(cartState || {}), tokenToUse, slug]);
+        }
+        else {
+            const id = randomUUID();
+            yield conn.query(`INSERT INTO storefront_abandoned_checkouts 
+                 (id, slug, recoveryToken, customerName, customerPhone, deliveryAddress, cartState, status) 
+                 VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')`, [id, slug, tokenToUse, cleanName, cleanPhone, cleanAddress || '', JSON.stringify(cartState || {})]);
+        }
+        // 3. Resolve warehouse ID
+        const warehouseId = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.warehouseId) || (yield getDefaultWarehouseId(conn));
+        // 4. Perform stock checks and reservations
+        const items = (cartState === null || cartState === void 0 ? void 0 : cartState.items) || [];
+        for (const item of items) {
+            const productId = item.id;
+            const variantId = item.variantId || null;
+            const qty = Number(item.quantity) || 0;
+            if (qty <= 0)
+                continue;
+            // Check stock availability with FOR UPDATE row lock to prevent race conditions
+            if (variantId) {
+                const [vStockRows] = yield conn.query('SELECT stock FROM product_variant_stocks WHERE variantId = ? AND warehouseId = ? LIMIT 1 FOR UPDATE', [variantId, warehouseId]);
+                const currentStock = vStockRows.length > 0 ? Number(vStockRows[0].stock) : 0;
+                if (currentStock < qty) {
+                    throw new Error(`الكمية المطلوبة من "${item.name || 'المنتج'}" غير متوفرة. المتوفر: ${currentStock}`);
+                }
+            }
+            else {
+                const [pStockRows] = yield conn.query('SELECT stock FROM product_stocks WHERE productId = ? AND warehouseId = ? LIMIT 1 FOR UPDATE', [productId, warehouseId]);
+                const currentStock = pStockRows.length > 0 ? Number(pStockRows[0].stock) : 0;
+                if (currentStock < qty) {
+                    throw new Error(`الكمية المطلوبة من "${item.name || 'المنتج'}" غير متوفرة. المتوفر: ${currentStock}`);
+                }
+            }
+            // Decrement stock
+            yield conn.query('UPDATE products SET stock = stock - ? WHERE id = ?', [qty, productId]);
+            yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
+                 VALUES (UUID(), ?, ?, -?) 
+                 ON DUPLICATE KEY UPDATE stock = stock - ?`, [productId, warehouseId, qty, qty]);
+            if (variantId) {
+                yield conn.query('UPDATE product_variants SET stock = stock - ? WHERE id = ?', [qty, variantId]);
+                yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock) 
+                     VALUES (UUID(), ?, ?, ?, -?) 
+                     ON DUPLICATE KEY UPDATE stock = stock - ?`, [variantId, productId, warehouseId, qty, qty]);
+            }
+            // Save reservation
+            const expiresAt = new Date(Date.now() + 30 * 60 * 1000);
+            const formattedExpiresAt = expiresAt.toISOString().slice(0, 19).replace('T', ' ');
+            yield conn.query(`INSERT INTO checkout_stock_reservations (id, productId, variantId, warehouseId, quantity, recoveryToken, expiresAt, createdAt) 
+                 VALUES (UUID(), ?, ?, ?, ?, ?, ?, NOW())`, [productId, variantId, warehouseId, qty, tokenToUse, formattedExpiresAt]);
+        }
+        yield conn.commit();
+        res.json({ success: true, recoveryToken: tokenToUse });
+    }
+    catch (err) {
+        yield conn.rollback();
+        console.error('❌ Failed to save storefront draft checkout & reserve stock:', err.message);
+        res.status(400).json({ error: err.message });
+    }
+    finally {
+        conn.release();
+    }
+}));
+// Storefront guest abandoned checkout retrieve
+app.get('/api/storefront/:slug/abandoned/:token', storefrontAuthMiddleware, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const token = req.params.token;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const [rows] = yield pool.query(`SELECT customerName, customerPhone, deliveryAddress, cartState, status 
+             FROM storefront_abandoned_checkouts 
+             WHERE recoveryToken = ? AND slug = ? LIMIT 1`, [token, slug]);
+        if (rows.length === 0) {
+            return res.status(404).json({ error: 'Recovery draft checkout not found.' });
+        }
+        const draft = rows[0];
+        let parsedCartState = null;
+        try {
+            parsedCartState = JSON.parse(draft.cartState);
+        }
+        catch (jsonErr) {
+            console.error('❌ Failed to parse draft cartState:', jsonErr);
+        }
+        res.json({
+            customerName: draft.customerName,
+            customerPhone: draft.customerPhone,
+            deliveryAddress: draft.deliveryAddress,
+            cartState: parsedCartState || { items: [], promo: null },
+            status: draft.status
+        });
+    }
+    catch (err) {
+        console.error('❌ Failed to retrieve storefront draft checkout:', err);
+        res.status(500).json({ error: 'Failed to retrieve draft checkout.' });
+    }
+}));
+app.get('/api/storefront/:slug/config', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    if (!slug) {
+        return res.status(400).json({ error: 'Storefront slug is required' });
+    }
+    try {
+        const config = yield getSiteConfig(slug);
+        res.json(config);
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
 }));
 app.use('/api', (req, res, next) => {
     // Exclude auth routes (already handled above, but double check)
@@ -796,6 +1146,14 @@ app.use('/api', (req, res, next) => {
     if (isPublicGet) {
         return (0, policyMiddleware_1.loadSystemConfig)(req, res, next);
     }
+    // Public chat upload endpoint for storefront reviews (images only, rate-limited separately)
+    if (req.path === '/chat/upload' && req.method === 'POST') {
+        return (0, policyMiddleware_1.loadSystemConfig)(req, res, next);
+    }
+    // Storefront public guest routes (config, order submission, coupon validation, abandoned checkouts)
+    if (req.path.startsWith('/storefront/')) {
+        return (0, policyMiddleware_1.loadSystemConfig)(req, res, next);
+    }
     (0, authMiddleware_1.authenticateToken)(req, res, () => {
         // After authentication succeeds, load system config for fiscal year filtering & data policies
         (0, policyMiddleware_1.loadSystemConfig)(req, res, () => {
@@ -804,6 +1162,60 @@ app.use('/api', (req, res, next) => {
         });
     });
 });
+// B2B Wholesale Portal Support: Cart Persistence GET endpoint
+app.get('/api/portal/cart', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const userId = req.user.id;
+        const conn = yield (0, db_1.getConnection)();
+        try {
+            const [rows] = yield conn.query('SELECT cartState FROM storefront_carts WHERE userId = ?', [userId]);
+            if (rows.length === 0) {
+                return res.json({ items: [], promo: null });
+            }
+            try {
+                const cartState = JSON.parse(rows[0].cartState);
+                res.json(cartState);
+            }
+            catch (jsonErr) {
+                console.error('❌ Failed to parse B2B cartState JSON:', jsonErr);
+                res.json({ items: [], promo: null });
+            }
+        }
+        finally {
+            conn.release();
+        }
+    }
+    catch (err) {
+        console.error('❌ Failed to retrieve B2B cart:', err);
+        res.status(500).json({ error: 'Failed to retrieve portal cart.' });
+    }
+}));
+// B2B Wholesale Portal Support: Cart Persistence POST endpoint
+app.post('/api/portal/cart', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const userId = req.user.id;
+        const { cartState } = req.body;
+        if (!cartState) {
+            return res.status(400).json({ error: 'cartState is required' });
+        }
+        const conn = yield (0, db_1.getConnection)();
+        try {
+            yield conn.query(`
+                INSERT INTO storefront_carts (userId, cartState) 
+                VALUES (?, ?)
+                ON DUPLICATE KEY UPDATE cartState = VALUES(cartState), updatedAt = CURRENT_TIMESTAMP
+            `, [userId, JSON.stringify(cartState)]);
+            res.json({ success: true });
+        }
+        finally {
+            conn.release();
+        }
+    }
+    catch (err) {
+        console.error('❌ Failed to save B2B cart:', err);
+        res.status(500).json({ error: 'Failed to save portal cart.' });
+    }
+}));
 // Routes
 // Root route removed to allow frontend serving
 // app.get('/', (req, res) => {
@@ -853,6 +1265,7 @@ app.use('/api/mrp', mrpRoutes_1.default);
 app.use('/api/packaging', packagingRoutes_1.default);
 // HR & Payroll Module Routes
 app.use('/api/hr', hrRoutes_1.default);
+app.use('/api/phone-attendance', phoneAttendanceRoutes_1.default);
 // CRM (Customer Relationship Management) Module Routes
 app.use('/api/crm', crmRoutes_1.default);
 // Knowledge Base (قاعدة المعرفة) Routes
@@ -1212,13 +1625,39 @@ const chatStorage = multer_1.default.diskStorage({
 const chatUpload = (0, multer_1.default)({
     storage: chatStorage,
     limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
-    fileFilter: (_req, file, cb) => {
+    fileFilter: (req, file, cb) => {
+        var _a;
         const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf'];
-        cb(null, allowedTypes.includes(file.mimetype));
+        const mimeToExt = {
+            'image/jpeg': ['.jpg', '.jpeg'],
+            'image/png': ['.png'],
+            'image/gif': ['.gif'],
+            'image/webp': ['.webp'],
+            'application/pdf': ['.pdf']
+        };
+        const ext = path_1.default.extname(file.originalname).toLowerCase();
+        const mType = file.mimetype;
+        // Ensure extension matches mimetype
+        if (!allowedTypes.includes(mType) || !((_a = mimeToExt[mType]) === null || _a === void 0 ? void 0 : _a.includes(ext))) {
+            return cb(new Error('File extension does not match file type or format is not allowed'), false);
+        }
+        // Restrict guests to images only
+        const hasAuth = !!(req.user || req.headers['authorization']);
+        if (!hasAuth && mType === 'application/pdf') {
+            return cb(new Error('Guests are only allowed to upload images (PNG, JPG, JPEG, GIF, WEBP)'), false);
+        }
+        cb(null, true);
     },
 });
-// File upload endpoint for chat attachments
-app.post('/api/chat/upload', chatUpload.single('file'), (req, res) => {
+// File upload endpoint for chat attachments (guest uploads rate-limited, images-only)
+app.post('/api/chat/upload', rateLimiter_1.uploadLimiter, (req, res, next) => {
+    chatUpload.single('file')(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ error: err.message || 'File upload failed' });
+        }
+        next();
+    });
+}, (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded or invalid file format' });
     }
@@ -1704,40 +2143,313 @@ app.use((req, res, next) => {
     }
     next();
 });
+let domainToSlugCache = null;
+let lastCacheUpdate = 0;
+const CACHE_TTL = 30000; // 30 seconds
+function getSlugForDomain(host) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!host)
+            return null;
+        const domain = host.split(':')[0].toLowerCase();
+        // Ignore default domains
+        const defaultDomains = ['localhost', '127.0.0.1', 'cloud-erp.com', 'erp.weanst.com'];
+        if (defaultDomains.includes(domain)) {
+            return null;
+        }
+        const now = Date.now();
+        if (domainToSlugCache && (now - lastCacheUpdate < CACHE_TTL)) {
+            return domainToSlugCache[domain] || domainToSlugCache[`www.${domain}`] || null;
+        }
+        const newCache = {};
+        // 1. Query from DB
+        try {
+            const [rows] = yield db_1.pool.query('SELECT tenantSlug, configText FROM storefront_tenant_configs');
+            for (const row of rows) {
+                try {
+                    const config = JSON.parse(row.configText);
+                    if (config.customDomain) {
+                        const customDomain = config.customDomain.trim().toLowerCase();
+                        newCache[customDomain] = row.tenantSlug;
+                        if (!customDomain.startsWith('www.')) {
+                            newCache[`www.${customDomain}`] = row.tenantSlug;
+                        }
+                        else {
+                            newCache[customDomain.replace(/^www\./, '')] = row.tenantSlug;
+                        }
+                    }
+                }
+                catch (e) {
+                    console.warn(`Failed to parse config for domain mapping from DB for ${row.tenantSlug}:`, e);
+                }
+            }
+        }
+        catch (dbErr) {
+            console.error('Failed to query storefront_tenant_configs for domain mapping:', dbErr.message);
+        }
+        // 2. Directory fallback for legacy/unmigrated sites
+        try {
+            const dirs = fs_1.default.readdirSync(sitesPath);
+            for (const slug of dirs) {
+                if (slug === '_template')
+                    continue;
+                // Skip if already mapped from DB
+                if (Object.values(newCache).includes(slug))
+                    continue;
+                const configPath = path_1.default.join(sitesPath, slug, 'config.json');
+                if (fs_1.default.existsSync(configPath)) {
+                    try {
+                        const config = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
+                        if (config.customDomain) {
+                            const customDomain = config.customDomain.trim().toLowerCase();
+                            newCache[customDomain] = slug;
+                            if (!customDomain.startsWith('www.')) {
+                                newCache[`www.${customDomain}`] = slug;
+                            }
+                            else {
+                                newCache[customDomain.replace(/^www\./, '')] = slug;
+                            }
+                        }
+                    }
+                    catch (e) {
+                        console.warn(`Failed to parse config for domain mapping in directory ${slug}:`, e);
+                    }
+                }
+            }
+            domainToSlugCache = newCache;
+            lastCacheUpdate = now;
+        }
+        catch (err) {
+            console.error('Failed to read sites directory for domain mapping:', err);
+            if (!domainToSlugCache) {
+                domainToSlugCache = newCache;
+                lastCacheUpdate = now;
+            }
+        }
+        return (domainToSlugCache && (domainToSlugCache[domain] || domainToSlugCache[`www.${domain}`])) || null;
+    });
+}
+// CNAME Router Rewrite Middleware
+app.use((req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
+    const host = req.get('host') || '';
+    try {
+        const slug = yield getSlugForDomain(host);
+        if (slug) {
+            // Under a mapped domain! Rewrite paths transparently:
+            if (req.path === '/' || req.path === '/index.html') {
+                req.url = `/sites/${slug}/index.html`;
+            }
+            else if (req.path === '/manifest.json') {
+                req.url = `/sites/${slug}/manifest.json`;
+            }
+            else if (req.path === '/sw.js') {
+                req.url = `/sites/${slug}/sw.js`;
+            }
+            else if (req.path === '/robots.txt') {
+                req.url = `/sites/${slug}/robots.txt`;
+            }
+            else if (req.path === '/sitemap.xml') {
+                req.url = `/sites/${slug}/sitemap.xml`;
+            }
+            else if (!req.path.startsWith('/sites/') && !req.path.startsWith('/api/')) {
+                const potentialFilePath = path_1.default.join(sitesPath, slug, req.path);
+                if (fs_1.default.existsSync(potentialFilePath)) {
+                    req.url = `/sites/${slug}${req.path}`;
+                }
+            }
+        }
+    }
+    catch (err) {
+        console.error('Error in domain mapping middleware:', err);
+    }
+    next();
+}));
 app.use('/uploads', express_1.default.static(uploadsPath));
+// Dynamic robots.txt for tenant storefronts
+app.get('/sites/:slug/robots.txt', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const slug = req.params.slug;
+    const host = req.get('host') || '';
+    const protocol = req.protocol || 'http';
+    const mappedSlug = yield getSlugForDomain(host);
+    const sitemapUrl = mappedSlug
+        ? `${protocol}://${host}/sitemap.xml`
+        : `${protocol}://${host}/sites/${slug}/sitemap.xml`;
+    res.setHeader('Content-Type', 'text/plain');
+    res.send(`User-agent: *
+Allow: /
+Sitemap: ${sitemapUrl}
+`);
+}));
+// Dynamic sitemap.xml for tenant storefronts
+app.get('/sites/:slug/sitemap.xml', (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const slug = req.params.slug;
+    const host = req.get('host') || '';
+    const protocol = req.protocol || 'http';
+    const mappedSlug = yield getSlugForDomain(host);
+    const rootLoc = mappedSlug
+        ? `${protocol}://${host}/`
+        : `${protocol}://${host}/sites/${slug}/`;
+    try {
+        const conn = yield db_1.pool.getConnection();
+        const [rows] = yield conn.query('SELECT id FROM products WHERE isActive = TRUE');
+        conn.release();
+        const productsList = rows;
+        let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url>
+    <loc>${rootLoc}</loc>
+    <changefreq>daily</changefreq>
+    <priority>1.0</priority>
+  </url>`;
+        for (const p of productsList) {
+            const productLoc = mappedSlug
+                ? `${protocol}://${host}/?product=${p.id}`
+                : `${protocol}://${host}/sites/${slug}/?product=${p.id}`;
+            xml += `
+  <url>
+    <loc>${productLoc}</loc>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>`;
+        }
+        xml += `
+</urlset>`;
+        res.setHeader('Content-Type', 'application/xml');
+        res.send(xml);
+    }
+    catch (err) {
+        console.error(`❌ Failed to generate sitemap for ${slug}:`, err.message);
+        res.status(500).send('Internal Server Error');
+    }
+}));
+function escapeHtml(str) {
+    if (!str)
+        return '';
+    return str
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+// Serve storefronts with server-side SEO pre-rendering for HTML routes
 // Serve storefronts with server-side SEO pre-rendering for HTML routes
 app.get(['/sites/:slug', '/sites/:slug/', '/sites/:slug/index.html'], (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c;
     const slug = req.params.slug;
     if (slug === '_template') {
         return next();
     }
-    const configPath = path_1.default.join(sitesPath, slug, 'config.json');
     const indexPath = path_1.default.join(sitesPath, slug, 'index.html');
-    if (fs_1.default.existsSync(indexPath) && fs_1.default.existsSync(configPath)) {
+    if (fs_1.default.existsSync(indexPath)) {
         try {
             let html = fs_1.default.readFileSync(indexPath, 'utf8');
-            const config = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
-            const seoTitle = ((_a = config.seo) === null || _a === void 0 ? void 0 : _a.title) || config.brandName || 'Store';
-            const seoDesc = ((_b = config.seo) === null || _b === void 0 ? void 0 : _b.description) || config.tagline || '';
+            const config = yield getSiteConfig(slug);
+            let seoTitle = ((_a = config.seo) === null || _a === void 0 ? void 0 : _a.title) || config.brandName || 'Store';
+            let seoDesc = ((_b = config.seo) === null || _b === void 0 ? void 0 : _b.description) || config.tagline || '';
             const logoUrl = config.logoUrl || '';
             const host = req.get('host') || '';
             const protocol = req.protocol || 'http';
             const fullLogoUrl = logoUrl ? (logoUrl.startsWith('http') ? logoUrl : `${protocol}://${host}${logoUrl}`) : '';
+            const mappedSlug = yield getSlugForDomain(host);
+            let canonicalUrl = mappedSlug
+                ? `${protocol}://${host}/`
+                : `${protocol}://${host}/sites/${slug}/`;
+            let structuredData = '';
+            const productId = req.query.product;
+            let product = null;
+            if (productId) {
+                try {
+                    const conn = yield db_1.pool.getConnection();
+                    const [rows] = yield conn.query('SELECT name, description, price, sku, stock, image FROM products WHERE id = ? AND isActive = TRUE', [productId]);
+                    conn.release();
+                    if (rows.length > 0) {
+                        product = rows[0];
+                    }
+                }
+                catch (err) {
+                    console.warn(`Failed to fetch product ${productId} for SEO injection:`, err.message);
+                }
+            }
+            if (product) {
+                seoTitle = `${product.name} | ${config.brandName || 'Store'}`;
+                if (product.description) {
+                    seoDesc = product.description.substring(0, 160);
+                }
+                canonicalUrl = mappedSlug
+                    ? `${protocol}://${host}/?product=${productId}`
+                    : `${protocol}://${host}/sites/${slug}/?product=${productId}`;
+                const productImage = product.image ? (product.image.startsWith('http') ? product.image : `${protocol}://${host}${product.image}`) : fullLogoUrl;
+                structuredData = JSON.stringify({
+                    "@context": "https://schema.org",
+                    "@type": "Product",
+                    "name": product.name,
+                    "image": productImage,
+                    "description": seoDesc,
+                    "sku": product.sku || undefined,
+                    "offers": {
+                        "@type": "Offer",
+                        "url": canonicalUrl,
+                        "priceCurrency": ((_c = config.currency) === null || _c === void 0 ? void 0 : _c.code) || 'USD',
+                        "price": product.price,
+                        "availability": product.stock > 0 ? "https://schema.org/InStock" : "https://schema.org/OutOfStock"
+                    }
+                });
+            }
+            else {
+                structuredData = JSON.stringify({
+                    "@context": "https://schema.org",
+                    "@type": "Organization",
+                    "name": config.brandName || 'Store',
+                    "url": canonicalUrl,
+                    "logo": fullLogoUrl,
+                    "description": seoDesc
+                });
+            }
             // Inject SEO tags
-            html = html.replace('<title>Loading...</title>', `<title>${seoTitle}</title>`);
+            html = html.replace('<title>Loading...</title>', `<title>${escapeHtml(seoTitle)}</title>`);
+            const manifestHref = mappedSlug ? '/manifest.json' : `/sites/${slug}/manifest.json`;
             const metaTags = `
-    <meta name="description" content="${seoDesc}">
-    <meta property="og:title" content="${seoTitle}">
-    <meta property="og:description" content="${seoDesc}">
-    <meta property="og:image" content="${fullLogoUrl}">
+    <link rel="manifest" href="${escapeHtml(manifestHref)}">
+    <link rel="canonical" href="${escapeHtml(canonicalUrl)}">
+    <meta name="description" content="${escapeHtml(seoDesc)}">
+    <meta property="og:title" content="${escapeHtml(seoTitle)}">
+    <meta property="og:description" content="${escapeHtml(seoDesc)}">
+    <meta property="og:image" content="${escapeHtml(product ? (product.image || fullLogoUrl) : fullLogoUrl)}">
     <meta property="og:type" content="website">
     <meta name="twitter:card" content="summary_large_image">
-    <meta name="twitter:title" content="${seoTitle}">
-    <meta name="twitter:description" content="${seoDesc}">
-    <meta name="twitter:image" content="${fullLogoUrl}">
+    <meta name="twitter:title" content="${escapeHtml(seoTitle)}">
+    <meta name="twitter:description" content="${escapeHtml(seoDesc)}">
+    <meta name="twitter:image" content="${escapeHtml(product ? (product.image || fullLogoUrl) : fullLogoUrl)}">
+    <script type="application/ld+json">${structuredData.replace(/<\/script>/gi, '<\\/script>')}</script>
             `;
             html = html.replace('</head>', `${metaTags}\n</head>`);
+            const swPath = mappedSlug ? '/sw.js' : `/sites/${slug}/sw.js`;
+            const pwaRegisterScript = `
+    <script>
+      if ('serviceWorker' in navigator) {
+        window.addEventListener('load', () => {
+          navigator.serviceWorker.register('${swPath}')
+            .then(reg => console.log('ServiceWorker registered for ${slug}'))
+            .catch(err => console.error('ServiceWorker registration failed:', err));
+        });
+      }
+    </script>
+    </body>
+            `;
+            html = html.replace('</body>', pwaRegisterScript);
+            // Inject Dynamic custom CSS/JS from config if present
+            if (config.customCss) {
+                const cssContent = config.customCss.trim().startsWith('<style')
+                    ? config.customCss
+                    : `<style id="sf-custom-css">\n${config.customCss}\n</style>`;
+                html = html.replace('</head>', `${cssContent}\n</head>`);
+            }
+            if (config.customJs) {
+                const jsContent = config.customJs.trim().startsWith('<script')
+                    ? config.customJs
+                    : `<script id="sf-custom-js">\n${config.customJs}\n</script>`;
+                html = html.replace('</body>', `${jsContent}\n</body>`);
+            }
             res.setHeader('Content-Type', 'text/html');
             res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
             return res.send(html);
@@ -1749,6 +2461,141 @@ app.get(['/sites/:slug', '/sites/:slug/', '/sites/:slug/index.html'], (req, res,
     }
     next();
 }));
+app.get('/sites/:slug/manifest.json', (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b;
+    const slug = req.params.slug;
+    if (slug === '_template')
+        return next();
+    try {
+        const config = yield getSiteConfig(slug);
+        const name = config.brandName || 'Storefront';
+        const startUrl = `/sites/${slug}/`;
+        const themeColor = ((_a = config.colors) === null || _a === void 0 ? void 0 : _a.primary) || '#2563EB';
+        const bgColor = ((_b = config.colors) === null || _b === void 0 ? void 0 : _b.background) || '#FFFFFF';
+        let logoUrl = config.logoUrl || '';
+        let iconType = "image/png";
+        let iconSizes = "512x512";
+        if (logoUrl) {
+            if (logoUrl.startsWith('/sites/')) {
+                const relativePath = logoUrl.replace(/^\/sites\//, '');
+                const absolutePath = path_1.default.join(sitesPath, relativePath);
+                if (!fs_1.default.existsSync(absolutePath)) {
+                    logoUrl = '';
+                }
+            }
+        }
+        if (!logoUrl) {
+            logoUrl = '/sites/_template/favicon.svg';
+            iconType = "image/svg+xml";
+            iconSizes = "any";
+        }
+        else if (logoUrl.endsWith('.svg')) {
+            iconType = "image/svg+xml";
+            iconSizes = "any";
+        }
+        else if (logoUrl.endsWith('.webp')) {
+            iconType = "image/webp";
+        }
+        const manifest = {
+            name: name,
+            short_name: name,
+            start_url: startUrl,
+            display: "standalone",
+            orientation: "any",
+            background_color: bgColor,
+            theme_color: themeColor,
+            icons: [
+                {
+                    src: logoUrl,
+                    sizes: iconSizes,
+                    type: iconType,
+                    purpose: "any maskable"
+                }
+            ]
+        };
+        res.setHeader('Content-Type', 'application/json');
+        return res.json(manifest);
+    }
+    catch (err) {
+        return res.status(500).json({ error: err.message });
+    }
+}));
+app.get('/sites/:slug/sw.js', (req, res, next) => {
+    const slug = req.params.slug;
+    if (slug === '_template')
+        return next();
+    const swCode = `
+const CACHE_NAME = 'storefront-${slug}-v2';
+const ASSETS_TO_CACHE = [
+  '/sites/${slug}/',
+  '/sites/${slug}/index.html',
+  '/sites/_template/styles.min.css',
+  '/sites/_template/storefront.min.js',
+  'https://unpkg.com/lucide@0.469.0/dist/umd/lucide.min.js'
+];
+
+self.addEventListener('install', event => {
+  self.skipWaiting();
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => {
+      return cache.addAll(ASSETS_TO_CACHE);
+    })
+  );
+});
+
+self.addEventListener('activate', event => {
+  self.clients.claim();
+  event.waitUntil(
+    caches.keys().then(keys => {
+      return Promise.all(
+        keys.map(key => {
+          if (key !== CACHE_NAME) {
+            return caches.delete(key);
+          }
+        })
+      );
+    })
+  );
+});
+
+self.addEventListener('fetch', event => {
+  if (event.request.method !== 'GET') return;
+  
+  const url = new URL(event.request.url);
+  
+  if (url.pathname.includes('/api/')) {
+    return;
+  }
+
+  event.respondWith(
+    caches.match(event.request).then(cachedResponse => {
+      if (cachedResponse) {
+        return cachedResponse;
+      }
+      return fetch(event.request).then(networkResponse => {
+        if (!networkResponse || networkResponse.status !== 200) {
+          return networkResponse;
+        }
+        
+        if (url.origin === self.location.origin && 
+            (url.pathname.startsWith('/sites/') || url.pathname.endsWith('.png') || url.pathname.endsWith('.jpg') || url.pathname.endsWith('.css') || url.pathname.endsWith('.js'))) {
+          const responseToCache = networkResponse.clone();
+          caches.open(CACHE_NAME).then(cache => {
+            cache.put(event.request, responseToCache);
+          });
+        }
+        
+        return networkResponse;
+      }).catch(() => {
+        return caches.match('/sites/${slug}/index.html');
+      });
+    })
+  );
+});
+`;
+    res.setHeader('Content-Type', 'application/javascript');
+    return res.send(swCode);
+});
 app.use('/sites', express_1.default.static(sitesPath));
 // ── Site Customization API ───────────────────────────────────────────
 const siteUploadStorage = multer_1.default.diskStorage({
@@ -1766,44 +2613,222 @@ const siteUploadStorage = multer_1.default.diskStorage({
         cb(null, `logo${ext}`);
     }
 });
-const siteUpload = (0, multer_1.default)({ storage: siteUploadStorage });
-app.post('/api/sites/:slug/logo', authMiddleware_1.authenticateToken, siteUpload.single('logo'), (req, res) => {
+const siteUpload = (0, multer_1.default)({
+    storage: siteUploadStorage,
+    limits: { fileSize: 2 * 1024 * 1024 }, // 2MB limit for logo
+    fileFilter: (_req, file, cb) => {
+        const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/svg+xml'];
+        const allowedExts = ['.jpg', '.jpeg', '.png', '.webp', '.svg'];
+        const ext = path_1.default.extname(file.originalname).toLowerCase();
+        if (allowedTypes.includes(file.mimetype) && allowedExts.includes(ext)) {
+            cb(null, true);
+        }
+        else {
+            cb(new Error('Invalid format. Allowed formats: PNG, JPG, JPEG, WEBP, SVG'), false);
+        }
+    }
+});
+const checkStorefrontWritePermission = (req, res, next) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a, _b, _c;
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const user = req.user;
+    if (!user) {
+        return res.status(401).json({ error: 'Unauthorized: Authentication required' });
+    }
+    // 1. Admin overrides
+    const ADMIN_ROLES = ['ADMIN', 'MASTER_ADMIN', 'GENERAL_MANAGER', 'MANAGER', 'المدير', 'المدير العام', 'مسئول النظام'];
+    const isAdmin = ADMIN_ROLES.some(role => { var _a; return role.trim().toUpperCase() === ((_a = user.role) === null || _a === void 0 ? void 0 : _a.trim().toUpperCase()); }) || (user.permissions && user.permissions.includes('all'));
+    if (((_a = user.role) === null || _a === void 0 ? void 0 : _a.trim().toUpperCase()) === 'MASTER_ADMIN' || (user.permissions && user.permissions.includes('all'))) {
+        return next();
+    }
+    // 2. Fetch the storefront user to find the associated branchId
+    const privateConfigPath = path_1.default.join(sitesPrivatePath, slug, 'private-config.json');
+    if (!fs_1.default.existsSync(privateConfigPath)) {
+        return res.status(404).json({ error: `Storefront not found: ${slug}` });
+    }
+    try {
+        const privateConfig = JSON.parse(fs_1.default.readFileSync(privateConfigPath, 'utf8'));
+        const storefrontUsername = (_c = (_b = privateConfig === null || privateConfig === void 0 ? void 0 : privateConfig.api) === null || _b === void 0 ? void 0 : _b.autoLogin) === null || _c === void 0 ? void 0 : _c.username;
+        if (!storefrontUsername) {
+            return res.status(400).json({ error: 'Storefront user is not configured on the server.' });
+        }
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const [rows] = yield pool.query(`SELECT branchId FROM users WHERE username = ? LIMIT 1`, [storefrontUsername]);
+        const storefrontUser = rows[0];
+        if (!storefrontUser) {
+            return res.status(400).json({ error: 'Storefront user not found in database.' });
+        }
+        // Check if the logged-in user belongs to the same branch
+        if (user.branchId !== undefined && user.branchId !== null && storefrontUser.branchId !== undefined && storefrontUser.branchId !== null) {
+            if (Number(user.branchId) === Number(storefrontUser.branchId)) {
+                return next();
+            }
+        }
+        else if (isAdmin) {
+            return next();
+        }
+        return res.status(403).json({ error: 'Forbidden: You do not have permission to manage this storefront' });
+    }
+    catch (err) {
+        console.error('Storefront permission check error:', err.message);
+        return res.status(500).json({ error: 'Internal server error during permission check' });
+    }
+});
+app.post('/api/sites/:slug/logo', authMiddleware_1.authenticateToken, checkStorefrontWritePermission, (req, res, next) => {
+    siteUpload.single('logo')(req, res, (err) => {
+        if (err) {
+            return res.status(400).json({ error: err.message || 'Logo upload failed' });
+        }
+        next();
+    });
+}, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const rawSlug = req.params.slug;
     const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
     }
     const relativeUrl = `/sites/${slug}/${req.file.filename}`;
-    const configPath = path_1.default.join(sitesPath, slug, 'config.json');
-    if (fs_1.default.existsSync(configPath)) {
+    try {
+        const config = yield getSiteConfig(slug);
+        config.logoUrl = relativeUrl;
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        yield pool.query('INSERT INTO storefront_tenant_configs (tenantSlug, configText) VALUES (?, ?) ON DUPLICATE KEY UPDATE configText = VALUES(configText)', [slug, JSON.stringify(config)]);
+        const configPath = path_1.default.join(sitesPath, slug, 'config.json');
         try {
-            const config = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
-            config.logoUrl = relativeUrl;
             fs_1.default.writeFileSync(configPath, JSON.stringify(config, null, 2), 'utf8');
         }
         catch (e) {
-            console.error('Failed to update config.json logoUrl:', e.message);
+            console.warn(`[Logo] Failed to write backup file for ${slug}:`, e.message);
         }
+        delete configCache[slug];
+        res.json({ success: true, logoUrl: relativeUrl });
     }
-    res.json({ success: true, logoUrl: relativeUrl });
-});
-app.post('/api/sites/:slug/config', authMiddleware_1.authenticateToken, (req, res) => {
+    catch (err) {
+        res.status(500).json({ error: `Failed to update logo: ${err.message}` });
+    }
+}));
+app.post('/api/sites/:slug/config', authMiddleware_1.authenticateToken, checkStorefrontWritePermission, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     const rawSlug = req.params.slug;
     const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
-    const configPath = path_1.default.join(sitesPath, slug, 'config.json');
-    if (!fs_1.default.existsSync(configPath)) {
-        return res.status(404).json({ error: `Config not found for site ${slug}` });
-    }
     try {
-        const currentConfig = JSON.parse(fs_1.default.readFileSync(configPath, 'utf8'));
+        const currentConfig = yield getSiteConfig(slug);
         const newConfig = Object.assign(Object.assign({}, currentConfig), req.body);
-        fs_1.default.writeFileSync(configPath, JSON.stringify(newConfig, null, 2), 'utf8');
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        yield pool.query('INSERT INTO storefront_tenant_configs (tenantSlug, configText) VALUES (?, ?) ON DUPLICATE KEY UPDATE configText = VALUES(configText)', [slug, JSON.stringify(newConfig)]);
+        const configPath = path_1.default.join(sitesPath, slug, 'config.json');
+        try {
+            fs_1.default.writeFileSync(configPath, JSON.stringify(newConfig, null, 2), 'utf8');
+        }
+        catch (e) {
+            console.warn(`[Config] Failed to write backup file for ${slug}:`, e.message);
+        }
+        delete configCache[slug];
         res.json({ success: true, config: newConfig });
     }
     catch (err) {
         res.status(500).json({ error: `Failed to save config: ${err.message}` });
     }
-});
+}));
+// Tenant admin abandoned checkouts list
+app.get('/api/sites/:slug/abandoned', authMiddleware_1.authenticateToken, checkStorefrontWritePermission, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        const [rows] = yield pool.query(`SELECT id, customerName, customerPhone, deliveryAddress, cartState, status, recoveryToken, createdAt 
+             FROM storefront_abandoned_checkouts 
+             WHERE slug = ? 
+             ORDER BY createdAt DESC LIMIT 100`, [slug]);
+        res.json({ abandonedCheckouts: rows });
+    }
+    catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}));
+app.post('/api/sites/:slug/abandoned/:token/email', authMiddleware_1.authenticateToken, checkStorefrontWritePermission, (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    var _a;
+    const rawSlug = req.params.slug;
+    const slug = (typeof rawSlug === 'string' ? rawSlug : '').replace(/[^a-zA-Z0-9-_]/g, '');
+    const token = req.params.token;
+    try {
+        const { pool } = yield Promise.resolve().then(() => __importStar(require('./db')));
+        // 1. Fetch draft checkout details
+        const [drafts] = yield pool.query('SELECT customerName, customerPhone, deliveryAddress, cartState FROM storefront_abandoned_checkouts WHERE recoveryToken = ? AND slug = ? LIMIT 1', [token, slug]);
+        const draft = drafts[0];
+        if (!draft) {
+            return res.status(404).json({ error: 'لم يتم العثور على مسودة طلب لهذه المعاملة.' });
+        }
+        // 2. Resolve customer email from partners table
+        const cleanPhone = draft.customerPhone.trim();
+        const [partners] = yield pool.query('SELECT email, name FROM partners WHERE (phone = ? OR mobile = ? OR name = ?) AND email IS NOT NULL AND email != \'\' LIMIT 1', [cleanPhone, cleanPhone, draft.customerName]);
+        let recipientEmail = ((_a = partners[0]) === null || _a === void 0 ? void 0 : _a.email) || req.body.email;
+        if (!recipientEmail) {
+            return res.status(400).json({ error: 'لم يتم العثور على بريد إلكتروني مسجل لهذا العميل. يرجى توفير بريد إلكتروني.' });
+        }
+        // 3. Resolve site config and URL
+        const config = yield getSiteConfig(slug);
+        const brandName = config.brandName || slug;
+        const currency = config.currency || '$';
+        const host = req.get('host') || 'localhost:3000';
+        const siteUrl = config.customDomain ? `https://${config.customDomain}` : `${req.protocol}://${host}/sites/${slug}`;
+        const recoveryLink = `${siteUrl}?recoveryToken=${token}`;
+        // 4. Parse cart items
+        let cartState = {};
+        try {
+            cartState = typeof draft.cartState === 'string' ? JSON.parse(draft.cartState) : draft.cartState;
+        }
+        catch (e) { }
+        const items = cartState.items || [];
+        let itemsHtml = '';
+        let total = 0;
+        items.forEach((item) => {
+            const itemQty = Number(item.quantity) || 1;
+            const itemPrice = Number(item.price) || 0;
+            const lineTotal = itemQty * itemPrice;
+            total += lineTotal;
+            itemsHtml += `
+                <li style="padding: 10px 0; border-bottom: 1px solid #eee; display: flex; justify-content: space-between; direction: rtl;">
+                    <span>${item.name} (x${itemQty})</span>
+                    <span style="font-weight: bold;">${lineTotal.toFixed(2)} ${currency}</span>
+                </li>
+            `;
+        });
+        // 5. Construct HTML Recovery Template
+        const subject = `هل نسيت شيئاً؟ أكمل طلبك في ${brandName} | Complete your purchase at ${brandName}`;
+        const htmlBody = `
+            <div style="font-family: sans-serif; direction: rtl; text-align: right; padding: 30px; border: 1px solid #e2e8f0; border-radius: 12px; max-width: 600px; margin: auto; background-color: #ffffff;">
+                <h2 style="color: #4F46E5; margin-bottom: 10px;">عزيزي ${draft.customerName}،</h2>
+                <p style="font-size: 16px; color: #374151; line-height: 1.6;">لقد لاحظنا أنك تركت بعض المنتجات الرائعة في عربة التسوق الخاصة بك في <strong>${brandName}</strong>. لا تدعها تذهب!</p>
+                <hr style="border: 0; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
+                
+                <h3 style="color: #1F2937; margin-bottom: 10px;">العناصر في عربتك:</h3>
+                <ul style="list-style: none; padding: 0; margin: 0; color: #4B5563;">
+                    ${itemsHtml || '<li style="padding: 10px 0;">منتجات في عربة التسوق</li>'}
+                </ul>
+                <h4 style="text-align: left; color: #111827; margin-top: 15px;">الإجمالي التقريبي: <span style="font-size: 18px; color: #4F46E5;">${total.toFixed(2)} ${currency}</span></h4>
+                
+                <div style="text-align: center; margin: 35px 0;">
+                    <a href="${recoveryLink}" style="background-color: #4F46E5; color: #ffffff; padding: 14px 28px; text-decoration: none; font-weight: bold; border-radius: 8px; font-size: 16px; display: inline-block; box-shadow: 0 4px 6px -1px rgba(79, 70, 229, 0.2);">أكمل عملية الشراء الآن</a>
+                </div>
+                
+                <p style="font-size: 14px; color: #6B7280; text-align: center;">إذا كان لديك أي أسئلة، فلا تتردد في الاتصال بنا. شكراً لتسوقك معنا!</p>
+            </div>
+        `;
+        // 6. Send the email
+        const sent = yield (0, mailService_1.sendStorefrontEmail)(recipientEmail, subject, htmlBody);
+        if (sent) {
+            res.json({ success: true, message: 'تم إرسال بريد التذكير الإلكتروني بنجاح.' });
+        }
+        else {
+            res.status(500).json({ error: 'فشل في إرسال البريد الإلكتروني. يرجى التحقق من إعدادات SMTP.' });
+        }
+    }
+    catch (err) {
+        console.error('❌ Failed to trigger recovery email:', err.message);
+        res.status(500).json({ error: `فشل في إرسال البريد الإلكتروني: ${err.message}` });
+    }
+}));
 // Serve pre-compressed .br/.gz files when available (built by vite-plugin-compression2)
 // Falls back to raw files + dynamic compression() middleware for uncompressed assets
 app.use((0, express_static_gzip_1.default)(frontendPath, {
@@ -1869,6 +2894,47 @@ else {
 (0, db_1.initDB)().then(() => __awaiter(void 0, void 0, void 0, function* () {
     exports.dbReady = dbReady = true;
     console.log('✅ Database ready — server fully operational');
+    // ── Create Storefront Phase 3 Tables ──
+    try {
+        yield db_1.pool.query(`
+            CREATE TABLE IF NOT EXISTS storefront_tenant_configs (
+                tenantSlug VARCHAR(100) PRIMARY KEY,
+                configText LONGTEXT NOT NULL,
+                updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+            ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+        console.log('✅ storefront_tenant_configs table — ready');
+    }
+    catch (tblErr) {
+        console.error('Failed to create storefront_tenant_configs table:', tblErr.message);
+    }
+    try {
+        yield db_1.pool.query(`
+            CREATE TABLE IF NOT EXISTS checkout_stock_reservations (
+                id VARCHAR(36) PRIMARY KEY,
+                productId VARCHAR(36) NOT NULL,
+                variantId VARCHAR(36) NULL,
+                warehouseId VARCHAR(36) NOT NULL,
+                quantity DECIMAL(15,5) NOT NULL,
+                recoveryToken VARCHAR(36) NOT NULL,
+                expiresAt DATETIME NOT NULL,
+                createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_token (recoveryToken),
+                INDEX idx_expires (expiresAt)
+            ) ENGINE=InnoDB CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+        console.log('✅ checkout_stock_reservations table — ready');
+    }
+    catch (tblErr) {
+        console.error('Failed to create checkout_stock_reservations table:', tblErr.message);
+    }
+    // Initialize Reservation TTL release CRON job
+    try {
+        (0, reservationJobs_1.initializeReservationJobs)();
+    }
+    catch (cronErr) {
+        console.error('Failed to initialize reservation cleanup cron:', cronErr.message);
+    }
     console.log('Server is running'); // Required by launcher detection
     // ── Start DB Health Monitors ──
     Promise.resolve().then(() => __importStar(require('./utils/dbHealth'))).then(({ startPoolMonitor, startScheduledMaintenance }) => {
@@ -1890,6 +2956,21 @@ else {
     (0, membershipJobs_1.initializeMembershipJobs)();
     // Initialize POS CRON jobs
     (0, posJobs_1.initializePOSJobs)();
+    // Start background embedding worker
+    try {
+        (0, aiEmbeddingWorker_1.startEmbeddingWorker)();
+    }
+    catch (embedErr) {
+        console.error('Failed to start embedding worker:', embedErr.message);
+    }
+    // ── Run Abandoned Checkouts TTL Cleanup (delete PENDING older than 30 days) ──
+    try {
+        const [cleanupResult] = yield db_1.pool.query("DELETE FROM storefront_abandoned_checkouts WHERE status = 'PENDING' AND createdAt < DATE_SUB(NOW(), INTERVAL 30 DAY)");
+        console.log(`🧹 [DB Cleanup] Cleaned up ${cleanupResult.affectedRows || 0} stale abandoned checkout drafts older than 30 days.`);
+    }
+    catch (cleanupErr) {
+        console.warn('⚠️ Failed to run abandoned checkouts TTL cleanup:', cleanupErr.message);
+    }
 })).catch(err => {
     console.error('❌ Failed to initialize database:', err);
     dbError = (err === null || err === void 0 ? void 0 : err.message) || String(err);

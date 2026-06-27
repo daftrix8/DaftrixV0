@@ -4,6 +4,7 @@ const express_1 = require("express");
 const productController_1 = require("../controllers/productController");
 const productUnitController_1 = require("../controllers/productUnitController");
 const authMiddleware_1 = require("../middleware/authMiddleware");
+const productReviewController_1 = require("../controllers/productReviewController");
 const router = (0, express_1.Router)();
 // Variant Templates (MUST be before /:id routes)
 router.get('/variant-templates', productController_1.getVariantTemplates);
@@ -38,4 +39,7 @@ router.post('/', (0, authMiddleware_1.requirePermission)('inventory.manage_produ
 router.put('/:id', (0, authMiddleware_1.requirePermission)('inventory.manage_products'), productController_1.updateProduct);
 router.patch('/:id/toggle-active', (0, authMiddleware_1.requirePermission)('inventory.manage_products'), productController_1.toggleProductActive);
 router.delete('/:id', (0, authMiddleware_1.requirePermission)('inventory.manage_products'), productController_1.deleteProduct);
+// Product Reviews
+router.get('/:id/reviews', productReviewController_1.getProductReviews);
+router.post('/:id/reviews', authMiddleware_1.authenticateToken, productReviewController_1.createProductReview);
 exports.default = router;

@@ -11,7 +11,12 @@ const path_1 = __importDefault(require("path"));
 const fs_1 = __importDefault(require("fs"));
 const whatsappController_1 = require("../controllers/whatsappController");
 // Ensure uploads/whatsapp directory exists
-const uploadsDir = path_1.default.join(__dirname, '../../uploads/whatsapp');
+const baseUploadsPath = fs_1.default.existsSync(path_1.default.join(process.cwd(), 'uploads'))
+    ? path_1.default.join(process.cwd(), 'uploads')
+    : fs_1.default.existsSync(path_1.default.join(process.cwd(), '..', 'uploads'))
+        ? path_1.default.join(process.cwd(), '..', 'uploads')
+        : path_1.default.join(__dirname, '..', 'uploads');
+const uploadsDir = path_1.default.join(baseUploadsPath, 'whatsapp');
 if (!fs_1.default.existsSync(uploadsDir)) {
     fs_1.default.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -44,6 +49,9 @@ const router = (0, express_1.Router)();
 router.use(authMiddleware_1.authenticateToken);
 router.get('/settings', (0, authMiddleware_1.requirePermission)('settings.view'), whatsappController_1.getWhatsAppSettings);
 router.put('/settings', (0, authMiddleware_1.requirePermission)('settings.edit'), whatsappController_1.updateWhatsAppSettings);
+router.get('/state', (0, authMiddleware_1.requirePermission)('settings.view'), whatsappController_1.getWhatsAppState);
+router.post('/initialize', (0, authMiddleware_1.requirePermission)('settings.edit'), whatsappController_1.initializeWhatsAppInstance);
+router.post('/logout', (0, authMiddleware_1.requirePermission)('settings.edit'), whatsappController_1.logoutWhatsAppInstance);
 router.post('/test', (0, authMiddleware_1.requirePermission)('settings.edit'), whatsappController_1.testConnection);
 router.get('/logs', (0, authMiddleware_1.requirePermission)('settings.view'), whatsappController_1.getMessageLogs);
 router.post('/send-invoice-pdf', upload.single('pdf'), whatsappController_1.sendInvoicePDFViaWhatsApp);

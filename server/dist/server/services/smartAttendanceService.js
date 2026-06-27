@@ -41,7 +41,9 @@ exports.getSmartAttendanceStats = getSmartAttendanceStats;
 exports.haversineDistance = haversineDistance;
 exports.generateDeviceFingerprint = generateDeviceFingerprint;
 exports.resetDeviceBinding = resetDeviceBinding;
+exports.getTodayBranchAttendance = getTodayBranchAttendance;
 const db_1 = require("../db");
+const eventBus_1 = require("../utils/eventBus");
 const crypto_1 = require("crypto");
 const crypto_2 = __importDefault(require("crypto"));
 const fs_1 = __importDefault(require("fs"));
@@ -571,6 +573,24 @@ function recordPunch(req) {
             }
             // Return the modified verificationStatus and confidence total
             const finalConfidence = Object.assign(Object.assign({}, confidence), { status: verificationStatus });
+            // Broadcast the punch to all connected kiosk displays
+            try {
+                const [empRows] = yield db_1.pool.query('SELECT fullName, branchId, avatar FROM employees WHERE id = ?', [req.employeeId]);
+                if (empRows.length > 0) {
+                    eventBus_1.eventBus.broadcast('attendance:punch', {
+                        employeeId: req.employeeId,
+                        employeeName: empRows[0].fullName,
+                        employeeAvatar: empRows[0].avatar || null,
+                        punchType: req.punchType,
+                        status: verificationStatus,
+                        branchId: empRows[0].branchId || null,
+                        time: punchTime.toISOString(),
+                    });
+                }
+            }
+            catch (e) {
+                console.error('❌ Failed to broadcast punch in recordPunch:', e.message);
+            }
             return { punchId, confidence: finalConfidence, attendanceRecordId };
         }
         finally {
@@ -905,4 +925,43 @@ function saveSelfie(punchId, base64Data) {
         console.error(`📸 Failed to save selfie for punch ${punchId}:`, err);
         return null;
     }
+}
+/**
+ * Get today's attendance summary for a specific branch kiosk.
+ */
+function getTodayBranchAttendance(branchId) {
+    return __awaiter(this, void 0, void 0, function* () {
+        // 1. Get today's punches count
+        const [statsRows] = yield db_1.pool.query(`
+        SELECT 
+            COUNT(*) as totalPunches,
+            SUM(CASE WHEN punchType = 'CHECK_IN' AND verificationStatus = 'AUTO_APPROVED' THEN 1 ELSE 0 END) as onTimeCount,
+            SUM(CASE WHEN punchType = 'CHECK_IN' AND verificationStatus = 'PENDING_REVIEW' THEN 1 ELSE 0 END) as lateCount
+        FROM smart_attendance_punches sap
+        JOIN employees e ON sap.employeeId = e.id
+        WHERE e.branchId = ? AND DATE(sap.punchTime) = CURDATE()
+    `, [branchId]);
+        const stats = statsRows[0] || { totalPunches: 0, onTimeCount: 0, lateCount: 0 };
+        // 2. Get last 15 punches today for this branch
+        const [punchesRows] = yield db_1.pool.query(`
+        SELECT 
+            sap.id as punchId,
+            sap.punchType,
+            sap.verificationStatus,
+            TIME_FORMAT(sap.punchTime, '%H:%i') as time,
+            e.fullName as employeeName,
+            e.avatar as employeeAvatar
+        FROM smart_attendance_punches sap
+        JOIN employees e ON sap.employeeId = e.id
+        WHERE e.branchId = ? AND DATE(sap.punchTime) = CURDATE()
+        ORDER BY sap.punchTime DESC
+        LIMIT 15
+    `, [branchId]);
+        return {
+            totalPunches: stats.totalPunches || 0,
+            onTimeCount: stats.onTimeCount || 0,
+            lateCount: stats.lateCount || 0,
+            todayList: punchesRows || []
+        };
+    });
 }

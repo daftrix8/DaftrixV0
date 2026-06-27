@@ -13,6 +13,7 @@ router.post('/receipts', (0, authMiddleware_1.requirePermission)('treasury.recei
 // Banks — GET open (needed for payment method dropdowns), mutations require permission
 router.get('/banks', treasuryController_1.getBanks);
 router.post('/banks', (0, authMiddleware_1.requirePermission)('treasury.manage'), treasuryController_1.createBank);
+router.post('/banks/reorder', (0, authMiddleware_1.requirePermission)('treasury.manage'), treasuryController_1.reorderBanks);
 router.post('/banks/recalculate', (0, authMiddleware_1.requirePermission)('system.settings'), treasuryController_1.recalculateBankBalances);
 router.post('/cleanup-accounts', (0, authMiddleware_1.requirePermission)('system.settings'), treasuryController_1.cleanupDuplicateBankAccounts);
 router.put('/banks/:id', (0, authMiddleware_1.requirePermission)('treasury.manage'), treasuryController_1.updateBank);

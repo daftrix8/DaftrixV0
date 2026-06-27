@@ -74,7 +74,8 @@ if (process.env.NODE_ENV === 'development') {
 // Invoices, payments, partner statements, product lookups
 // These must NEVER be blocked by background operations
 // ═══════════════════════════════════════════════════════════
-const poolConfig = Object.assign(Object.assign({ host: process.env.DB_HOST, user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_NAME, port: Number(process.env.DB_PORT) || 3306, waitForConnections: true, connectionLimit: 25, maxIdle: 5, idleTimeout: 300000, queueLimit: 100, connectTimeout: 30000, enableKeepAlive: true, keepAliveInitialDelay: 5000, decimalNumbers: true, charset: 'UTF8MB4_UNICODE_CI' }, (process.env.DB_SSL === 'true' ? { ssl: { rejectUnauthorized: false } } : {})), { authPlugins: {
+const poolConfig = Object.assign(Object.assign({ host: process.env.DB_HOST, user: process.env.DB_USER, password: process.env.DB_PASSWORD, database: process.env.DB_NAME, port: Number(process.env.DB_PORT) || 3306, waitForConnections: true, connectionLimit: 25, maxIdle: 5, idleTimeout: 300000, queueLimit: 0, connectTimeout: 30000, enableKeepAlive: true, keepAliveInitialDelay: 5000, decimalNumbers: true, charset: 'UTF8MB4_UNICODE_CI' }, (process.env.DB_SSL === 'true' ? { ssl: { rejectUnauthorized: false } } : {})), { authPlugins: {
+        auth_gssapi_client: () => () => Buffer.alloc(0),
         mysql_clear_password: () => () => Buffer.from(process.env.DB_PASSWORD + '\0')
     } });
 exports.pool = promise_1.default.createPool(poolConfig);
@@ -430,7 +431,7 @@ function safePoolQuery(sql_1, params_1) {
         throw new Error('safePoolQuery: should not reach here');
     });
 }
-exports.SCHEMA_VERSION = 80; // Bump this when adding new migrations
+exports.SCHEMA_VERSION = 84; // Bump this when adding new migrations
 function initDB() {
     return __awaiter(this, void 0, void 0, function* () {
         var _a, _b, _c, _d, _e, _f;
@@ -460,6 +461,28 @@ function initDB() {
             // Now connect to the database
             conn = yield exports.pool.getConnection();
             console.log("Connected to MariaDB/MySQL");
+            // Ensure product_reviews table exists
+            try {
+                yield conn.query(`
+        CREATE TABLE IF NOT EXISTS product_reviews (
+          id VARCHAR(36) PRIMARY KEY,
+          productId VARCHAR(36) NOT NULL,
+          customerId VARCHAR(36) NULL,
+          customerName VARCHAR(100) NOT NULL,
+          rating TINYINT NOT NULL,
+          comment TEXT NULL,
+          images JSON NULL,
+          isVerified BOOLEAN DEFAULT FALSE,
+          createdAt DATETIME DEFAULT CURRENT_TIMESTAMP,
+          INDEX idx_review_product (productId, createdAt),
+          INDEX idx_review_customer (customerId)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+      `);
+                console.log('✅ product_reviews table — ready');
+            }
+            catch (reviewErr) {
+                console.warn('⚠️ product_reviews table creation warning:', reviewErr === null || reviewErr === void 0 ? void 0 : reviewErr.message);
+            }
             // Check if schema is already up-to-date (skip migrations for fast startup)
             let needsMigrations = true;
             try {
@@ -585,12 +608,22 @@ function initDB() {
           id            VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
           isEnabled     BOOLEAN DEFAULT FALSE,
           phoneNumberId VARCHAR(100) NOT NULL DEFAULT '',
-          accessToken   TEXT NOT NULL,
+          accessToken   TEXT,
           wabaId        VARCHAR(100) NOT NULL DEFAULT '',
           webhookToken  VARCHAR(255) NOT NULL DEFAULT '',
+          apiUrl        VARCHAR(255) NOT NULL DEFAULT '',
+          instanceName  VARCHAR(100) NOT NULL DEFAULT '',
+          apiKey        TEXT,
+          provider      VARCHAR(20) DEFAULT 'EMBEDDED',
           sendOnInvoiceConfirm BOOLEAN DEFAULT TRUE,
           sendOnPaymentRecord  BOOLEAN DEFAULT TRUE,
           sendPOSReceipt       BOOLEAN DEFAULT FALSE,
+          createdAt     DATETIME DEFAULT CURRENT_TIMESTAMP,
+          updatedAt     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )`);
+                    yield conn.query(`CREATE TABLE IF NOT EXISTS whatsapp_session_keys (
+          keyId         VARCHAR(255) PRIMARY KEY,
+          keyValue      LONGTEXT NOT NULL,
           createdAt     DATETIME DEFAULT CURRENT_TIMESTAMP,
           updatedAt     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
         )`);
@@ -792,6 +825,42 @@ function initDB() {
                 }
                 catch (posCartErr) {
                     console.warn('⚠️ pos_active_carts fast-path creation warning:', posCartErr === null || posCartErr === void 0 ? void 0 : posCartErr.message);
+                }
+                // ── Ensure active customer storefront carts table exists ──
+                try {
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS storefront_carts (
+            userId VARCHAR(36) PRIMARY KEY,
+            cartState LONGTEXT NOT NULL,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+          ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+                }
+                catch (storefrontCartErr) {
+                    console.warn('⚠️ storefront_carts fast-path creation warning:', storefrontCartErr === null || storefrontCartErr === void 0 ? void 0 : storefrontCartErr.message);
+                }
+                // ── Ensure abandoned checkouts table exists ──
+                try {
+                    yield conn.query(`
+          CREATE TABLE IF NOT EXISTS storefront_abandoned_checkouts (
+            id VARCHAR(36) PRIMARY KEY,
+            slug VARCHAR(100) NOT NULL,
+            recoveryToken VARCHAR(36) UNIQUE NOT NULL,
+            customerName VARCHAR(255) NOT NULL,
+            customerPhone VARCHAR(50) NOT NULL,
+            deliveryAddress TEXT NOT NULL,
+            cartState LONGTEXT NOT NULL,
+            status VARCHAR(20) DEFAULT 'PENDING',
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_slug (slug),
+            INDEX idx_phone (customerPhone)
+          ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+        `);
+                }
+                catch (abandonedCheckErr) {
+                    console.warn('⚠️ storefront_abandoned_checkouts table creation warning:', abandonedCheckErr === null || abandonedCheckErr === void 0 ? void 0 : abandonedCheckErr.message);
                 }
                 // ── Fix collation mismatch: MariaDB 11+ creates tables with utf8mb4_uca1400_ai_ci ──
                 // MariaDB 11+ blocks MODIFY COLUMN on FK-referenced columns regardless of FK_CHECKS.
@@ -1498,6 +1567,32 @@ function initDB() {
             updatedAt BIGINT NOT NULL
         ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
     `).catch(() => { });
+            // storefront_carts table
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS storefront_carts (
+            userId VARCHAR(36) PRIMARY KEY,
+            cartState LONGTEXT NOT NULL,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            FOREIGN KEY (userId) REFERENCES users(id) ON DELETE CASCADE
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `).catch(() => { });
+            // storefront_abandoned_checkouts table
+            yield conn.query(`
+        CREATE TABLE IF NOT EXISTS storefront_abandoned_checkouts (
+            id VARCHAR(36) PRIMARY KEY,
+            slug VARCHAR(100) NOT NULL,
+            recoveryToken VARCHAR(36) UNIQUE NOT NULL,
+            customerName VARCHAR(255) NOT NULL,
+            customerPhone VARCHAR(50) NOT NULL,
+            deliveryAddress TEXT NOT NULL,
+            cartState LONGTEXT NOT NULL,
+            status VARCHAR(20) DEFAULT 'PENDING',
+            createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updatedAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            INDEX idx_slug (slug),
+            INDEX idx_phone (customerPhone)
+        ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+    `).catch(() => { });
             // ========================================
             // LOYALTY SYSTEM TABLES (نظام الولاء)
             // ========================================
@@ -1914,7 +2009,8 @@ function initDB() {
         swift VARCHAR(50),
         type VARCHAR(50),
         accountId VARCHAR(36),
-        color VARCHAR(100)
+        color VARCHAR(100),
+        sortOrder INT DEFAULT 0
       )
     `);
             // Branch isolation: link each treasury/bank to a branch
@@ -1925,6 +2021,7 @@ function initDB() {
             yield conn.query(`ALTER TABLE banks ADD COLUMN isPrimary BOOLEAN DEFAULT FALSE`).catch(() => { });
             yield conn.query(`ALTER TABLE banks ADD COLUMN depositPermissions JSON`).catch(() => { });
             yield conn.query(`ALTER TABLE banks ADD COLUMN withdrawPermissions JSON`).catch(() => { });
+            yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS sortOrder INT DEFAULT 0`).catch(() => { });
             // Payment Fees: per-bank fee configuration (رسوم الدفع)
             yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeEnabled BOOLEAN DEFAULT FALSE COMMENT 'تفعيل رسوم الدفع'`).catch(() => { });
             yield conn.query(`ALTER TABLE banks ADD COLUMN IF NOT EXISTS feeType VARCHAR(20) DEFAULT 'PERCENTAGE' COMMENT 'نوع الرسوم: PERCENTAGE / FIXED / BOTH'`).catch(() => { });
@@ -3894,6 +3991,22 @@ function initDB() {
             // Migration: Add skippedLocked column to existing sync_log tables
             yield conn.query(`ALTER TABLE fingerprint_sync_log ADD COLUMN IF NOT EXISTS skippedLocked INT DEFAULT 0`).catch(() => { });
             console.log('✅ Fingerprint device tables initialized');
+            // Phone Enrollment Tokens for Smart Attendance
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS employee_phone_tokens (
+        id VARCHAR(36) PRIMARY KEY,
+        employeeId VARCHAR(36) NOT NULL,
+        pairingCode VARCHAR(6) NOT NULL,
+        deviceId VARCHAR(255),
+        phoneJwt TEXT,
+        isUsed BOOLEAN DEFAULT FALSE,
+        expiresAt DATETIME NOT NULL,
+        enrolledAt DATETIME,
+        INDEX idx_pairing_code (pairingCode),
+        INDEX idx_employee (employeeId)
+      )
+    `).then(() => console.log('✅ employee_phone_tokens table initialized'))
+                .catch((err) => console.error('❌ Failed to initialize employee_phone_tokens table:', err.message));
             // ========================================
             // ALL SYSTEM PERMISSIONS
             // ========================================
@@ -5211,6 +5324,10 @@ function initDB() {
         accessToken   TEXT NOT NULL,
         wabaId        VARCHAR(100) NOT NULL DEFAULT '',
         webhookToken  VARCHAR(255) NOT NULL DEFAULT '',
+        apiUrl        VARCHAR(255) NOT NULL DEFAULT '',
+        instanceName  VARCHAR(100) NOT NULL DEFAULT '',
+        apiKey        TEXT,
+        provider      VARCHAR(20) DEFAULT 'EMBEDDED',
         sendOnInvoiceConfirm BOOLEAN DEFAULT TRUE,
         sendOnPaymentRecord  BOOLEAN DEFAULT TRUE,
         sendPOSReceipt       BOOLEAN DEFAULT FALSE,
@@ -5218,6 +5335,31 @@ function initDB() {
         updatedAt     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
       )
     `).catch(() => { });
+            yield conn.query(`
+      CREATE TABLE IF NOT EXISTS whatsapp_session_keys (
+        keyId         VARCHAR(255) PRIMARY KEY,
+        keyValue      LONGTEXT NOT NULL,
+        createdAt     DATETIME DEFAULT CURRENT_TIMESTAMP,
+        updatedAt     DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `).catch(() => { });
+            // Alter table safely for Evolution API columns
+            try {
+                yield conn.query(`ALTER TABLE whatsapp_settings ADD COLUMN apiUrl VARCHAR(255) NOT NULL DEFAULT ''`);
+            }
+            catch (err) { }
+            try {
+                yield conn.query(`ALTER TABLE whatsapp_settings ADD COLUMN instanceName VARCHAR(100) NOT NULL DEFAULT ''`);
+            }
+            catch (err) { }
+            try {
+                yield conn.query(`ALTER TABLE whatsapp_settings ADD COLUMN apiKey TEXT`);
+            }
+            catch (err) { }
+            try {
+                yield conn.query(`ALTER TABLE whatsapp_settings ADD COLUMN provider VARCHAR(20) DEFAULT 'EMBEDDED'`);
+            }
+            catch (err) { }
             yield conn.query(`
       CREATE TABLE IF NOT EXISTS whatsapp_message_log (
         id              VARCHAR(36) PRIMARY KEY DEFAULT (UUID()),
@@ -5412,7 +5554,8 @@ function seedInitialData() {
                 const masterPassword = process.env.MASTER_ADMIN_PASSWORD || 'Daftrix@2025!';
                 const hashedMasterPassword = yield bcrypt.hash(masterPassword, 10);
                 const masterId = 'master-admin-' + uuidv4().slice(0, 8);
-                yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions, isHidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [masterId, 'System Administrator', 'support@daftrix.com', 'myst', hashedMasterPassword, 'MASTER_ADMIN', 'ACTIVE', JSON.stringify(['all']), true]);
+                const supportEmail = process.env.SUPPORT_EMAIL || 'support@company.com';
+                yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions, isHidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [masterId, 'System Administrator', supportEmail, 'myst', hashedMasterPassword, 'MASTER_ADMIN', 'ACTIVE', JSON.stringify(['all']), true]);
                 console.log('Seeded hidden master admin (isHidden=true)');
             }
             else {
@@ -5425,7 +5568,8 @@ function seedInitialData() {
                     const masterPassword = process.env.MASTER_ADMIN_PASSWORD || 'Daftrix@2025!';
                     const hashedMasterPassword = yield bcrypt.hash(masterPassword, 10);
                     const masterId = 'master-admin-' + uuidv4().slice(0, 8);
-                    yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions, isHidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [masterId, 'System Administrator', 'support@daftrix.com', 'myst', hashedMasterPassword, 'MASTER_ADMIN', 'ACTIVE', JSON.stringify(['all']), true]);
+                    const supportEmail = process.env.SUPPORT_EMAIL || 'support@company.com';
+                    yield conn.query('INSERT INTO users (id, name, email, username, password, role, status, permissions, isHidden) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [masterId, 'System Administrator', supportEmail, 'myst', hashedMasterPassword, 'MASTER_ADMIN', 'ACTIVE', JSON.stringify(['all']), true]);
                     console.log('Added hidden master admin to existing database');
                 }
             }

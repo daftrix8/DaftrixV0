@@ -13,7 +13,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.generateBranchQr = exports.autoMatchUsersAndEmployees = exports.getAudit = exports.resetEmployeeDevice = exports.linkUserToEmployee = exports.getUserEmployeeLinks = exports.removeLocation = exports.editLocation = exports.addLocation = exports.getLocation = exports.listLocations = exports.getStats = exports.reviewPunchAction = exports.listPendingReviews = exports.getMyStatus = exports.punchBulkCheckIn = exports.punchCheckIn = void 0;
+exports.getTodayBranchKioskStats = exports.generateBranchQr = exports.autoMatchUsersAndEmployees = exports.getAudit = exports.resetEmployeeDevice = exports.linkUserToEmployee = exports.getUserEmployeeLinks = exports.removeLocation = exports.editLocation = exports.addLocation = exports.getLocation = exports.listLocations = exports.getStats = exports.reviewPunchAction = exports.listPendingReviews = exports.getMyStatus = exports.punchBulkCheckIn = exports.punchCheckIn = void 0;
 const errorHandler_1 = require("../utils/errorHandler");
 const smartAttendanceService_1 = require("../services/smartAttendanceService");
 const db_1 = require("../db");
@@ -488,3 +488,21 @@ const generateBranchQr = (req, res) => __awaiter(void 0, void 0, void 0, functio
     }
 });
 exports.generateBranchQr = generateBranchQr;
+/**
+ * GET /api/hr/smart-attendance/branch-stats/:branchId
+ * Retrieves today's stats and history for the branch kiosk.
+ */
+const getTodayBranchKioskStats = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const { branchId } = req.params;
+        if (!branchId) {
+            return res.status(400).json({ message: 'branchId is required' });
+        }
+        const data = yield (0, smartAttendanceService_1.getTodayBranchAttendance)(branchId);
+        res.json(Object.assign({ success: true }, data));
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'Failed to get branch kiosk stats');
+    }
+});
+exports.getTodayBranchKioskStats = getTodayBranchKioskStats;

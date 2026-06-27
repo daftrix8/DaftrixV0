@@ -268,8 +268,11 @@ function validateModifyOthersData(originalCreator, currentUser, currentUserRole,
     if (!originalCreator || !currentUser) {
         return { valid: true };
     }
-    // If same user, always allow
-    if (originalCreator === currentUser) {
+    const normalize = (s) => s.trim().toLowerCase().replace(/\s+/g, ' ');
+    const creatorNormalized = normalize(originalCreator);
+    const currentUserTokens = currentUser.split('|').map(normalize);
+    // If same user (either username or name matches original creator), always allow
+    if (currentUserTokens.includes(creatorNormalized)) {
         return { valid: true };
     }
     // Administrative roles (MASTER_ADMIN, ADMIN, GENERAL_MANAGER) can always modify others' data
@@ -330,7 +333,7 @@ function validateNegativeStock(lines, transactionType, config, existingConn, war
             const [oldLineRows] = yield existingConn.query(`SELECT il.productId, il.quantity, il.bonusQty
              FROM invoice_lines il
              JOIN invoices i ON i.id = il.invoiceId
-             WHERE il.invoiceId = ? AND i.status = 'POSTED'`, [existingInvoiceId]);
+             WHERE il.invoiceId = ? AND (i.status IN ('POSTED', 'PAID', 'PARTIAL', 'PARTIALLY_PAID') OR i.posted = 1)`, [existingInvoiceId]);
             for (const ol of oldLineRows) {
                 const qty = (Number(ol.quantity) || 0) + (Number(ol.bonusQty) || 0);
                 oldQtyCredit[ol.productId] = (oldQtyCredit[ol.productId] || 0) + qty;

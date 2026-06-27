@@ -9,7 +9,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.additionalSecurityHeaders = exports.securityHeaders = void 0;
+exports.additionalSecurityHeaders = exports.storefrontSecurityHeaders = exports.securityHeaders = void 0;
 const helmet_1 = __importDefault(require("helmet"));
 /**
  * Core security headers via helmet.
@@ -88,6 +88,85 @@ exports.securityHeaders = (0, helmet_1.default)({
     crossOriginOpenerPolicy: false,
     crossOriginEmbedderPolicy: false,
     originAgentCluster: false,
+});
+/**
+ * Storefront security headers specifically for client pages.
+ * Relaxed CSP to allow dynamic fonts, tailwind, CDNs, and tracking pixels.
+ */
+exports.storefrontSecurityHeaders = (0, helmet_1.default)({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: [
+                "'self'",
+                "'unsafe-inline'", // Needed for inline storefront scripts (Google Tag, Facebook Pixel, etc.)
+                "'unsafe-eval'", // Needed for storefront page rendering / components logic
+                "https://cdn.tailwindcss.com",
+                "https://unpkg.com",
+                "https://cdnjs.cloudflare.com",
+                "https://aistudiocdn.com",
+                "https://*.google-analytics.com",
+                "https://*.analytics.google.com",
+                "https://*.googletagmanager.com",
+                "https://connect.facebook.net",
+                "https://*.facebook.com"
+            ],
+            scriptSrcAttr: ["'unsafe-inline'"],
+            styleSrc: [
+                "'self'",
+                "'unsafe-inline'",
+                "https://fonts.googleapis.com",
+                "https://cdn.tailwindcss.com",
+                "https://cdnjs.cloudflare.com"
+            ],
+            fontSrc: [
+                "'self'",
+                "data:",
+                "https://fonts.gstatic.com",
+                "https://fonts.googleapis.com",
+                "https://cdnjs.cloudflare.com"
+            ],
+            imgSrc: [
+                "'self'",
+                "data:",
+                "blob:",
+                "*" // Storefronts display third-party/external product images (from URLs)
+            ],
+            connectSrc: [
+                "'self'",
+                "ws:",
+                "wss:",
+                "http:", // ERP API on localhost, LAN IPs, Tailscale — any HTTP origin
+                "https:", // ERP API on production/HTTPS origins
+            ],
+            frameSrc: [
+                "'self'",
+                "https://*.youtube.com",
+                "https://*.vimeo.com",
+                "https://*.google.com" // For Google Maps embeds
+            ],
+            objectSrc: ["'none'"],
+            baseUri: ["'self'"],
+            formAction: ["'self'"],
+            upgradeInsecureRequests: null, // Allow Tailscale / plain HTTP local access
+        }
+    },
+    strictTransportSecurity: false, // Conditionally set in additionalSecurityHeaders
+    xContentTypeOptions: true,
+    referrerPolicy: {
+        policy: 'strict-origin-when-cross-origin',
+    },
+    frameguard: {
+        action: 'sameorigin', // Block clickjacking
+    },
+    dnsPrefetchControl: {
+        allow: false,
+    },
+    hidePoweredBy: true,
+    xXssProtection: true,
+    crossOriginOpenerPolicy: false,
+    crossOriginEmbedderPolicy: false,
+    originAgentCluster: false
 });
 /**
  * Additional security headers (not included in helmet by default)

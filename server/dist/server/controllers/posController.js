@@ -1772,6 +1772,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
         const authReq = req;
         const systemConfig = authReq.systemConfig;
         if (systemConfig && (currentUserRole === null || currentUserRole === void 0 ? void 0 : currentUserRole.toUpperCase()) !== 'MASTER_ADMIN') {
+            const u = authReq.user;
             const context = {
                 type: 'INVOICE_SALE',
                 date: now,
@@ -1780,7 +1781,7 @@ const processPOSSale = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 notes: notes || 'مبيعات نقاط البيع',
                 warehouseId: effectiveWarehouseId,
                 createdBy: userName,
-                currentUser: userName,
+                currentUser: u ? `${u.username || ''}|${u.name || ''}` : userName,
                 currentUserRole,
                 lines: items.filter((i) => i.tradeInAction !== 'CUSTOM_TRADE_IN').map((i) => ({
                     productId: i.productId,
@@ -4178,7 +4179,7 @@ const getPOSCustomerSummary = (req, res) => __awaiter(void 0, void 0, void 0, fu
         // Fetch active membership + its benefits
         let activeMembership = null;
         try {
-            const [membershipRows] = yield conn.query(`SELECT m.id, m.status, m.joinDate, m.endDate, p.name as packageName, p.id as packageId, p.icon as packageIcon
+            const [membershipRows] = yield conn.query(`SELECT m.id, m.status, m.lastBillingDate, m.joinDate, m.endDate, p.name as packageName, p.id as packageId, p.icon as packageIcon
                  FROM memberships m
                  JOIN membership_packages p ON m.packageId = p.id
                  WHERE m.customerId = ? AND m.status IN ('active', 'ACTIVE', 'PENDING_PAYMENT')
@@ -4186,14 +4187,29 @@ const getPOSCustomerSummary = (req, res) => __awaiter(void 0, void 0, void 0, fu
             let packageIds = [];
             if (membershipRows.length > 0) {
                 // Keep the most recent one as the primary for display
-                activeMembership = membershipRows[0];
+                const mRaw = membershipRows[0];
+                let status = mRaw.status ? mRaw.status.toUpperCase() : mRaw.status;
+                // Fetch settings to check grace period
+                const [settingsRows] = yield conn.query('SELECT gracePeriodDays, attendanceAllowedFor FROM membership_settings WHERE id = 1');
+                const settings = settingsRows.length > 0 ? settingsRows[0] : { gracePeriodDays: 0, attendanceAllowedFor: 'active_only' };
+                const graceDays = Number(settings.gracePeriodDays || 0);
+                const allowGrace = settings.attendanceAllowedFor === 'active_and_grace';
+                if (status === 'PENDING_PAYMENT' && allowGrace && mRaw.lastBillingDate && graceDays > 0) {
+                    const lastBilling = new Date(mRaw.lastBillingDate);
+                    lastBilling.setDate(lastBilling.getDate() + graceDays);
+                    lastBilling.setHours(23, 59, 59, 999);
+                    if (new Date() <= lastBilling) {
+                        status = 'GRACE_PERIOD';
+                    }
+                }
+                activeMembership = Object.assign(Object.assign({}, mRaw), { status });
                 packageIds = membershipRows.map(r => r.packageId);
             }
             else {
                 activeMembership = {
                     packageId: 'regular-package',
                     packageName: 'عضوية عادية',
-                    status: 'active'
+                    status: 'ACTIVE'
                 };
                 packageIds = ['regular-package'];
             }

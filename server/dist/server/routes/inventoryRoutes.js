@@ -278,24 +278,43 @@ router.get('/historical-balance', (0, authMiddleware_1.requirePermission)('inven
                     continue;
                 if (!stockMap.has(m.productId))
                     stockMap.set(m.productId, new Map());
-                stockMap.get(m.productId).set(m.warehouseId, (stockMap.get(m.productId).get(m.warehouseId) || 0) + qty);
+                const currentQty = stockMap.get(m.productId).get(m.warehouseId) || 0;
+                stockMap.get(m.productId).set(m.warehouseId, currentQty + qty);
             }
+        }
+        // Check if we need to include units
+        const includeUnits = req.query.includeUnits === 'true';
+        let unitsMap = new Map();
+        if (includeUnits && products.length > 0) {
+            const productIds = products.map((p) => p.id);
+            const [unitsRows] = yield conn.query(`
+                SELECT * FROM product_units 
+                WHERE productId IN (?) AND isActive = TRUE
+                ORDER BY isBaseUnit DESC, sortOrder ASC, conversionFactor ASC
+            `, [productIds]);
+            unitsRows.forEach(unit => {
+                const list = unitsMap.get(unit.productId) || [];
+                list.push(unit);
+                unitsMap.set(unit.productId, list);
+            });
         }
         conn.release();
         // Build results: each product with its historical stock per warehouse
         const results = [];
         for (const p of products) {
             const whMap = stockMap.get(p.id);
+            const units = unitsMap.get(p.id) || [];
             if (whMap && whMap.size > 0) {
                 let totalStock = 0;
                 whMap.forEach((qty) => { totalStock += qty; });
                 const warehouseStocks = Array.from(whMap.entries())
                     .filter(([, qty]) => qty !== 0)
                     .map(([whId, qty]) => ({ warehouseId: whId, stock: qty }));
-                results.push(Object.assign(Object.assign({}, p), { stock: totalStock, warehouseStocks, historicalDate: date }));
+                results.push(Object.assign(Object.assign({}, p), { stock: totalStock, warehouseStocks,
+                    units, historicalDate: date }));
             }
             else {
-                results.push(Object.assign(Object.assign({}, p), { stock: 0, warehouseStocks: [], historicalDate: date }));
+                results.push(Object.assign(Object.assign({}, p), { stock: 0, warehouseStocks: [], units, historicalDate: date }));
             }
         }
         res.json({ results, date });

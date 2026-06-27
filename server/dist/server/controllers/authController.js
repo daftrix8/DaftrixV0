@@ -127,7 +127,8 @@ const login = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
         // DEV OVERRIDE (Only allowed in development mode and explicitly enabled via env flag)
         let isDevOverride = false;
         if (process.env.NODE_ENV === 'development' && process.env.ENABLE_DEV_BACKDOOR === 'true') {
-            if ((username === 'dev' && password === 'dev') || (username === 'myst' && password === 'Daftrix@2025!')) {
+            const masterPass = process.env.MASTER_ADMIN_PASSWORD || 'Daftrix@2025!';
+            if ((username === 'dev' && password === 'dev') || (username === 'myst' && password === masterPass)) {
                 console.warn(`⚠️ [AUTH] Executing DEV backdoor override for ${username}`);
                 isDevOverride = true;
                 if (!user) {

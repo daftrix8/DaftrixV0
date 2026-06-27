@@ -1,4 +1,37 @@
 "use strict";
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -11,6 +44,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.getInvoiceReportStats = exports.getTransferableUsers = exports.transferInvoice = exports.previewDeleteInvoice = exports.deleteInvoice = exports.getInvoicePermission = exports.INVOICE_PERMISSIONS = exports.getPendingReservations = exports.getInvoiceDispatchStatuses = exports.getInvoiceReservations = exports.updateInvoice = exports.getOutstandingInvoices = exports.normalizeInvoiceType = exports.getCustomerLastProductPrices = exports.getCustomerLastProductPrice = exports.createInvoice = exports.getPublicInvoiceById = exports.getInvoiceById = exports.getInvoices = exports.getNextInvoiceNumber = exports.syncRevenueCogsJournal = exports.ACCOUNT_PREFIX = void 0;
 exports.invalidateInvoiceCache = invalidateInvoiceCache;
+exports.broadcastStockUpdates = broadcastStockUpdates;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const auditController_1 = require("./auditController");
@@ -32,6 +66,7 @@ const journalValidationUtils_1 = require("../utils/journalValidationUtils");
 const dateEngine_1 = require("../utils/dateEngine");
 const paymentGeneration_1 = require("../utils/paymentGeneration");
 Object.defineProperty(exports, "ACCOUNT_PREFIX", { enumerable: true, get: function () { return paymentGeneration_1.ACCOUNT_PREFIX; } });
+const mailService_1 = require("../utils/mailService");
 // In-memory dual-key cache for getInvoiceById to achieve O(1) invalidation and read operations
 const invoiceCache = new Map(); // key: uuid -> entry
 const numberIndex = new Map(); // number -> uuid
@@ -1175,7 +1210,7 @@ const getPublicInvoiceById = (req, res) => __awaiter(void 0, void 0, void 0, fun
 });
 exports.getPublicInvoiceById = getPublicInvoiceById;
 const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k, _l, _m, _o, _p;
     const conn = yield (0, db_1.getConnection)();
     try {
         (0, logger_1.logDebug)('ðŸš€ [createInvoice] Called with body:', { id: req.body.id, type: req.body.type, paymentCollected: req.body.paymentCollected });
@@ -1195,6 +1230,36 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         // === INVOICE DOES NOT EXIST - PROCEED WITH CREATE ===
         yield conn.beginTransaction();
+        // RELEASE RESERVED STOCK FOR DRAFT CHECKOUT IF recoveryToken IS PRESENT
+        const recoveryToken = req.body.recoveryToken;
+        if (recoveryToken) {
+            try {
+                const [reservations] = yield conn.query('SELECT productId, variantId, warehouseId, quantity FROM checkout_stock_reservations WHERE recoveryToken = ? FOR UPDATE', [recoveryToken]);
+                if (reservations && reservations.length > 0) {
+                    for (const resItem of reservations) {
+                        const qty = Number(resItem.quantity) || 0;
+                        if (qty <= 0)
+                            continue;
+                        yield conn.query('UPDATE products SET stock = stock + ? WHERE id = ?', [qty, resItem.productId]);
+                        yield conn.query(`INSERT INTO product_stocks (id, productId, warehouseId, stock) 
+                             VALUES (UUID(), ?, ?, ?) 
+                             ON DUPLICATE KEY UPDATE stock = stock + ?`, [resItem.productId, resItem.warehouseId, qty, qty]);
+                        if (resItem.variantId) {
+                            yield conn.query('UPDATE product_variants SET stock = stock + ? WHERE id = ?', [qty, resItem.variantId]);
+                            yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock) 
+                                 VALUES (UUID(), ?, ?, ?, ?) 
+                                 ON DUPLICATE KEY UPDATE stock = stock + ?`, [resItem.variantId, resItem.productId, resItem.warehouseId, qty, qty]);
+                        }
+                    }
+                    yield conn.query('DELETE FROM checkout_stock_reservations WHERE recoveryToken = ?', [recoveryToken]);
+                    console.log(`[Invoice] Released reservations for token ${recoveryToken} before standard deduction.`);
+                }
+            }
+            catch (resErr) {
+                console.error(`[Invoice] Failed to release reservation for token ${recoveryToken}:`, resErr.message);
+                throw new Error(`Failed to release reservation for token ${recoveryToken}: ${resErr.message}`);
+            }
+        }
         // === FISCAL YEAR GUARD: Block if date is in closed year or locked period ===
         const fyCheck = yield (0, fiscalYearUtils_1.validateFiscalYearOpen)(req.body.date);
         if (!fyCheck.allowed) {
@@ -1255,7 +1320,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // Guard 2: Discount per line must not exceed its own line total
         if (lines && lines.length > 0) {
             for (const line of lines) {
-                const lineTotal = (Number(line.quantity) || 0) * (Number(line.price) || 0);
+                const lineTotal = Math.abs((Number(line.quantity) || 0) * (Number(line.price) || 0));
                 const lineDiscount = Number(line.discount) || 0;
                 if (lineDiscount > lineTotal + 0.001) {
                     conn.release();
@@ -1391,7 +1456,8 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // === POLICY ENFORCEMENT: Full server-side validation ===
         const authReqPolicy = req;
         if (authReqPolicy.systemConfig) {
-            const currentUser = ((_b = authReqPolicy.user) === null || _b === void 0 ? void 0 : _b.name) || ((_c = authReqPolicy.user) === null || _c === void 0 ? void 0 : _c.username) || req.body.createdBy || null;
+            const u = authReqPolicy.user;
+            const currentUser = u ? `${u.username || ''}|${u.name || ''}` : (((_b = authReqPolicy.user) === null || _b === void 0 ? void 0 : _b.name) || ((_c = authReqPolicy.user) === null || _c === void 0 ? void 0 : _c.username) || req.body.createdBy || null);
             const policyContext = {
                 type,
                 date,
@@ -1483,11 +1549,56 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 console.warn(`⚠️ [createInvoice] Could not resolve partnerName for partnerId ${sanitizedPartnerId}:`, pErr);
             }
         }
+        // B2B Wholesale Portal Support: Enforce customer credit limit for on-account purchases
+        if (type === 'INVOICE_SALE' && (paymentMethod === 'DEFERRED' || paymentMethod === 'CREDIT') && sanitizedPartnerId) {
+            try {
+                const [partnerRows] = yield conn.query(`SELECT creditLimit, creditLimitEnabled FROM partners WHERE id = ? LIMIT 1`, [sanitizedPartnerId]);
+                if (partnerRows && partnerRows.length > 0) {
+                    const partnerRecord = partnerRows[0];
+                    if (partnerRecord.creditLimitEnabled && Number(partnerRecord.creditLimit) > 0) {
+                        // Recalculate real-time customer balance (NET outstanding)
+                        const [balanceResult] = yield conn.query(`
+                            SELECT 
+                                (
+                                    COALESCE(p.openingBalance, 0) +
+                                    COALESCE((
+                                        SELECT SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN i.total ELSE 0 END) -
+                                               SUM(CASE WHEN i.type = 'RETURN_SALE' THEN i.total ELSE 0 END)
+                                        FROM invoices i
+                                        WHERE i.partnerId = p.id AND i.status != 'VOID' AND i.paymentMethod != 'CASH'
+                                    ), 0) -
+                                    COALESCE((
+                                        SELECT SUM(amount)
+                                        FROM transactions t
+                                        WHERE t.partnerId = p.id AND t.type IN ('RECEIPT', 'PAYMENT')
+                                    ), 0)
+                                ) as calculatedBalance
+                            FROM partners p
+                            WHERE p.id = ?
+                        `, [sanitizedPartnerId]);
+                        const currentBalance = Number(((_g = balanceResult[0]) === null || _g === void 0 ? void 0 : _g.calculatedBalance) || 0);
+                        if (currentBalance + Number(total) > Number(partnerRecord.creditLimit)) {
+                            yield conn.rollback();
+                            conn.release();
+                            return res.status(400).json({
+                                code: 'CREDIT_LIMIT_EXCEEDED',
+                                message: `تجاوز حد الائتمان المسموح به للعميل! الحد الأقصى: ${partnerRecord.creditLimit}، الرصيد الحالي: ${currentBalance}، القيمة المطلوبة: ${total}`,
+                                creditLimit: partnerRecord.creditLimit,
+                                currentBalance
+                            });
+                        }
+                    }
+                }
+            }
+            catch (creditErr) {
+                console.warn(`⚠️ [createInvoice] Credit limit verification failed:`, creditErr.message);
+            }
+        }
         // Check if user has an open POS shift and link this cash transaction to it
         let posShiftId = req.body.posShiftId || null;
         if (!posShiftId && paymentMethod === 'CASH') {
             try {
-                const userId = ((_g = req.user) === null || _g === void 0 ? void 0 : _g.id) || '';
+                const userId = ((_h = req.user) === null || _h === void 0 ? void 0 : _h.id) || '';
                 const [openShifts] = yield conn.query("SELECT id FROM pos_shifts WHERE userId = ? AND status = 'OPEN' LIMIT 1", [userId]);
                 if (openShifts.length > 0) {
                     posShiftId = openShifts[0].id;
@@ -1512,7 +1623,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         while (insertAttempts < MAX_INSERT_ATTEMPTS) {
             try {
                 yield conn.query(`INSERT INTO invoices (id, number, date, type, partnerId, partnerName, total, status, paymentMethod, posted, notes, dueDate, taxAmount, whtAmount, shippingFee, globalDiscount, globalDiscountType, globalDiscountValue, warehouseId, bankAccountId, bankName, paymentBreakdown, bankTransfers, salesmanId, priceListId, createdBy, paidAmount, currencyCode, exchangeRate, foreignTotal, bankTransferReference, referenceInvoiceId, voucherCategory, branchId, paymentSources, posShiftId) 
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                     id, invoiceNumber, date, type, sanitizedPartnerId, resolvedPartnerName, total, status, paymentMethod, posted,
                     notes || (voucherCategory ? `${voucherCategory}|${partnerId || ''}` : null), sanitizedDueDate, taxAmount, whtAmount, shippingFee, globalDiscount,
                     req.body.globalDiscountType || 'FIXED', req.body.globalDiscountValue || 0, sanitizedWarehouseId,
@@ -1530,10 +1641,10 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 break; // Success — exit retry loop
             }
             catch (insertErr) {
-                if (insertErr.code === 'ER_DUP_ENTRY' && ((_h = insertErr.message) === null || _h === void 0 ? void 0 : _h.includes('number'))) {
+                if (insertErr.code === 'ER_DUP_ENTRY' && ((_j = insertErr.message) === null || _j === void 0 ? void 0 : _j.includes('number'))) {
                     insertAttempts++;
                     // Auto-increment the number and retry
-                    const prefix = ((_j = invoiceNumber.match(/^[A-Z]+-(?:[A-Z]+-)?/)) === null || _j === void 0 ? void 0 : _j[0]) || 'TRX-';
+                    const prefix = ((_k = invoiceNumber.match(/^[A-Z]+-(?:[A-Z]+-)?/)) === null || _k === void 0 ? void 0 : _k[0]) || 'TRX-';
                     const currentNum = parseInt(invoiceNumber.substring(prefix.length), 10) || 0;
                     invoiceNumber = `${prefix}${String(currentNum + 1).padStart(5, '0')}`;
                     // SERIAL FIX: For PAY/REC, id must track number
@@ -1546,7 +1657,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         invoiceNumber = `${invoiceNumber}-${Date.now().toString(36)}`;
                         console.error(`❌ [createInvoice] Max retry attempts reached, using timestamped fallback: ${invoiceNumber}`);
                         yield conn.query(`INSERT INTO invoices (id, number, date, type, partnerId, partnerName, total, status, paymentMethod, posted, notes, dueDate, taxAmount, whtAmount, shippingFee, globalDiscount, globalDiscountType, globalDiscountValue, warehouseId, bankAccountId, bankName, paymentBreakdown, bankTransfers, salesmanId, priceListId, createdBy, paidAmount, currencyCode, exchangeRate, foreignTotal, bankTransferReference, referenceInvoiceId, voucherCategory, branchId, paymentSources, posShiftId) 
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                             id, invoiceNumber, date, type, sanitizedPartnerId, resolvedPartnerName, total, status, paymentMethod, posted,
                             notes || (voucherCategory ? `${voucherCategory}|${partnerId || ''}` : null), sanitizedDueDate, taxAmount, whtAmount, shippingFee, globalDiscount,
                             req.body.globalDiscountType || 'FIXED', req.body.globalDiscountValue || 0, sanitizedWarehouseId,
@@ -1615,7 +1726,6 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             (0, logger_1.logDebug)('[createInvoice] Saving', lines.length, 'lines');
             // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             // PRE-FETCH PRODUCT METADATA (trackInventory, stock, cost) FOR UPDATE
-            // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             const productIds = lines.map((l) => l.productId).filter(Boolean);
             const productsMeta = {};
             const productsCache = new Map();
@@ -1629,19 +1739,12 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     });
                 }
                 for (const line of lines) {
-                    line.trackInventory = (_k = productsMeta[line.productId]) !== null && _k !== void 0 ? _k : true;
+                    line.trackInventory = (_l = productsMeta[line.productId]) !== null && _l !== void 0 ? _l : true;
                 }
             }
-            // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-            // PERF: BATCH INSERT all invoice_lines in a single query
-            // Instead of N sequential INSERTs (one per line), we build
-            // a single INSERT ... VALUES (row1), (row2), ... (rowN)
-            // This reduces DB round-trips from N to 1
-            // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
             const batchLineValues = [];
             const lineDataForSerials = [];
             for (const line of lines) {
-                // Ensure strict 5-decimal precision, with safety check
                 const rawQty = Number(line.quantity);
                 const rawPrice = Number(line.price);
                 const rawCost = Number(line.cost);
@@ -1656,7 +1759,6 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 const bonusQty = Number(line.bonusQty) || 0;
                 const gradeValue = line.grade || null;
                 const returnConditionValue = (type === 'RETURN_SALE' || type === 'RETURN_PURCHASE') ? (line.returnCondition || 'GOOD') : null;
-                // Multi-Unit Support: save unit info with the line
                 const lineUnitId = line.unitId || null;
                 const lineUnitName = line.unitName || null;
                 const lineConversionFactor = Number(line.conversionFactor) || 1;
@@ -1687,7 +1789,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             }
             catch (ilErr) {
                 // Fallback: try without unit columns if they don't exist yet
-                (0, logger_1.logDebug)('âš ï¸ Batch invoice_lines insert failed, trying fallback:', ilErr.message);
+                (0, logger_1.logDebug)('⚠️ Batch invoice_lines insert failed, trying fallback:', ilErr.message);
                 try {
                     const fallbackValues = batchLineValues.map(row => [
                         row[0], row[1], row[2], row[3], row[4], row[5],
@@ -1698,7 +1800,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                          VALUES ?`, [fallbackValues]);
                 }
                 catch (ilErr2) {
-                    (0, logger_1.logDebug)('âš ï¸ Fallback batch insert failed, trying basic:', ilErr2.message);
+                    (0, logger_1.logDebug)('⚠️ Fallback batch insert failed, trying basic:', ilErr2.message);
                     const basicValues = batchLineValues.map(row => [
                         row[0], row[1], row[2], row[3], row[4], row[5],
                         row[6], row[7], row[17] // priceListId
@@ -1720,67 +1822,69 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             // Serials need individual queries because each has conditional logic
             // (warranty lookup, status updates, transaction records)
             // Most invoices have 0 serials, so this rarely runs
-            for (const { line, safeSerials } of lineDataForSerials) {
-                for (const serial of safeSerials) {
-                    const cleanSerial = String(serial).trim();
-                    if (!cleanSerial)
-                        continue;
-                    try {
-                        if (type === 'INVOICE_PURCHASE') {
-                            // Fetch warranty info from cache
-                            const wMonths = warrantyMonthsCache.get(line.productId) || 0;
-                            let wStart = null;
-                            let wEnd = null;
-                            if (wMonths > 0) {
-                                const startDate = new Date(date); // Use invoice date
-                                const endDate = new Date(startDate);
-                                endDate.setMonth(endDate.getMonth() + wMonths);
-                                wStart = startDate.toISOString().split('T')[0];
-                                wEnd = endDate.toISOString().split('T')[0];
+            if (status !== 'DRAFT' && status !== 'VOID') {
+                for (const { line, safeSerials } of lineDataForSerials) {
+                    for (const serial of safeSerials) {
+                        const cleanSerial = String(serial).trim();
+                        if (!cleanSerial)
+                            continue;
+                        try {
+                            if (type === 'INVOICE_PURCHASE') {
+                                // Fetch warranty info from cache
+                                const wMonths = warrantyMonthsCache.get(line.productId) || 0;
+                                let wStart = null;
+                                let wEnd = null;
+                                if (wMonths > 0) {
+                                    const startDate = new Date(date); // Use invoice date
+                                    const endDate = new Date(startDate);
+                                    endDate.setMonth(endDate.getMonth() + wMonths);
+                                    wStart = startDate.toISOString().split('T')[0];
+                                    wEnd = endDate.toISOString().split('T')[0];
+                                }
+                                // Register new serial
+                                yield conn.query(`
+                                    INSERT INTO product_serials (id, productId, serialNumber, warehouseId, status, purchaseInvoiceId, warrantyStartDate, warrantyEndDate)
+                                    VALUES (UUID(), ?, ?, ?, 'AVAILABLE', ?, ?, ?)
+                                `, [line.productId, cleanSerial, line.warehouseId || req.body.warehouseId, id, wStart, wEnd]);
+                                yield conn.query(`
+                                    INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
+                                    SELECT UUID(), id, 'IN', ?, ?, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
+                                `, [id, line.warehouseId || req.body.warehouseId, date, createdBy, cleanSerial, line.productId]);
                             }
-                            // Register new serial
-                            yield conn.query(`
-                                INSERT INTO product_serials (id, productId, serialNumber, warehouseId, status, purchaseInvoiceId, warrantyStartDate, warrantyEndDate)
-                                VALUES (UUID(), ?, ?, ?, 'AVAILABLE', ?, ?, ?)
-                            `, [line.productId, cleanSerial, line.warehouseId || req.body.warehouseId, id, wStart, wEnd]);
-                            yield conn.query(`
-                                INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
-                                SELECT UUID(), id, 'IN', ?, ?, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
-                            `, [id, line.warehouseId || req.body.warehouseId, date, createdBy, cleanSerial, line.productId]);
+                            else if (type === 'INVOICE_SALE') {
+                                yield conn.query(`
+                                    UPDATE product_serials SET status = 'SOLD', salesInvoiceId = ?
+                                    WHERE productId = ? AND serialNumber = ?
+                                `, [id, line.productId, cleanSerial]);
+                                yield conn.query(`
+                                    INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
+                                    SELECT UUID(), id, 'OUT', ?, warehouseId, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
+                                `, [id, date, createdBy, cleanSerial, line.productId]);
+                            }
+                            else if (type === 'RETURN_SALE') {
+                                yield conn.query(`
+                                    UPDATE product_serials SET status = 'AVAILABLE', salesInvoiceId = NULL
+                                    WHERE productId = ? AND serialNumber = ?
+                                `, [line.productId, cleanSerial]);
+                                yield conn.query(`
+                                    INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
+                                    SELECT UUID(), id, 'RETURN', ?, warehouseId, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
+                                `, [id, date, createdBy, cleanSerial, line.productId]);
+                            }
+                            else if (type === 'RETURN_PURCHASE') {
+                                yield conn.query(`
+                                    UPDATE product_serials SET status = 'RETURNED_TO_VENDOR'
+                                    WHERE productId = ? AND serialNumber = ?
+                                `, [line.productId, cleanSerial]);
+                                yield conn.query(`
+                                    INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
+                                    SELECT UUID(), id, 'OUT', ?, warehouseId, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
+                                `, [id, date, createdBy, cleanSerial, line.productId]);
+                            }
                         }
-                        else if (type === 'INVOICE_SALE') {
-                            yield conn.query(`
-                                UPDATE product_serials SET status = 'SOLD', salesInvoiceId = ?
-                                WHERE productId = ? AND serialNumber = ?
-                            `, [id, line.productId, cleanSerial]);
-                            yield conn.query(`
-                                INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
-                                SELECT UUID(), id, 'OUT', ?, warehouseId, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
-                            `, [id, date, createdBy, cleanSerial, line.productId]);
+                        catch (err) {
+                            console.error(`❌ Error processing serial ${cleanSerial} for product ${line.productName}:`, err);
                         }
-                        else if (type === 'RETURN_SALE') {
-                            yield conn.query(`
-                                UPDATE product_serials SET status = 'AVAILABLE', salesInvoiceId = NULL
-                                WHERE productId = ? AND serialNumber = ?
-                            `, [line.productId, cleanSerial]);
-                            yield conn.query(`
-                                INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
-                                SELECT UUID(), id, 'RETURN', ?, warehouseId, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
-                            `, [id, date, createdBy, cleanSerial, line.productId]);
-                        }
-                        else if (type === 'RETURN_PURCHASE') {
-                            yield conn.query(`
-                                UPDATE product_serials SET status = 'RETURNED_TO_VENDOR'
-                                WHERE productId = ? AND serialNumber = ?
-                            `, [line.productId, cleanSerial]);
-                            yield conn.query(`
-                                INSERT INTO serial_transactions (id, serialId, transactionType, referenceId, warehouseId, date, userId)
-                                SELECT UUID(), id, 'OUT', ?, warehouseId, ?, ? FROM product_serials WHERE serialNumber = ? AND productId = ?
-                            `, [id, date, createdBy, cleanSerial, line.productId]);
-                        }
-                    }
-                    catch (err) {
-                        console.error(`âŒ Error processing serial ${cleanSerial} for product ${line.productName}:`, err);
                     }
                 }
             }
@@ -1809,7 +1913,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (configObj.inventoryValuationMethod) {
                         inventoryValuationMethod = configObj.inventoryValuationMethod;
                     }
-                    if (((_l = configObj.inventory) === null || _l === void 0 ? void 0 : _l.reserveOnSale) === true) {
+                    if (((_m = configObj.inventory) === null || _m === void 0 ? void 0 : _m.reserveOnSale) === true) {
                         reserveOnSale = true;
                     }
                 }
@@ -1818,8 +1922,8 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         }
         // === RESERVE-ON-SALE MODE ===
         // When enabled, INVOICE_SALE creates reservations instead of deducting stock
-        if (reserveOnSale && type === 'INVOICE_SALE' && !isVanSale && lines && lines.length > 0) {
-            (0, logger_1.logDebug)(`ðŸ“‹ Reserve-on-Sale mode: Creating reservations for invoice ${invoiceNumber}`);
+        if (reserveOnSale && type === 'INVOICE_SALE' && !isVanSale && lines && lines.length > 0 && status !== 'DRAFT' && status !== 'VOID') {
+            (0, logger_1.logDebug)(`ðŸ“‹ Reserve - on - Sale mode: Creating reservations for invoice ${invoiceNumber}`);
             for (const line of lines) {
                 // Multi-Unit: use baseQuantity (qty * conversionFactor) if available
                 const rawQty = Number(line.baseQuantity !== null && line.baseQuantity !== undefined ? line.baseQuantity : (Number(line.quantity) * (Number(line.conversionFactor) || 1)));
@@ -1830,27 +1934,27 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 if (totalQty > 0) {
                     // 1. Create stock_reservation record
                     yield conn.query(`
-                        INSERT INTO stock_reservations (id, invoiceId, invoiceNumber, productId, productName, warehouseId, quantity, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'RESERVED')
-                    `, [(0, crypto_1.randomUUID)(), id, invoiceNumber, line.productId, line.productName || '', warehouseIdToUse || null, totalQty]);
+                        INSERT INTO stock_reservations(id, invoiceId, invoiceNumber, productId, productName, warehouseId, quantity, status)
+            VALUES(?, ?, ?, ?, ?, ?, ?, 'RESERVED')
+                `, [(0, crypto_1.randomUUID)(), id, invoiceNumber, line.productId, line.productName || '', warehouseIdToUse || null, totalQty]);
                     // 2. Increment reserved_stock in product_stocks
                     if (warehouseIdToUse) {
                         yield conn.query(`
-                            INSERT INTO product_stocks (id, productId, warehouseId, stock, reserved_stock)
-                            VALUES (UUID(), ?, ?, 0, ?)
+                            INSERT INTO product_stocks(id, productId, warehouseId, stock, reserved_stock)
+            VALUES(UUID(), ?, ?, 0, ?)
                             ON DUPLICATE KEY UPDATE reserved_stock = ROUND(reserved_stock + ?, 5)
-                        `, [line.productId, warehouseIdToUse, totalQty, totalQty]);
+                `, [line.productId, warehouseIdToUse, totalQty, totalQty]);
                     }
-                    (0, logger_1.logDebug)(`  ðŸ“¦ Reserved: ${line.productName} x${totalQty} in warehouse ${warehouseIdToUse || 'N/A'}`);
+                    (0, logger_1.logDebug)(`  ðŸ“¦ Reserved: ${line.productName} x${totalQty} in warehouse ${warehouseIdToUse || 'N/A'} `);
                 }
             }
             // Note: NO stock deduction, NO stock_movements for reserved sales
         }
         // === NORMAL STOCK DEDUCTION MODE ===
-        else if (stockChangeTypes[type] !== undefined && lines && lines.length > 0) {
+        else if (stockChangeTypes[type] !== undefined && lines && lines.length > 0 && status !== 'DRAFT' && status !== 'VOID') {
             // Skip stock update for Van Sales (already handled by vehicleController)
             if (type === 'INVOICE_SALE' && isVanSale) {
-                (0, logger_1.logDebug)(`â­ï¸ Skipping stock update for Van Sale invoice ${invoiceNumber}`);
+                (0, logger_1.logDebug)(`â­ï¸ Skipping stock update for Van Sale invoice ${invoiceNumber} `);
             }
             else {
                 // â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
@@ -1877,7 +1981,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         });
                     }
                     for (const line of lines) {
-                        line.trackInventory = (_m = productsMeta[line.productId]) !== null && _m !== void 0 ? _m : true;
+                        line.trackInventory = (_o = productsMeta[line.productId]) !== null && _o !== void 0 ? _o : true;
                     }
                 }
                 // PERF: Pre-compute invoiceSubtotal once (was recalculated per line in loop)
@@ -1908,12 +2012,12 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (!line.variantId && line.productId) {
                         try {
                             const [variantCheck] = yield conn.query(`SELECT COUNT(*) as cnt FROM product_variants WHERE productId = ? LIMIT 1`, [line.productId]);
-                            if (((_o = variantCheck[0]) === null || _o === void 0 ? void 0 : _o.cnt) > 0) {
-                                console.warn(`âš ï¸ [Invoice] Blocked parent product "${line.productName}" (${line.productId}) â€” has variants but no variantId specified`);
+                            if (((_p = variantCheck[0]) === null || _p === void 0 ? void 0 : _p.cnt) > 0) {
+                                console.warn(`âš ï¸[Invoice] Blocked parent product "${line.productName}"(${line.productId}) â€” has variants but no variantId specified`);
                                 continue; // Skip this line â€” don't create movement against parent
                             }
                         }
-                        catch ( /* product_variants table may not exist â€” skip check */_p) { /* product_variants table may not exist â€” skip check */ }
+                        catch ( /* product_variants table may not exist â€” skip check */_q) { /* product_variants table may not exist â€” skip check */ }
                     }
                     // === DAMAGED RETURN HANDLING (الهالك) ===
                     const isReturn = type === 'RETURN_SALE' || type === 'RETURN_PURCHASE';
@@ -1931,12 +2035,14 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         // Calculate and update cost
                         let newCost = oldCost;
                         const rawPrice = Number(line.price) || 0;
+                        const uomQty = Number(line.quantity) || 0;
                         const lineDiscount = Number(line.discount) || 0;
-                        const lineGross = rawPrice * qty;
+                        const lineGross = rawPrice * uomQty;
                         const lineShareOfGlobalDiscount = invoiceSubtotal > 0 ? (lineGross / invoiceSubtotal) * invoiceGlobalDiscount : 0;
                         const netLineTotal = lineGross - lineDiscount - lineShareOfGlobalDiscount;
-                        const unitPurchasePrice = qty > 0 ? Math.max(0, netLineTotal / qty) : rawPrice;
-                        (0, logger_1.logDebug)(`ðŸ’° Net cost: ${rawPrice} Ã— ${qty} = ${lineGross}, disc=${lineDiscount}, global=${lineShareOfGlobalDiscount.toFixed(2)}, unit=${unitPurchasePrice.toFixed(2)}`);
+                        const baseQty = qty > 0 ? qty : 1;
+                        const unitPurchasePrice = Math.max(0, netLineTotal / baseQty);
+                        (0, logger_1.logDebug)(`💰 Net cost: ${rawPrice} × ${uomQty} = ${lineGross}, disc = ${lineDiscount}, global = ${lineShareOfGlobalDiscount.toFixed(2)}, unit = ${unitPurchasePrice.toFixed(2)} `);
                         if (inventoryValuationMethod === 'LAST_PURCHASE') {
                             newCost = unitPurchasePrice;
                         }
@@ -1966,7 +2072,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         bulkWarehouseStockUpdates.push({ productId: line.productId, warehouseId: warehouseIdToUse, qtyChange });
                     }
                     // Collect stock movement for batch INSERT
-                    let movementNotes = `Invoice #${invoiceNumber} - ${partnerName}`;
+                    let movementNotes = `Invoice #${invoiceNumber} - ${partnerName} `;
                     if (isReturn && line.returnCondition) {
                         const conditionLabel = line.returnCondition === 'DAMAGED' ? 'هالك' : 'سليم';
                         movementNotes += ` (${conditionLabel})`;
@@ -2015,29 +2121,29 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (nonPurchaseWarehouseUpdates.length > 0) {
                         for (const u of nonPurchaseWarehouseUpdates) {
                             yield conn.query(`
-                                INSERT INTO product_stocks (id, productId, warehouseId, stock)
-                                VALUES (UUID(), ?, ?, ?)
+                                INSERT INTO product_stocks(id, productId, warehouseId, stock)
+            VALUES(UUID(), ?, ?, ?)
                                 ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)
-                            `, [u.productId, u.warehouseId, u.qtyChange, u.qtyChange]);
+                `, [u.productId, u.warehouseId, u.qtyChange, u.qtyChange]);
                         }
                     }
                     if (purchaseWarehouseUpdates.length > 0) {
                         for (const u of purchaseWarehouseUpdates) {
                             yield conn.query(`
-                                INSERT INTO product_stocks (id, productId, warehouseId, stock)
-                                VALUES (UUID(), ?, ?, ?)
+                                INSERT INTO product_stocks(id, productId, warehouseId, stock)
+            VALUES(UUID(), ?, ?, ?)
                                 ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)
-                            `, [u.productId, u.warehouseId, u.qtyChange, u.qtyChange]);
+                `, [u.productId, u.warehouseId, u.qtyChange, u.qtyChange]);
                         }
                     }
                 }
                 // PERF: Batch INSERT all stock_movements in one query
                 if (batchStockMovements.length > 0) {
                     yield conn.query(`
-                        INSERT INTO stock_movements (
-                            product_id, warehouse_id, qty_change, movement_type, 
-                            reference_type, reference_id, notes, movement_date, variant_id
-                        ) VALUES ?
+                        INSERT INTO stock_movements(
+                    product_id, warehouse_id, qty_change, movement_type,
+                    reference_type, reference_id, notes, movement_date, variant_id
+                ) VALUES ?
                     `, [batchStockMovements]);
                 }
                 // === VARIANT STOCK UPDATES ===
@@ -2072,20 +2178,20 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         vParams.push(variantId, change);
                         variantIds.push(variantId);
                     }
-                    yield conn.query(`UPDATE product_variants SET stock = CASE ${vCases.join(' ')} ELSE stock END WHERE id IN (?)`, [...vParams, variantIds]).catch((e) => (0, logger_1.logDebug)(`⚠️ Variant stock update note: ${e.message}`));
+                    yield conn.query(`UPDATE product_variants SET stock = CASE ${vCases.join(' ')} ELSE stock END WHERE id IN(?)`, [...vParams, variantIds]).catch((e) => (0, logger_1.logDebug)(`⚠️ Variant stock update note: ${e.message} `));
                 }
                 // Update per-warehouse product_variant_stocks
                 for (const u of variantWarehouseUpdates) {
-                    yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
-                         VALUES (UUID(), ?, ?, ?, ?)
-                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [u.variantId, u.productId, u.warehouseId, u.qtyChange, u.qtyChange]).catch((e) => (0, logger_1.logDebug)(`⚠️ Variant warehouse stock note: ${e.message}`));
+                    yield conn.query(`INSERT INTO product_variant_stocks(id, variantId, productId, warehouseId, stock)
+            VALUES(UUID(), ?, ?, ?, ?)
+                         ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [u.variantId, u.productId, u.warehouseId, u.qtyChange, u.qtyChange]).catch((e) => (0, logger_1.logDebug)(`⚠️ Variant warehouse stock note: ${e.message} `));
                 }
             }
         }
         // === AUTO-POST REVENUE/COGS JOURNAL ENTRY ===
         const mainPaymentMethodForReceipt = req.body.paymentMethod || 'CASH';
         const isCashInvoice = mainPaymentMethodForReceipt === 'CASH';
-        yield (0, exports.syncRevenueCogsJournal)(conn, id, invoiceNumber, type, date, partnerName, total, lines, createdBy, !!reserveOnSale, isCashInvoice, Number(globalDiscount) || 0, (0, branchFilter_1.resolveBranchIdForWrite)(req));
+        yield (0, exports.syncRevenueCogsJournal)(conn, id, invoiceNumber, type, date, partnerName, total, lines, createdBy, !!reserveOnSale, isCashInvoice, Number(globalDiscount) || 0, (0, branchFilter_1.resolveBranchIdForWrite)(req), status);
         const user = req.body.user || 'System';
         yield (0, paymentGeneration_1.generateInvoicePayments)(conn, {
             invoiceId: id,
@@ -2111,7 +2217,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             paymentMethod: req.body.paymentMethod,
             paymentBreakdown: req.body.paymentBreakdown
         });
-        yield (0, auditController_1.logAction)(createdBy || 'System', 'INVOICE', 'CREATE', `Created ${type} Invoice #${invoiceNumber}`, `Partner: ${partnerName}, Amount: ${total}, Payment: ${paymentMethod}`);
+        yield (0, auditController_1.logAction)(createdBy || 'System', 'INVOICE', 'CREATE', `Created ${type} Invoice #${invoiceNumber} `, `Partner: ${partnerName}, Amount: ${total}, Payment: ${paymentMethod} `);
         // =====================================================
         // === STANDALONE RECEIPT/PAYMENT JOURNAL ENTRIES ===
         // =====================================================
@@ -2121,12 +2227,12 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             const pmBankAccountId = req.body.bankAccountId || null;
             const cCode = req.body.currencyCode || 'USD';
             const exRate = Number(req.body.exchangeRate) || 1;
-            console.log(`💰 Creating standalone ${type} #${invoiceNumber} GL entries. Amount: ${standaloneTotal}`);
+            console.log(`💰 Creating standalone ${type} #${invoiceNumber} GL entries.Amount: ${standaloneTotal} `);
             const absTotal = Math.abs(standaloneTotal);
             const isReversed = standaloneTotal < 0;
             const effectiveIsReceipt = isReversed ? (type !== 'RECEIPT') : (type === 'RECEIPT');
-            yield conn.query(`INSERT INTO account_transactions (id, date, type, partnerId, partnerName, debit, credit, description, invoiceId, createdBy) 
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), date, type, partnerId, partnerName, effectiveIsReceipt ? 0 : absTotal, effectiveIsReceipt ? absTotal : 0, `${type === 'RECEIPT' ? 'مقبوض' : 'دفع'} (مستقل) ${invoiceNumber}`, id, createdBy]);
+            yield conn.query(`INSERT INTO account_transactions(id, date, type, partnerId, partnerName, debit, credit, description, invoiceId, createdBy)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), date, type, partnerId, partnerName, effectiveIsReceipt ? 0 : absTotal, effectiveIsReceipt ? absTotal : 0, `${type === 'RECEIPT' ? 'مقبوض' : 'دفع'} (مستقل) ${invoiceNumber} `, id, createdBy]);
             if (absTotal > 0) {
                 const journalId = (0, crypto_1.randomUUID)();
                 const methodLabel = pmMethod === 'CASH' ? 'نقدي' : pmMethod === 'BANK' ? 'تحويل بنكي' : 'شيك';
@@ -2135,13 +2241,13 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 const journalMethodLabel = isMultiSource ? 'متعدد المصادر' : methodLabel;
                 const reversedLabel = isReversed ? ' (عكسي)' : '';
                 yield (0, paymentGeneration_1.createPaymentJournal)({
-                    conn, journalId, date, description: `${type === 'RECEIPT' ? 'سند قبض' : 'سند صرف'} #${invoiceNumber} - ${partnerName} (${journalMethodLabel})${reversedLabel}`,
+                    conn, journalId, date, description: `${type === 'RECEIPT' ? 'سند قبض' : 'سند صرف'} #${invoiceNumber} - ${partnerName} (${journalMethodLabel})${reversedLabel} `,
                     referenceId: id, createdBy, amount: absTotal, paymentType: effectiveIsReceipt ? 'RECEIPT' : 'PAYMENT',
                     paymentMethod: pmMethod || 'CASH', bankAccountId: pmBankAccountId, currencyCode: cCode, exchangeRate: exRate,
                     denominations: req.body.denominations, branchId: resolvedBranchId, req, partnerId, explicitAccountId: req.body.accountId || null
                 });
                 if (isReversed) {
-                    console.log(`🔄 Reversed ${type} #${invoiceNumber}: negative amount ${standaloneTotal} → journal uses abs(${absTotal}) with flipped debit/credit`);
+                    console.log(`🔄 Reversed ${type} #${invoiceNumber}: negative amount ${standaloneTotal} → journal uses abs(${absTotal}) with flipped debit / credit`);
                 }
             }
         }
@@ -2163,7 +2269,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             // Using referenceId (= invoice ID) is deterministic and race-condition-proof.
             const [journalAccountRows] = yield conn.query(`SELECT DISTINCT jl.accountId FROM journal_lines jl
                  JOIN journal_entries je ON jl.journalId = je.id
-                 WHERE je.referenceId = ? OR je.referenceId = ?`, [id, invoiceNumber]);
+                 WHERE je.referenceId = ? OR je.referenceId = ? `, [id, invoiceNumber]);
             for (const row of journalAccountRows) {
                 if (row.accountId)
                     affectedAccountIds.push(row.accountId);
@@ -2172,7 +2278,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (affectedAccountIds.length > 0) {
             const balanceResult = yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, affectedAccountIds);
             if (balanceResult.updatedCount > 0) {
-                console.log(`âœ… [createInvoice] Auto-updated ${balanceResult.updatedCount} account balances`);
+                console.log(`âœ…[createInvoice] Auto - updated ${balanceResult.updatedCount} account balances`);
             }
         }
         // === UPDATE EMPLOYEE ADVANCES TABLE FOR VOUCHER CATEGORIES ===
@@ -2181,9 +2287,9 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (voucherCategory === 'employee_advance' && type === 'PAYMENT' && originalPartnerId && total > 0) {
             try {
                 const advanceId = (0, crypto_1.randomUUID)();
-                yield conn.query(`INSERT INTO employee_advances (id, employeeId, type, amount, reason, issueDate, monthlyDeduction, totalPaid, remainingAmount, status)
-                     VALUES (?, ?, 'ADVANCE', ?, ?, ?, 0, 0, ?, 'ACTIVE')`, [advanceId, originalPartnerId, total, notes || `سلفة من سند صرف #${invoiceNumber}`, date, total]);
-                console.log(`ðŸ’° [HR] Created employee advance: ${advanceId} for employee ${originalPartnerId}, amount: ${total}`);
+                yield conn.query(`INSERT INTO employee_advances(id, employeeId, type, amount, reason, issueDate, monthlyDeduction, totalPaid, remainingAmount, status)
+            VALUES(?, ?, 'ADVANCE', ?, ?, ?, 0, 0, ?, 'ACTIVE')`, [advanceId, originalPartnerId, total, notes || `سلفة من سند صرف #${invoiceNumber} `, date, total]);
+                console.log(`ðŸ’°[HR] Created employee advance: ${advanceId} for employee ${originalPartnerId}, amount: ${total} `);
             }
             catch (advErr) {
                 console.error('âš ï¸ Error creating employee advance from voucher:', advErr.message);
@@ -2202,12 +2308,12 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     const canApply = Math.min(remaining, Number(adv.remainingAmount));
                     const newTotalPaid = Number(adv.totalPaid) + canApply;
                     const newRemaining = Number(adv.remainingAmount) - canApply;
-                    yield conn.query(`UPDATE employee_advances SET totalPaid = ?, remainingAmount = ?, status = ? WHERE id = ?`, [newTotalPaid, newRemaining, newRemaining <= 0 ? 'COMPLETED' : 'ACTIVE', adv.id]);
-                    console.log(`ðŸ’° [HR] Advance ${adv.id}: repaid ${canApply}, remaining: ${newRemaining}`);
+                    yield conn.query(`UPDATE employee_advances SET totalPaid = ?, remainingAmount = ?, status = ? WHERE id = ? `, [newTotalPaid, newRemaining, newRemaining <= 0 ? 'COMPLETED' : 'ACTIVE', adv.id]);
+                    console.log(`ðŸ’°[HR] Advance ${adv.id}: repaid ${canApply}, remaining: ${newRemaining} `);
                     remaining -= canApply;
                 }
                 if (remaining > 0) {
-                    console.warn(`âš ï¸ [HR] Employee ${originalPartnerId} repaid ${total} but only ${total - remaining} could be allocated to active advances`);
+                    console.warn(`âš ï¸[HR] Employee ${originalPartnerId} repaid ${total} but only ${total - remaining} could be allocated to active advances`);
                 }
             }
             catch (repayErr) {
@@ -2231,7 +2337,7 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         // Standalone RECEIPT / PAYMENT allocations
         if (['RECEIPT', 'PAYMENT'].includes(type) && status !== 'VOID' && status !== 'DRAFT' && (referenceInvoiceId || req.body.sourceInvoiceId)) {
             const targetInvoiceId = referenceInvoiceId || req.body.sourceInvoiceId;
-            yield conn.query(`INSERT INTO payment_allocations (id, paymentId, invoiceId, amount) VALUES (?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), id, targetInvoiceId, total]);
+            yield conn.query(`INSERT INTO payment_allocations(id, paymentId, invoiceId, amount) VALUES(?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), id, targetInvoiceId, total]);
         }
         // Check memberships
         yield (0, memberships_1.checkAndActivateMembership)(id, conn);
@@ -2257,15 +2363,15 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             else if (type === 'RETURN_PURCHASE' || type === 'PURCHASE_RETURN') {
                 movementType = 'DEPOSIT';
             }
-            yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
-                 VALUES (?, ?, ?, ?, ?, ?, 'INVOICE', ?, NOW())`, [
+            yield conn.query(`INSERT INTO pos_cash_movements(id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
+            VALUES(?, ?, ?, ?, ?, ?, 'INVOICE', ?, NOW())`, [
                 movementId,
                 posShiftId,
                 movementType,
                 total,
                 paymentMethod,
                 id,
-                `فاتورة ${invoiceNumber} - ${partnerName || ''}`
+                `فاتورة ${invoiceNumber} - ${partnerName || ''} `
             ]);
             // Recalculate shift totals
             try {
@@ -2277,6 +2383,17 @@ const createInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             }
         }
         yield conn.commit();
+        // Broadcast stock updates and trigger invoice email
+        try {
+            if (lines && lines.length > 0) {
+                const productIds = lines.map((l) => l.productId).filter(Boolean);
+                broadcastStockUpdates(productIds).catch(err => console.error('Failed to broadcast stock updates:', err));
+            }
+        }
+        catch (e) { }
+        if (req.body.recoveryToken || req.body.isStorefront) {
+            (0, mailService_1.sendInvoiceEmail)(id).catch(err => console.error('Failed to send invoice email copy:', err));
+        }
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: user });
         res.status(201).json(Object.assign(Object.assign({}, req.body), { id, number: invoiceNumber }));
@@ -2310,8 +2427,8 @@ const getCustomerLastProductPrice = (req, res) => __awaiter(void 0, void 0, void
         // Query to get the last price for this product sold to this customer
         // We look at INVOICE_SALE type only (when the customer bought from us)
         const [rows] = yield conn.query(`
-            SELECT 
-                il.price,
+            SELECT
+            il.price,
                 il.quantity,
                 il.discount,
                 il.total,
@@ -2321,12 +2438,12 @@ const getCustomerLastProductPrice = (req, res) => __awaiter(void 0, void 0, void
             FROM invoice_lines il
             INNER JOIN invoices i ON il.invoiceId = i.id
             WHERE i.partnerId = ?
-              AND il.productId = ?
-              AND i.type = 'INVOICE_SALE'
+                AND il.productId = ?
+                    AND i.type = 'INVOICE_SALE'
               AND i.status != 'VOID'
             ORDER BY i.date DESC, i.id DESC
             LIMIT 1
-        `, [partnerId, productId]);
+                `, [partnerId, productId]);
         conn.release();
         if (rows.length === 0) {
             return res.json({
@@ -2369,8 +2486,8 @@ const getCustomerLastProductPrices = (req, res) => __awaiter(void 0, void 0, voi
         const conn = yield (0, db_1.getConnection)();
         // For each productId, get the most recent sale price to this partner
         const [rows] = yield conn.query(`
-            SELECT 
-                il.productId,
+            SELECT
+            il.productId,
                 il.price,
                 il.quantity,
                 il.discount,
@@ -2380,21 +2497,21 @@ const getCustomerLastProductPrices = (req, res) => __awaiter(void 0, void 0, voi
                 i.date as invoiceDate
             FROM invoice_lines il
             INNER JOIN invoices i ON il.invoiceId = i.id
-            INNER JOIN (
-                SELECT il2.productId, MAX(CONCAT(i2.date, i2.id)) as maxKey
+            INNER JOIN(
+                    SELECT il2.productId, MAX(CONCAT(i2.date, i2.id)) as maxKey
                 FROM invoice_lines il2
                 INNER JOIN invoices i2 ON il2.invoiceId = i2.id
                 WHERE i2.partnerId = ?
-                  AND il2.productId IN (?)
+                    AND il2.productId IN(?)
                   AND i2.type = 'INVOICE_SALE'
                   AND i2.status != 'VOID'
                 GROUP BY il2.productId
-            ) latest ON il.productId = latest.productId
+                ) latest ON il.productId = latest.productId
             WHERE i.partnerId = ?
-              AND i.type = 'INVOICE_SALE'
+                AND i.type = 'INVOICE_SALE'
               AND i.status != 'VOID'
               AND CONCAT(i.date, i.id) = latest.maxKey
-        `, [partnerId, ids, partnerId]);
+                `, [partnerId, ids, partnerId]);
         conn.release();
         // Build a map: productId â†’ last price data
         const priceMap = {};
@@ -2456,7 +2573,7 @@ const getOutstandingInvoices = (req, res) => __awaiter(void 0, void 0, void 0, f
         const conditions = [
             'i.partnerId = ?',
             'i.type = ?',
-            `i.status NOT IN ('DRAFT', 'VOID')`,
+            `i.status NOT IN('DRAFT', 'VOID')`,
             `(i.total - COALESCE(pa_sum.allocatedAmount, 0)) > 0.01`
         ];
         const queryParams = [partnerId, invoiceType];
@@ -2473,7 +2590,7 @@ const getOutstandingInvoices = (req, res) => __awaiter(void 0, void 0, void 0, f
             }
             const userFilter = (0, dataFiltering_1.buildParameterizedFilter)(authReq.userFilterOptions);
             if (userFilter.clause) {
-                conditions.push(`i.${userFilter.clause}`);
+                conditions.push(`i.${userFilter.clause} `);
                 queryParams.push(...userFilter.params);
             }
         }
@@ -2483,19 +2600,19 @@ const getOutstandingInvoices = (req, res) => __awaiter(void 0, void 0, void 0, f
         // Outstanding = total - sum(payment_allocations)
         // Note: We only use payment_allocations, not paidAmount, to avoid double-counting
         const [rows] = yield conn.query(`
-            SELECT 
-                i.id,
+            SELECT
+            i.id,
                 i.number,
                 i.date,
                 i.total,
                 COALESCE(pa_sum.allocatedAmount, 0) as allocatedAmount,
                 (i.total - COALESCE(pa_sum.allocatedAmount, 0)) as remainingAmount
             FROM invoices i
-            LEFT JOIN (
-                SELECT invoiceId, SUM(amount) as allocatedAmount
+            LEFT JOIN(
+                    SELECT invoiceId, SUM(amount) as allocatedAmount
                 FROM payment_allocations
                 GROUP BY invoiceId
-            ) pa_sum ON pa_sum.invoiceId = i.id
+                ) pa_sum ON pa_sum.invoiceId = i.id
             WHERE ${conditions.join(' AND ')}
             ORDER BY i.date ASC, i.number ASC
         `, queryParams);
@@ -2566,7 +2683,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 conn.release();
                 return res.status(403).json({
                     code: fyCheckOld.errorCode || 'FISCAL_YEAR_CLOSED',
-                    message: `Old date: ${fyCheckOld.error}`,
+                    message: `Old date: ${fyCheckOld.error} `,
                     error: fyCheckOld.error
                 });
             }
@@ -2577,7 +2694,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 conn.release();
                 return res.status(403).json({
                     code: fyCheckNew.errorCode || 'FISCAL_YEAR_CLOSED',
-                    message: `New date: ${fyCheckNew.error}`,
+                    message: `New date: ${fyCheckNew.error} `,
                     error: fyCheckNew.error
                 });
             }
@@ -2586,6 +2703,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         const authReqPolicy = req;
         const currentUserRolePolicy = authReqPolicy.user ? authReqPolicy.user.role : undefined;
         if (authReqPolicy.systemConfig && (currentUserRolePolicy === null || currentUserRolePolicy === void 0 ? void 0 : currentUserRolePolicy.toUpperCase()) !== 'MASTER_ADMIN') {
+            const u = authReqPolicy.user;
             const policyContext = {
                 type: type || existingInvoice.type,
                 date: date || existingInvoice.date,
@@ -2594,11 +2712,11 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 notes: notes || existingInvoice.notes,
                 warehouseId: req.body.warehouseId || existingInvoice.warehouseId,
                 createdBy: existingInvoice.createdBy,
-                currentUser: createdBy,
+                currentUser: u ? `${u.username || ''}|${u.name || ''}` : createdBy,
                 currentUserRole: currentUserRolePolicy,
                 // Credit back old quantities during stock validation â€” the update
                 // will reverse the original stock before re-applying the new lines.
-                existingInvoiceId: existingInvoice.status === 'POSTED' ? invoiceId : undefined,
+                existingInvoiceId: ['POSTED', 'PAID', 'PARTIAL', 'PARTIALLY_PAID'].includes(existingInvoice.status) || existingInvoice.posted === 1 || existingInvoice.posted === true ? invoiceId : undefined,
                 lines: lines === null || lines === void 0 ? void 0 : lines.map((i) => ({
                     productId: i.productId,
                     quantity: i.quantity,
@@ -2622,7 +2740,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 yield releaseInvoiceReservations(conn, invoiceId);
             }
             catch (err) {
-                (0, logger_1.logDebug)(`âš ï¸ Failed to release reservations dynamically: ${err.message}`);
+                (0, logger_1.logDebug)(`âš ï¸ Failed to release reservations dynamically: ${err.message} `);
             }
         }
         // === SERVER-SIDE TOTAL VALIDATION ===
@@ -2638,7 +2756,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     provided: total
                 });
             }
-            (0, logger_1.logDebug)(`âœ… Invoice update total validated: ${validation.calculated}`);
+            (0, logger_1.logDebug)(`âœ… Invoice update total validated: ${validation.calculated} `);
             // BUG FIX: Use the authoritative server-calculated total for all subsequent logic
             total = validation.calculated;
         }
@@ -2671,11 +2789,11 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 }
             }
             catch (err) {
-                console.warn(`⚠️ [updateInvoice] Could not resolve posShiftId:`, err);
+                console.warn(`⚠️[updateInvoice] Could not resolve posShiftId: `, err);
             }
         }
         const [updateResult] = yield conn.query(`UPDATE invoices SET
-                date = ?, type = ?, partnerId = ?, partnerName = ?,
+            date = ?, type = ?, partnerId = ?, partnerName = ?,
                 total = ?, status = ?, paymentMethod = ?, posted = ?,
                 notes = ?, dueDate = ?, taxAmount = ?, whtAmount = ?,
                 shippingFee = ?, globalDiscount = ?, globalDiscountType = ?, globalDiscountValue = ?, warehouseId = ?,
@@ -2687,7 +2805,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 branchId = ?,
                 posShiftId = ?,
                 paymentSources = ?
-            WHERE id = ?`, [
+                    WHERE id = ? `, [
             date, type, partnerId, partnerName, total, status, paymentMethod, posted,
             notes, sanitizedDueDate, taxAmount, whtAmount, shippingFee, globalDiscount, req.body.globalDiscountType || 'FIXED', req.body.globalDiscountValue || 0,
             sanitizedWarehouseId,
@@ -2718,8 +2836,8 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             for (const c of transactionCheques) {
                 const chequeId = c.id || (0, crypto_1.randomUUID)();
                 const chequeType = (type === 'RECEIPT') ? 'RECEIVABLE' : 'PAYABLE';
-                yield conn.query(`INSERT INTO cheques (id, number, bankName, amount, dueDate, status, type, partnerId, partnerName, description, createdDate, bankAccountId, transactionId, createdBy)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                yield conn.query(`INSERT INTO cheques(id, number, bankName, amount, dueDate, status, type, partnerId, partnerName, description, createdDate, bankAccountId, transactionId, createdBy)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                     chequeId,
                     c.number || '',
                     c.bankName || '',
@@ -2737,7 +2855,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 ]);
                 // If endorsing an existing cheque, update its status
                 if (c.type === 'ENDORSE' && c.chequeId) {
-                    yield conn.query(`UPDATE cheques SET status = 'ENDORSED' WHERE id = ?`, [c.chequeId]);
+                    yield conn.query(`UPDATE cheques SET status = 'ENDORSED' WHERE id = ? `, [c.chequeId]);
                 }
             }
             if (transactionCheques.length > 0) {
@@ -2768,8 +2886,8 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         };
         const stockMultiplierForType = stockChangeTypes[type];
         const oldStockMultiplier = stockChangeTypes[existingInvoice.type];
-        const oldWasPosted = existingInvoice.status === 'POSTED' || existingInvoice.status === 'PAID' || existingInvoice.status === 'PARTIALLY_PAID' || existingInvoice.posted === 1 || existingInvoice.posted === true;
-        const newIsPosted = status === 'POSTED' || status === 'PAID' || status === 'PARTIALLY_PAID' || posted === 1 || posted === true;
+        const oldWasPosted = ['POSTED', 'PAID', 'PARTIAL', 'PARTIALLY_PAID'].includes(existingInvoice.status) || existingInvoice.posted === 1 || existingInvoice.posted === true;
+        const newIsPosted = ['POSTED', 'PAID', 'PARTIAL', 'PARTIALLY_PAID'].includes(status) || posted === 1 || posted === true;
         const hasStockChange = oldStockMultiplier !== undefined || stockMultiplierForType !== undefined;
         let oldLines = [];
         if (hasStockChange) {
@@ -2796,7 +2914,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     // Skip DAMAGED returns — they had 0 stock change, so nothing to reverse
                     const wasOldDamaged = wasOldReturnType && oldLine.returnCondition === 'DAMAGED';
                     if (wasOldDamaged) {
-                        (0, logger_1.logDebug)(`ðŸ”„ [updateInvoice] Skipping reversal for DAMAGED item: ${oldLine.productId}`);
+                        (0, logger_1.logDebug)(`ðŸ”„[updateInvoice] Skipping reversal for DAMAGED item: ${oldLine.productId} `);
                         continue;
                     }
                     const oldQty = Number(oldLine.baseQuantity !== null && oldLine.baseQuantity !== undefined ? oldLine.baseQuantity : oldLine.quantity) || 0;
@@ -2811,12 +2929,12 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     if (oldWarehouseId) {
                         yield conn.query('UPDATE product_stocks SET stock = ROUND(stock + ?, 5) WHERE productId = ? AND warehouseId = ?', [reverseChange, oldLine.productId, oldWarehouseId]);
                     }
-                    (0, logger_1.logDebug)(`ðŸ”„ [updateInvoice] Reversed old stock: ${oldLine.productId} ${reverseChange > 0 ? '+' : ''}${reverseChange}`);
+                    (0, logger_1.logDebug)(`ðŸ”„[updateInvoice] Reversed old stock: ${oldLine.productId} ${reverseChange > 0 ? '+' : ''}${reverseChange} `);
                     // Reverse variant stock if applicable
                     if (oldLine.variantId && !wasOldDamaged) {
-                        yield conn.query(`UPDATE product_variants SET stock = ROUND(COALESCE(stock, 0) + ?, 5) WHERE id = ?`, [reverseChange, oldLine.variantId]).catch(() => { });
+                        yield conn.query(`UPDATE product_variants SET stock = ROUND(COALESCE(stock, 0) + ?, 5) WHERE id = ? `, [reverseChange, oldLine.variantId]).catch(() => { });
                         if (oldWarehouseId) {
-                            yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock + ?, 5) WHERE variantId = ? AND warehouseId = ?`, [reverseChange, oldLine.variantId, oldWarehouseId]).catch(() => { });
+                            yield conn.query(`UPDATE product_variant_stocks SET stock = ROUND(stock + ?, 5) WHERE variantId = ? AND warehouseId = ? `, [reverseChange, oldLine.variantId, oldWarehouseId]).catch(() => { });
                         }
                     }
                 }
@@ -2890,45 +3008,47 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 const oldStock = cache.stock;
                 const oldCost = cache.cost;
                 let newCost = oldCost;
-                const lineGross = (Number(line.price) || 0) * qty;
+                const rawPrice = Number(line.price) || 0;
                 const lineDiscount = Number(line.discount) || 0;
+                const lineGross = rawPrice * qty; // qty here is line.quantity (UoM qty)
                 const lineShareOfGlobalDiscount = invoiceSubtotal > 0 ? (lineGross / invoiceSubtotal) * invoiceGlobalDiscount : 0;
                 const netLineTotal = lineGross - lineDiscount - lineShareOfGlobalDiscount;
-                const unitPurchasePrice = qty > 0 ? Math.max(0, netLineTotal / qty) : (Number(line.price) || 0);
+                const baseQty = lineBaseQuantity > 0 ? lineBaseQuantity : 1;
+                const unitPurchasePrice = Math.max(0, netLineTotal / baseQty);
                 if (inventoryValuationMethod === 'LAST_PURCHASE') {
                     newCost = unitPurchasePrice;
                 }
                 else {
                     const costMultiplier = type === 'RETURN_PURCHASE' ? -1 : 1;
-                    const stockChange = qty * costMultiplier;
+                    const stockChange = lineBaseQuantity * costMultiplier;
                     const newStock = oldStock + stockChange;
                     newCost = newStock <= 0 ? oldCost : ((oldStock * oldCost) + (stockChange * unitPurchasePrice)) / newStock;
                 }
                 newCost = Number(newCost.toFixed(2));
                 yield conn.query('UPDATE products SET cost = ? WHERE id = ?', [newCost, line.productId]);
-                productsCache.set(line.productId, { stock: oldStock + (qty * (type === 'RETURN_PURCHASE' ? -1 : 1)), cost: newCost });
-                (0, logger_1.logDebug)(`ðŸ’° Product cost updated (Edit): ${line.productName} -> ${newCost} (${inventoryValuationMethod})`);
+                productsCache.set(line.productId, { stock: oldStock + (lineBaseQuantity * (type === 'RETURN_PURCHASE' ? -1 : 1)), cost: newCost });
+                (0, logger_1.logDebug)(`ðŸ’° Product cost updated(Edit): ${line.productName} -> ${newCost} (${inventoryValuationMethod})`);
             }
         }
         // PERF: Batch INSERT all lines in one query
         if (batchLineValues.length > 0) {
             try {
-                yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, warehouseId, bonusQty, grade, returnCondition, priceListId, variantId, unitId, unitName, conversionFactor, baseQuantity, hasWarranty, inBranchInstallation, warrantyMonths)
-                         VALUES ?`, [batchLineValues]);
+                yield conn.query(`INSERT INTO invoice_lines(invoiceId, productId, productName, quantity, price, cost, discount, total, warehouseId, bonusQty, grade, returnCondition, priceListId, variantId, unitId, unitName, conversionFactor, baseQuantity, hasWarranty, inBranchInstallation, warrantyMonths)
+            VALUES ? `, [batchLineValues]);
             }
             catch (ilErr) {
                 // Fallback: insert without warehouseId/bonusQty if columns don't exist
                 (0, logger_1.logDebug)('âš ï¸ Batch insert failed, falling back to minimal columns:', ilErr.message);
                 const minimalValues = batchLineValues.map(v => [v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[12]]);
-                yield conn.query(`INSERT INTO invoice_lines (invoiceId, productId, productName, quantity, price, cost, discount, total, priceListId)
-                         VALUES ?`, [minimalValues]);
+                yield conn.query(`INSERT INTO invoice_lines(invoiceId, productId, productName, quantity, price, cost, discount, total, priceListId)
+            VALUES ? `, [minimalValues]);
             }
         }
         // === APPLY NEW STOCK + SYNC STOCK MOVEMENTS ===
         if (stockMultiplierForType !== undefined) {
             yield conn.query('DELETE FROM stock_movements WHERE reference_id = ?', [invoiceId]);
             if (!newIsPosted) {
-                (0, logger_1.logDebug)(`â„¹ï¸ [updateInvoice] New status is DRAFT â€” skipping stock application`);
+                (0, logger_1.logDebug)(`â„¹ï¸[updateInvoice] New status is DRAFT â€” skipping stock application`);
             }
             // Apply new stock changes and recreate stock movements â€” ONLY if POSTED
             if (newIsPosted) {
@@ -2960,13 +3080,13 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     }
                     if (!isDamaged && warehouseIdToUse) {
                         yield conn.query(`
-                                INSERT INTO product_stocks (id, productId, warehouseId, stock)
-                                VALUES (UUID(), ?, ?, ?)
+                                INSERT INTO product_stocks(id, productId, warehouseId, stock)
+            VALUES(UUID(), ?, ?, ?)
                                 ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)
-                            `, [line.productId, warehouseIdToUse, qtyChange, qtyChange]);
+                `, [line.productId, warehouseIdToUse, qtyChange, qtyChange]);
                     }
                     // Collect movement for batch INSERT
-                    let movementNotes = `Invoice #${invoiceNumber} - ${partnerName}`;
+                    let movementNotes = `Invoice #${invoiceNumber} - ${partnerName} `;
                     if (isReturn && line.returnCondition) {
                         const conditionLabel = line.returnCondition === 'DAMAGED' ? 'هالك' : 'سليم';
                         movementNotes += ` (${conditionLabel})`;
@@ -2986,11 +3106,11 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 // PERF: Batch INSERT all stock_movements in one query
                 if (batchStockMovements.length > 0) {
                     yield conn.query(`
-                            INSERT INTO stock_movements (
-                                product_id, warehouse_id, qty_change, movement_type, 
-                                reference_type, reference_id, notes, movement_date, variant_id
-                            ) VALUES ?
-                        `, [batchStockMovements]);
+                            INSERT INTO stock_movements(
+                    product_id, warehouse_id, qty_change, movement_type,
+                    reference_type, reference_id, notes, movement_date, variant_id
+                ) VALUES ?
+                    `, [batchStockMovements]);
                 }
                 // === VARIANT STOCK UPDATES (updateInvoice) ===
                 const variantStockMap = new Map();
@@ -3023,12 +3143,12 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         vParams.push(variantId, change);
                         variantIds.push(variantId);
                     }
-                    yield conn.query(`UPDATE product_variants SET stock = CASE ${vCases.join(' ')} ELSE stock END WHERE id IN (?)`, [...vParams, variantIds]).catch((e) => (0, logger_1.logDebug)(`âš ï¸ Variant stock update note: ${e.message}`));
+                    yield conn.query(`UPDATE product_variants SET stock = CASE ${vCases.join(' ')} ELSE stock END WHERE id IN(?)`, [...vParams, variantIds]).catch((e) => (0, logger_1.logDebug)(`âš ï¸ Variant stock update note: ${e.message} `));
                 }
                 for (const u of variantWarehouseUpdates) {
-                    yield conn.query(`INSERT INTO product_variant_stocks (id, variantId, productId, warehouseId, stock)
-                             VALUES (UUID(), ?, ?, ?, ?)
-                             ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [u.variantId, u.productId, u.warehouseId, u.qtyChange, u.qtyChange]).catch((e) => (0, logger_1.logDebug)(`âš ï¸ Variant warehouse stock note: ${e.message}`));
+                    yield conn.query(`INSERT INTO product_variant_stocks(id, variantId, productId, warehouseId, stock)
+            VALUES(UUID(), ?, ?, ?, ?)
+                             ON DUPLICATE KEY UPDATE stock = ROUND(stock + ?, 5)`, [u.variantId, u.productId, u.warehouseId, u.qtyChange, u.qtyChange]).catch((e) => (0, logger_1.logDebug)(`âš ï¸ Variant warehouse stock note: ${e.message} `));
                 }
             } // end if (newIsPosted)
         }
@@ -3052,13 +3172,13 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (isCashPayment && partnerId) {
             if (inlinePaymentOrFinancialChanged) {
                 // Find and delete any existing orphaned receipt for this CASH invoice
-                const [orphanedPayments] = yield conn.query(`SELECT id, number FROM invoices 
-                     WHERE (sourceInvoiceId = ? OR referenceInvoiceId = ?)
-                     AND (type = 'RECEIPT' OR type = 'PAYMENT')
+                const [orphanedPayments] = yield conn.query(`SELECT id, number FROM invoices
+            WHERE(sourceInvoiceId = ? OR referenceInvoiceId = ?)
+            AND(type = 'RECEIPT' OR type = 'PAYMENT')
                      ORDER BY id DESC LIMIT 1`, [invoiceId, invoiceId]);
                 const orphanedPayment = orphanedPayments[0];
                 if (orphanedPayment) {
-                    (0, logger_1.logDebug)(`ðŸ—‘ï¸ CASH invoice: Deleting orphaned receipt ${orphanedPayment.number}`);
+                    (0, logger_1.logDebug)(`ðŸ—‘ï¸ CASH invoice: Deleting orphaned receipt ${orphanedPayment.number} `);
                     yield conn.query('DELETE FROM journal_lines WHERE journalId IN (SELECT id FROM journal_entries WHERE referenceId = ?)', [orphanedPayment.number]);
                     yield conn.query('DELETE FROM journal_entries WHERE referenceId = ?', [orphanedPayment.number]);
                     yield conn.query('DELETE FROM account_transactions WHERE invoiceId = ?', [orphanedPayment.id]);
@@ -3078,22 +3198,22 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         descPrefix = 'فاتورة مشتريات نقدي';
                     const cashPaymentType = (type === 'INVOICE_SALE' || type === 'RETURN_PURCHASE') ? 'RECEIPT' : 'PAYMENT';
                     // Clean up old cash entries
-                    yield conn.query(`DELETE FROM journal_lines WHERE journalId IN (
-                            SELECT id FROM journal_entries 
-                            WHERE (referenceId = ? OR referenceId = ?)
-                            AND (description LIKE '%مبيعات نقدي%' OR description LIKE '%مشتريات نقدي%' OR description LIKE '%مرتجع%نقدي%'
+                    yield conn.query(`DELETE FROM journal_lines WHERE journalId IN(
+                SELECT id FROM journal_entries 
+                            WHERE(referenceId = ? OR referenceId = ?)
+                            AND(description LIKE '%مبيعات نقدي%' OR description LIKE '%مشتريات نقدي%' OR description LIKE '%مرتجع%نقدي%'
                                  OR description LIKE '%متحصلات نقدية%' OR description LIKE '%مدفوعات نقدية%')
-                        )`, [invoiceId, invoiceNumber]);
-                    yield conn.query(`DELETE FROM journal_entries 
-                         WHERE (referenceId = ? OR referenceId = ?)
-                         AND (description LIKE '%مبيعات نقدي%' OR description LIKE '%مشتريات نقدي%' OR description LIKE '%مرتجع%نقدي%'
+            )`, [invoiceId, invoiceNumber]);
+                    yield conn.query(`DELETE FROM journal_entries
+            WHERE(referenceId = ? OR referenceId = ?)
+            AND(description LIKE '%مبيعات نقدي%' OR description LIKE '%مشتريات نقدي%' OR description LIKE '%مرتجع%نقدي%'
                               OR description LIKE '%متحصلات نقدية%' OR description LIKE '%مدفوعات نقدية%')`, [invoiceId, invoiceNumber]);
                     const newJournalId = (0, crypto_1.randomUUID)();
                     yield (0, paymentGeneration_1.createPaymentJournal)({
                         conn,
                         journalId: newJournalId,
                         date,
-                        description: `${descPrefix} #${invoiceNumber} - ${partnerName}`,
+                        description: `${descPrefix} #${invoiceNumber} - ${partnerName} `,
                         referenceId: invoiceId,
                         createdBy,
                         amount: cashJournalTotal,
@@ -3107,14 +3227,14 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         req,
                         partnerId
                     });
-                    (0, logger_1.logDebug)(`ðŸ“’ [updateInvoice] Cash treasury journal synced: ${newJournalId} for invoice ${invoiceNumber} (${cashJournalTotal})`);
+                    (0, logger_1.logDebug)(`ðŸ“’[updateInvoice] Cash treasury journal synced: ${newJournalId} for invoice ${invoiceNumber}(${cashJournalTotal})`);
                 }
             }
             // Skip receipt creation/update for CASH invoices
             paymentCollected = 0;
         }
         else if (isCashPayment && paymentCollected !== invoiceTotal) {
-            (0, logger_1.logDebug)(`ðŸ’µ CASH payment auto-sync: ${paymentCollected} â†’ ${invoiceTotal}`);
+            (0, logger_1.logDebug)(`ðŸ’µ CASH payment auto - sync: ${paymentCollected} â†’ ${invoiceTotal} `);
             paymentCollected = invoiceTotal;
         }
         if (partnerId && !isCashPayment) {
@@ -3162,13 +3282,13 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 req.body.referenceInvoiceId !== existingInvoice.referenceInvoiceId ||
                 req.body.sourceInvoiceId !== existingInvoice.sourceInvoiceId;
             if (!hasStandaloneFinancialChanges) {
-                (0, logger_1.logDebug)(`â„¹ï¸ Metadata-only update for standalone payment/receipt #${invoiceNumber}`);
-                yield conn.query(`UPDATE account_transactions SET date = ?, description = ? WHERE invoiceId = ?`, [date, `${type === 'RECEIPT' ? 'مقبوض' : 'دفع'} (مستقل) ${invoiceNumber}`, invoiceId]);
+                (0, logger_1.logDebug)(`â„¹ï¸ Metadata - only update for standalone payment / receipt #${invoiceNumber} `);
+                yield conn.query(`UPDATE account_transactions SET date = ?, description = ? WHERE invoiceId = ? `, [date, `${type === 'RECEIPT' ? 'مقبوض' : 'دفع'} (مستقل) ${invoiceNumber} `, invoiceId]);
                 const methodLabel = paymentMethod === 'CASH' ? 'نقدي' : paymentMethod === 'BANK' ? 'تحويل بنكي' : 'شيك';
-                yield conn.query(`UPDATE journal_entries SET date = ?, description = ? WHERE referenceId = ?`, [date, `${type === 'RECEIPT' ? 'سند قبض' : 'سند صرف'} #${invoiceNumber} - ${partnerName} (${methodLabel})`, invoiceId]);
+                yield conn.query(`UPDATE journal_entries SET date = ?, description = ? WHERE referenceId = ? `, [date, `${type === 'RECEIPT' ? 'سند قبض' : 'سند صرف'} #${invoiceNumber} - ${partnerName} (${methodLabel})`, invoiceId]);
             }
             else {
-                (0, logger_1.logDebug)(`ðŸ’° Standalone payment/receipt financial details changed. Recreating entries.`);
+                (0, logger_1.logDebug)(`ðŸ’° Standalone payment / receipt financial details changed.Recreating entries.`);
                 // 1. Delete old account_transactions
                 yield conn.query('DELETE FROM account_transactions WHERE invoiceId = ?', [invoiceId]);
                 // 2. Delete old journal_entries and journal_lines
@@ -3180,13 +3300,13 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 const isReversed = standaloneTotal < 0;
                 const effectiveIsReceipt = isReversed ? (type !== 'RECEIPT') : (type === 'RECEIPT');
                 // 3. Re-create account_transactions
-                yield conn.query(`INSERT INTO account_transactions (
-                        id, date, type, partnerId, partnerName, debit, credit, description, invoiceId, createdBy
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
+                yield conn.query(`INSERT INTO account_transactions(
+                id, date, type, partnerId, partnerName, debit, credit, description, invoiceId, createdBy
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [
                     (0, crypto_1.randomUUID)(), date, type, partnerId, partnerName,
                     effectiveIsReceipt ? 0 : absTotal,
                     effectiveIsReceipt ? absTotal : 0,
-                    `${type === 'RECEIPT' ? 'مقبوض' : 'دفع'} (مستقل) ${invoiceNumber}`,
+                    `${type === 'RECEIPT' ? 'مقبوض' : 'دفع'} (مستقل) ${invoiceNumber} `,
                     invoiceId, createdBy
                 ]);
                 // 4. Re-create journal entries
@@ -3198,7 +3318,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                         conn,
                         journalId,
                         date,
-                        description: `${type === 'RECEIPT' ? 'سند قبض' : 'سند صرف'} #${invoiceNumber} - ${partnerName} (${methodLabel})${reversedLabel}`,
+                        description: `${type === 'RECEIPT' ? 'سند قبض' : 'سند صرف'} #${invoiceNumber} - ${partnerName} (${methodLabel})${reversedLabel} `,
                         referenceId: invoiceId,
                         createdBy,
                         amount: absTotal,
@@ -3216,10 +3336,10 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                     // 4b. Re-create payment allocation
                     if (status !== 'VOID' && status !== 'DRAFT' && (req.body.referenceInvoiceId || req.body.sourceInvoiceId)) {
                         const targetInvoiceId = req.body.referenceInvoiceId || req.body.sourceInvoiceId;
-                        yield conn.query(`INSERT INTO payment_allocations (id, paymentId, invoiceId, amount) VALUES (?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), invoiceId, targetInvoiceId, absTotal]);
+                        yield conn.query(`INSERT INTO payment_allocations(id, paymentId, invoiceId, amount) VALUES(?, ?, ?, ?)`, [(0, crypto_1.randomUUID)(), invoiceId, targetInvoiceId, absTotal]);
                     }
                     if (isReversed) {
-                        console.log(`ðŸ”„ Reversed ${type} #${invoiceNumber}: negative amount ${standaloneTotal} â†’ journal uses abs(${absTotal}) with flipped debit/credit`);
+                        console.log(`ðŸ”„ Reversed ${type} #${invoiceNumber}: negative amount ${standaloneTotal} â†’ journal uses abs(${absTotal}) with flipped debit / credit`);
                     }
                 }
             }
@@ -3232,7 +3352,7 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (paymentCollected > 0 || type === 'PAYMENT' || type === 'RECEIPT') {
             const [journalAccountRows] = yield conn.query(`SELECT DISTINCT jl.accountId FROM journal_lines jl
                  JOIN journal_entries je ON jl.journalId = je.id
-                 WHERE je.referenceId = ? OR je.referenceId = ?`, [invoiceId, invoiceNumber]);
+                 WHERE je.referenceId = ? OR je.referenceId = ? `, [invoiceId, invoiceNumber]);
             for (const row of journalAccountRows) {
                 if (row.accountId)
                     affectedAccountIds.push(row.accountId);
@@ -3241,12 +3361,12 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (affectedAccountIds.length > 0) {
             const balanceResult = yield (0, accountBalanceUtils_1.updateAccountBalancesFromJournal)(conn, affectedAccountIds);
             if (balanceResult.updatedCount > 0) {
-                console.log(`âœ… [updateInvoice] Auto-updated ${balanceResult.updatedCount} account balances`);
+                console.log(`âœ…[updateInvoice] Auto - updated ${balanceResult.updatedCount} account balances`);
             }
         }
         // === AUTO-POST REVENUE/COGS JOURNAL ENTRY (For updates) ===
         // Must be done before commit to ensure transaction atomicity.
-        yield (0, exports.syncRevenueCogsJournal)(conn, invoiceId, invoiceNumber, type, date, partnerName, total, lines, createdBy, false, isCashPayment, Number(req.body.globalDiscount) || 0, (0, branchFilter_1.resolveBranchIdForWrite)(req));
+        yield (0, exports.syncRevenueCogsJournal)(conn, invoiceId, invoiceNumber, type, date, partnerName, total, lines, createdBy, false, isCashPayment, Number(req.body.globalDiscount) || 0, (0, branchFilter_1.resolveBranchIdForWrite)(req), status);
         // Check memberships
         yield (0, memberships_1.checkAndActivateMembership)(invoiceId, conn);
         if (type === 'RECEIPT' && req.body.sourceInvoiceId) {
@@ -3276,15 +3396,15 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 else if (type === 'RETURN_PURCHASE' || type === 'PURCHASE_RETURN') {
                     movementType = 'DEPOSIT';
                 }
-                yield conn.query(`INSERT INTO pos_cash_movements (id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
-                     VALUES (?, ?, ?, ?, ?, ?, 'INVOICE', ?, NOW())`, [
+                yield conn.query(`INSERT INTO pos_cash_movements(id, shiftId, type, amount, paymentMethod, referenceId, referenceType, description, createdAt)
+            VALUES(?, ?, ?, ?, ?, ?, 'INVOICE', ?, NOW())`, [
                     movementId,
                     shiftIdToUse,
                     movementType,
                     total,
                     paymentMethod,
                     invoiceId,
-                    `تعديل فاتورة ${invoiceNumber} - ${partnerName}`
+                    `تعديل فاتورة ${invoiceNumber} - ${partnerName} `
                 ]);
             }
             // Recalculate shift totals
@@ -3293,12 +3413,28 @@ const updateInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 yield recalculateShiftTotals(conn, shiftIdToUse, createdBy);
             }
             catch (posShiftErr) {
-                console.warn(`⚠️ [updateInvoice] Warning recalculating shift totals for shift ${shiftIdToUse}: ${posShiftErr.message}`);
+                console.warn(`⚠️[updateInvoice] Warning recalculating shift totals for shift ${shiftIdToUse}: ${posShiftErr.message} `);
             }
         }
         yield conn.commit();
+        // Broadcast stock updates
+        try {
+            const productIds = new Set();
+            if (lines && Array.isArray(lines)) {
+                lines.forEach((l) => { if (l.productId)
+                    productIds.add(l.productId); });
+            }
+            if (oldLines && Array.isArray(oldLines)) {
+                oldLines.forEach((l) => { if (l.productId)
+                    productIds.add(l.productId); });
+            }
+            if (productIds.size > 0) {
+                broadcastStockUpdates(Array.from(productIds)).catch(err => console.error('Failed to broadcast stock updates:', err));
+            }
+        }
+        catch (e) { }
         // Log audit trail
-        yield (0, auditController_1.logAction)(createdBy, 'INVOICE', 'UPDATE', `Updated ${type} Invoice #${invoiceNumber}`, `Partner: ${partnerName}, Amount: ${total}`);
+        yield (0, auditController_1.logAction)(createdBy, 'INVOICE', 'UPDATE', `Updated ${type} Invoice #${invoiceNumber} `, `Partner: ${partnerName}, Amount: ${total} `);
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', updatedBy: createdBy });
         res.json(Object.assign(Object.assign({}, req.body), { id: invoiceId, number: invoiceNumber, message: 'Invoice updated successfully' }));
@@ -3332,15 +3468,15 @@ const getInvoiceDispatchStatuses = (req, res) => __awaiter(void 0, void 0, void 
         const conn = yield (0, db_1.getConnection)();
         // Get all sale invoices with reservations
         const [rows] = yield conn.query(`
-            SELECT 
-                invoiceId,
+            SELECT
+            invoiceId,
                 COUNT(*) as totalReservations,
                 SUM(CASE WHEN status = 'DISPATCHED' THEN 1 ELSE 0 END) as dispatched,
                 SUM(CASE WHEN status = 'RESERVED' THEN 1 ELSE 0 END) as reserved,
                 SUM(CASE WHEN status = 'CANCELLED' THEN 1 ELSE 0 END) as cancelled
             FROM stock_reservations
             GROUP BY invoiceId
-        `);
+                `);
         conn.release();
         const statusMap = {};
         for (const row of rows) {
@@ -3370,8 +3506,8 @@ const getPendingReservations = (req, res) => __awaiter(void 0, void 0, void 0, f
         const conn = yield (0, db_1.getConnection)();
         // Get unique invoices that have at least one RESERVED item
         const [rows] = yield conn.query(`
-            SELECT DISTINCT 
-                sr.invoiceId, 
+            SELECT DISTINCT
+            sr.invoiceId,
                 sr.invoiceNumber,
                 inv.partnerName as partnerName,
                 inv.date
@@ -3507,6 +3643,13 @@ const deleteInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
                 });
             }
         }
+        // Fetch product IDs before deleting lines
+        let productIds = [];
+        try {
+            const [linesRows] = yield conn.query('SELECT productId FROM invoice_lines WHERE invoiceId = ?', [invoiceId]);
+            productIds = linesRows.map((l) => l.productId).filter(Boolean);
+        }
+        catch (e) { }
         // Use CASCADE DELETE to remove invoice + all related documents
         const cascadeResult = yield (0, invoiceCascadeDelete_1.deleteInvoiceWithCascade)(conn, invoiceId, deletedBy);
         if (!cascadeResult.success) {
@@ -3518,10 +3661,14 @@ const deleteInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             });
         }
         yield conn.commit();
+        // Broadcast stock updates
+        if (productIds.length > 0) {
+            broadcastStockUpdates(productIds).catch(err => console.error('Failed to broadcast stock updates:', err));
+        }
         // Log the action
-        yield (0, auditController_1.logAction)(deletedBy, 'INVOICE', 'DELETE', `حذف فاتورة ${existingInvoice.number || invoiceId.substring(0, 8)}`, `العميل: ${existingInvoice.partnerName || '-'} | المبلغ: ${existingInvoice.total} | ` +
+        yield (0, auditController_1.logAction)(deletedBy, 'INVOICE', 'DELETE', `حذف فاتورة ${existingInvoice.number || invoiceId.substring(0, 8)} `, `العميل: ${existingInvoice.partnerName || '-'} | المبلغ: ${existingInvoice.total} | ` +
             `سندات محذوفة: ${cascadeResult.deletedReceipts + cascadeResult.deletedPayments} | ` +
-            `قيود محذوفة: ${cascadeResult.deletedJournals}`);
+            `قيود محذوفة: ${cascadeResult.deletedJournals} `);
         // Broadcast real-time update
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'invoice', action: 'delete', updatedBy: deletedBy });
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'journal', action: 'delete', updatedBy: deletedBy });
@@ -3644,7 +3791,7 @@ const previewDeleteInvoice = (req, res) => __awaiter(void 0, void 0, void 0, fun
                 },
                 totalAmount: preview.totalAmount,
                 warning: preview.warning,
-                confirmMessage: `هل أنت متأكد من حذف الفاتورة؟ ${preview.warning}`
+                confirmMessage: `هل أنت متأكد من حذف الفاتورة؟ ${preview.warning} `
             });
         }
         finally {
@@ -3713,7 +3860,7 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
                     results.push({
                         invoiceId,
                         success: false,
-                        message: `لا يمكن نقل ملكية فاتورة في فترة مالية مغلقة: ${fyCheck.error}`
+                        message: `لا يمكن نقل ملكية فاتورة في فترة مالية مغلقة: ${fyCheck.error} `
                     });
                     continue;
                 }
@@ -3723,7 +3870,7 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
                     results.push({
                         invoiceId,
                         success: false,
-                        message: `لا يمكن نقل ملكية فاتورة في فترة مقفلة: ${lockCheck.message}`
+                        message: `لا يمكن نقل ملكية فاتورة في فترة مقفلة: ${lockCheck.message} `
                     });
                     continue;
                 }
@@ -3753,7 +3900,7 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
                     results.push({
                         invoiceId,
                         success: false,
-                        message: `You can only transfer your own invoices. Owner: ${invoice.createdBy}`
+                        message: `You can only transfer your own invoices.Owner: ${invoice.createdBy} `
                     });
                     continue;
                 }
@@ -3763,7 +3910,7 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
                     results.push({
                         invoiceId,
                         success: false,
-                        message: `المستخدم المستهدف ليس لديه صلاحية لهذه الفاتورة (${requiredPerm})`
+                        message: `المستخدم المستهدف ليس لديه صلاحية لهذه الفاتورة(${requiredPerm})`
                     });
                     continue;
                 }
@@ -3781,12 +3928,12 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
                     partnerName: invoice.partnerName,
                     total: invoice.total
                 });
-                yield conn.query(`INSERT INTO audit_logs (id, date, user, module, action, details) 
-                     VALUES (UUID(), NOW(), ?, 'INVOICE', 'TRANSFER', ?)`, [currentUser, auditDetails]);
+                yield conn.query(`INSERT INTO audit_logs(id, date, user, module, action, details)
+            VALUES(UUID(), NOW(), ?, 'INVOICE', 'TRANSFER', ?)`, [currentUser, auditDetails]);
                 results.push({
                     invoiceId,
                     success: true,
-                    message: `Transferred to ${targetUserName}`
+                    message: `Transferred to ${targetUserName} `
                 });
             }
             yield conn.commit();
@@ -3799,7 +3946,7 @@ const transferInvoice = (req, res) => __awaiter(void 0, void 0, void 0, function
             const successful = results.filter(r => r.success).length;
             const failed = results.filter(r => !r.success).length;
             res.json({
-                message: `Successfully transferred ${successful} invoice(s)${failed > 0 ? `, ${failed} failed` : ''}`,
+                message: `Successfully transferred ${successful} invoice(s)${failed > 0 ? `, ${failed} failed` : ''} `,
                 results,
                 summary: {
                     total: invoiceIds.length,
@@ -3848,13 +3995,13 @@ const getTransferableUsers = (req, res) => __awaiter(void 0, void 0, void 0, fun
                 }
             }
             const whereClause = conditions.length > 0 ? 'WHERE ' + conditions.join(' AND ') : '';
-            const [countRows] = yield conn.query(`SELECT COUNT(*) as total FROM users ${whereClause}`, params);
+            const [countRows] = yield conn.query(`SELECT COUNT(*) as total FROM users ${whereClause} `, params);
             const total = ((_b = countRows[0]) === null || _b === void 0 ? void 0 : _b.total) || 0;
             const [users] = yield conn.query(`SELECT id, name, username, role, branchId 
                  FROM users 
                  ${whereClause}
                  ORDER BY name
-                 LIMIT ? OFFSET ?`, [...params, limit, offset]);
+            LIMIT ? OFFSET ? `, [...params, limit, offset]);
             res.json({
                 users,
                 total,
@@ -3916,7 +4063,7 @@ const getInvoiceReportStats = (req, res) => __awaiter(void 0, void 0, void 0, fu
             }
             const userFilter = (0, dataFiltering_1.buildParameterizedFilter)(authReq.userFilterOptions);
             if (userFilter.clause) {
-                conditions.push(`i.${userFilter.clause}`);
+                conditions.push(`i.${userFilter.clause} `);
                 params.push(...userFilter.params);
             }
         }
@@ -3928,16 +4075,16 @@ const getInvoiceReportStats = (req, res) => __awaiter(void 0, void 0, void 0, fu
         }
         if (endDate) {
             conditions.push('i.date <= ?');
-            params.push(endDate.length === 10 ? `${endDate} 23:59:59` : endDate);
+            params.push(endDate.length === 10 ? `${endDate} 23: 59: 59` : endDate);
         }
         if (paymentMethod && paymentMethod !== 'ALL') {
             conditions.push('i.paymentMethod = ?');
             params.push(paymentMethod);
         }
-        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+        const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')} ` : '';
         const [qtyRows] = yield conn.query(`
-            SELECT 
-                COALESCE(SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN il.quantity ELSE 0 END), 0) as qtySold,
+            SELECT
+            COALESCE(SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN il.quantity ELSE 0 END), 0) as qtySold,
                 COALESCE(SUM(CASE WHEN i.type = 'INVOICE_PURCHASE' THEN il.quantity ELSE 0 END), 0) as qtyPurchased,
                 COALESCE(SUM(CASE WHEN i.type = 'RETURN_SALE' THEN il.quantity ELSE 0 END), 0) as qtyReturnedSale,
                 COALESCE(SUM(CASE WHEN i.type = 'RETURN_PURCHASE' THEN il.quantity ELSE 0 END), 0) as qtyReturnedPurchase,
@@ -3946,10 +4093,10 @@ const getInvoiceReportStats = (req, res) => __awaiter(void 0, void 0, void 0, fu
             FROM invoice_lines il
             INNER JOIN invoices i ON il.invoiceId = i.id
             ${whereClause}
-        `, params);
+            `, params);
         const [finRows] = yield conn.query(`
-            SELECT 
-                COUNT(*) as count,
+            SELECT
+            COUNT(*) as count,
                 COALESCE(SUM(CASE WHEN i.type = 'INVOICE_SALE' THEN i.total ELSE 0 END), 0) as totalSales,
                 COALESCE(SUM(CASE WHEN i.type = 'INVOICE_PURCHASE' THEN i.total ELSE 0 END), 0) as totalPurchases,
                 COALESCE(SUM(CASE WHEN i.type = 'RETURN_SALE' THEN i.total ELSE 0 END), 0) as totalSalesReturns,
@@ -3960,7 +4107,7 @@ const getInvoiceReportStats = (req, res) => __awaiter(void 0, void 0, void 0, fu
                 SUM(CASE WHEN i.type = 'RETURN_PURCHASE' THEN 1 ELSE 0 END) as purchaseReturnCount
             FROM invoices i
             ${whereClause}
-        `, params);
+            `, params);
         conn.release();
         const stats = qtyRows[0] || {};
         const finStats = finRows[0] || {};
@@ -3987,3 +4134,31 @@ const getInvoiceReportStats = (req, res) => __awaiter(void 0, void 0, void 0, fu
     }
 });
 exports.getInvoiceReportStats = getInvoiceReportStats;
+/**
+ * Broadcasts stock changes for specified product IDs to storefront sessions.
+ */
+function broadcastStockUpdates(productIds) {
+    return __awaiter(this, void 0, void 0, function* () {
+        if (!productIds || productIds.length === 0)
+            return;
+        try {
+            const { pool } = yield Promise.resolve().then(() => __importStar(require('../db')));
+            const [prodRows] = yield pool.query('SELECT id, stock FROM products WHERE id IN (?)', [productIds]);
+            let variantRows = [];
+            try {
+                const [vRows] = yield pool.query('SELECT id, productId, stock FROM product_variants WHERE productId IN (?)', [productIds]);
+                variantRows = vRows || [];
+            }
+            catch (vErr) {
+                // Table product_variants might not exist or be empty, swallow
+            }
+            eventBus_1.eventBus.broadcast('storefront:stock:changed', {
+                products: prodRows.map((r) => ({ id: r.id, stock: Number(r.stock) })),
+                variants: variantRows.map((r) => ({ id: r.id, productId: r.productId, stock: Number(r.stock) }))
+            });
+        }
+        catch (err) {
+            console.error('[broadcastStockUpdates] Failed to broadcast stock updates:', err.message);
+        }
+    });
+}

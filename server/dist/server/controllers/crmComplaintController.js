@@ -143,10 +143,21 @@ const getComplaintById = (req, res) => __awaiter(void 0, void 0, void 0, functio
 exports.getComplaintById = getComplaintById;
 // POST /api/crm/complaints
 const createComplaint = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c, _d, _e, _f, _g, _h;
     try {
-        const { partnerId, partnerName, partnerPhone, subject, description, type, severity, source, assignedTo, clientMood, invoiceId, attachments } = req.body;
-        const createdBy = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || null;
+        const partnerId = (_a = req.body.partnerId) !== null && _a !== void 0 ? _a : req.body.partner_id;
+        const partnerName = (_b = req.body.partnerName) !== null && _b !== void 0 ? _b : req.body.partner_name;
+        const partnerPhone = (_c = req.body.partnerPhone) !== null && _c !== void 0 ? _c : req.body.partner_phone;
+        const subject = req.body.subject;
+        const description = req.body.description;
+        const type = req.body.type;
+        const severity = req.body.severity;
+        const source = req.body.source;
+        const assignedTo = (_d = req.body.assignedTo) !== null && _d !== void 0 ? _d : req.body.assigned_to;
+        const clientMood = (_e = req.body.clientMood) !== null && _e !== void 0 ? _e : req.body.client_mood;
+        const invoiceId = (_f = req.body.invoiceId) !== null && _f !== void 0 ? _f : req.body.invoice_id;
+        const attachments = req.body.attachments;
+        const createdBy = ((_g = req.user) === null || _g === void 0 ? void 0 : _g.id) || null;
         if ((!partnerId && !partnerName) || !subject || !description) {
             return res.status(400).json({ success: false, message: 'Customer info, subject, and description are required' });
         }
@@ -183,7 +194,7 @@ const createComplaint = (req, res) => __awaiter(void 0, void 0, void 0, function
       INSERT INTO crm_complaint_comments (id, complaint_id, user_id, content, is_internal)
       VALUES (?, ?, ?, ?, 1)
     `, [(0, crypto_1.randomUUID)(), id, createdBy || 'system', 'تم إنشاء الشكوى بنجاح وبانتظار المراجعة.', 1]);
-        const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
+        const userName = ((_h = req.user) === null || _h === void 0 ? void 0 : _h.name) || 'System';
         yield (0, auditController_1.logAction)(userName, 'CRM', 'COMPLAINT_CREATED', `Created complaint: ${complaintNumber}`, `Complaint ID: ${id}`);
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'crm-complaints' });
         res.status(201).json({ success: true, id, complaintNumber, message: 'Complaint created successfully' });
@@ -196,11 +207,22 @@ const createComplaint = (req, res) => __awaiter(void 0, void 0, void 0, function
 exports.createComplaint = createComplaint;
 // PUT /api/crm/complaints/:id
 const updateComplaint = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b;
+    var _a, _b, _c, _d;
     try {
         const { id } = req.params;
-        const { status, severity, assignedTo, subject, description, type, clientMood, resolutionSummary, rootCause, satisfactionRating, compensationType, compensationAmount } = req.body;
-        const userId = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.id) || 'system';
+        const status = req.body.status;
+        const severity = req.body.severity;
+        const assignedTo = req.body.assignedTo !== undefined ? req.body.assignedTo : req.body.assigned_to;
+        const subject = req.body.subject;
+        const description = req.body.description;
+        const type = req.body.type;
+        const clientMood = (_a = req.body.clientMood) !== null && _a !== void 0 ? _a : req.body.client_mood;
+        const resolutionSummary = req.body.resolutionSummary !== undefined ? req.body.resolutionSummary : req.body.resolution_summary;
+        const rootCause = req.body.rootCause !== undefined ? req.body.rootCause : req.body.root_cause;
+        const satisfactionRating = req.body.satisfactionRating !== undefined ? req.body.satisfactionRating : req.body.satisfaction_rating;
+        const compensationType = (_b = req.body.compensationType) !== null && _b !== void 0 ? _b : req.body.compensation_type;
+        const compensationAmount = req.body.compensationAmount !== undefined ? req.body.compensationAmount : req.body.compensation_amount;
+        const userId = ((_c = req.user) === null || _c === void 0 ? void 0 : _c.id) || 'system';
         // Fetch old record
         const [oldRows] = yield (0, db_1.safePoolQuery)('SELECT status, complaint_number, partner_id FROM crm_complaints WHERE id = ?', [id]);
         if (oldRows.length === 0) {
@@ -317,7 +339,7 @@ const updateComplaint = (req, res) => __awaiter(void 0, void 0, void 0, function
                 ]);
             }
         }
-        const userName = ((_b = req.user) === null || _b === void 0 ? void 0 : _b.name) || 'System';
+        const userName = ((_d = req.user) === null || _d === void 0 ? void 0 : _d.name) || 'System';
         yield (0, auditController_1.logAction)(userName, 'CRM', 'COMPLAINT_UPDATED', `Updated complaint: ${complaintNumber}`, `Complaint ID: ${id}`);
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'crm-complaints' });
         res.json({ success: true, message: 'Complaint updated successfully' });
@@ -459,7 +481,7 @@ const getCompensations = (req, res) => __awaiter(void 0, void 0, void 0, functio
 exports.getCompensations = getCompensations;
 // POST /api/crm/complaints/compensations/:id/approve
 const approveCompensation = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
-    var _a, _b, _c, _d, _e, _f, _g, _h;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _j, _k;
     const conn = yield (0, db_1.getConnection)();
     try {
         const { id } = req.params;
@@ -529,12 +551,12 @@ const approveCompensation = (req, res) => __awaiter(void 0, void 0, void 0, func
             if (mockRes.statusCode !== 201 && mockRes.statusCode !== 200) {
                 throw new Error(((_c = mockRes.data) === null || _c === void 0 ? void 0 : _c.message) || ((_d = mockRes.data) === null || _d === void 0 ? void 0 : _d.error) || 'Failed to generate posted return invoice');
             }
-            postedInvoiceId = invoiceId;
+            postedInvoiceId = ((_e = mockRes.data) === null || _e === void 0 ? void 0 : _e.id) || invoiceId;
         }
         else if (comp.type === 'REFUND') {
             // Generate Outgoing Payment Voucher (سند صرف)
             const [safeRows] = yield conn.query(`SELECT id FROM banks WHERE name LIKE '%خزينة%' OR name LIKE '%نقدي%' LIMIT 1`);
-            const defaultSafeId = ((_e = safeRows[0]) === null || _e === void 0 ? void 0 : _e.id) || null;
+            const defaultSafeId = ((_f = safeRows[0]) === null || _f === void 0 ? void 0 : _f.id) || null;
             if (!defaultSafeId) {
                 throw new Error('No cash drawer/safe configured to process cash Refund');
             }
@@ -559,9 +581,9 @@ const approveCompensation = (req, res) => __awaiter(void 0, void 0, void 0, func
             const mockRes = createMockResponse();
             yield (0, invoiceController_1.createInvoice)(mockReq, mockRes);
             if (mockRes.statusCode !== 201 && mockRes.statusCode !== 200) {
-                throw new Error(((_f = mockRes.data) === null || _f === void 0 ? void 0 : _f.message) || ((_g = mockRes.data) === null || _g === void 0 ? void 0 : _g.error) || 'Failed to generate payment voucher');
+                throw new Error(((_g = mockRes.data) === null || _g === void 0 ? void 0 : _g.message) || ((_h = mockRes.data) === null || _h === void 0 ? void 0 : _h.error) || 'Failed to generate payment voucher');
             }
-            postedInvoiceId = invoiceId;
+            postedInvoiceId = ((_j = mockRes.data) === null || _j === void 0 ? void 0 : _j.id) || invoiceId;
         }
         // 2. Update Compensation Request Status
         yield conn.query(`UPDATE crm_complaint_compensations 
@@ -583,7 +605,7 @@ const approveCompensation = (req, res) => __awaiter(void 0, void 0, void 0, func
     `, [(0, crypto_1.randomUUID)(), comp.complaint_id, userId, content, 1]);
         yield conn.commit();
         conn.release();
-        const userName = ((_h = req.user) === null || _h === void 0 ? void 0 : _h.name) || 'System';
+        const userName = ((_k = req.user) === null || _k === void 0 ? void 0 : _k.name) || 'System';
         yield (0, auditController_1.logAction)(userName, 'CRM', 'COMPLAINT_COMPENSATION_APPROVED', `Approved compensation request for complaint: ${comp.complaint_number}`, `Comp ID: ${id}`);
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'crm-complaints' });
         res.json({ success: true, message: 'Compensation approved and posted successfully', invoiceId: postedInvoiceId });

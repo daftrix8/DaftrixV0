@@ -9,7 +9,7 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
     });
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getPublicMembershipCard = exports.checkAndActivateMembership = exports.updateMembershipSettings = exports.getMembershipSettings = exports.toggleMembershipSuspension = exports.unfreezeMembership = exports.freezeMembership = exports.getMembershipFreezes = exports.renewMembership = exports.deleteMembership = exports.updateMembership = exports.markMembershipPaid = exports.createMembership = exports.getMembershipById = exports.getMemberships = exports.deleteMembershipPackage = exports.updateMembershipPackage = exports.createMembershipPackage = exports.getMembershipPackages = void 0;
+exports.getPublicMembershipCard = exports.checkAndActivateMembership = exports.updateMembershipSettings = exports.getMembershipSettings = exports.getSubscriptionAnalytics = exports.toggleMembershipSuspension = exports.unfreezeMembership = exports.freezeMembership = exports.getMembershipFreezes = exports.renewMembership = exports.deleteMembership = exports.updateMembership = exports.markMembershipPaid = exports.createMembership = exports.getMembershipById = exports.getMemberships = exports.deleteMembershipPackage = exports.updateMembershipPackage = exports.createMembershipPackage = exports.getMembershipPackages = void 0;
 const db_1 = require("../db");
 const crypto_1 = require("crypto");
 const errorHandler_1 = require("../utils/errorHandler");
@@ -27,7 +27,7 @@ const getMembershipPackages = (req, res) => __awaiter(void 0, void 0, void 0, fu
     var _a;
     try {
         const conn = yield (0, db_1.getConnection)();
-        const [rows] = yield conn.query('SELECT id, name, description, price, durationDays, includedVisits, isActive, createdAt, updatedAt, icon, commissionType, commissionValue FROM membership_packages ORDER BY name ASC');
+        const [rows] = yield conn.query('SELECT id, name, description, price, durationDays, includedVisits, isActive, createdAt, updatedAt, icon, commissionType, commissionValue, billingType, recurringInterval FROM membership_packages ORDER BY name ASC');
         // Fetch all benefits — gracefully handle missing linkedMembershipId column
         let benefitRows = [];
         try {
@@ -167,14 +167,14 @@ exports.getMembershipPackages = getMembershipPackages;
 const createMembershipPackage = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     var _a;
     try {
-        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon, commissionType, commissionValue } = req.body;
+        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon, commissionType, commissionValue, billingType, recurringInterval } = req.body;
         const userName = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
         const id = (0, crypto_1.randomUUID)();
         const finalDuration = durationDays || 0;
         const finalVisits = includedVisits !== undefined ? includedVisits : null;
         const finalIsActive = isActive !== undefined ? isActive : true;
         const conn = yield (0, db_1.getConnection)();
-        yield conn.query('INSERT INTO membership_packages (id, name, description, price, durationDays, includedVisits, isActive, icon, commissionType, commissionValue) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, commissionType || 'PERCENT', commissionValue || 0]);
+        yield conn.query('INSERT INTO membership_packages (id, name, description, price, durationDays, includedVisits, isActive, icon, commissionType, commissionValue, billingType, recurringInterval) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, commissionType || 'PERCENT', commissionValue || 0, billingType || 'ONE_TIME', recurringInterval || 'monthly']);
         if (benefits && benefits.length > 0) {
             yield (0, membershipBenefitsSync_1.syncPackageBenefits)(conn, id, benefits, userName);
         }
@@ -191,13 +191,13 @@ const updateMembershipPackage = (req, res) => __awaiter(void 0, void 0, void 0, 
     var _a;
     try {
         const { id } = req.params;
-        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon, commissionType, commissionValue } = req.body;
+        const { name, description, price, durationDays, includedVisits, isActive, benefits, icon, commissionType, commissionValue, billingType, recurringInterval } = req.body;
         const userName = ((_a = req.user) === null || _a === void 0 ? void 0 : _a.name) || 'System';
         const finalDuration = durationDays || 0;
         const finalVisits = includedVisits !== undefined ? includedVisits : null;
         const finalIsActive = isActive !== undefined ? isActive : true;
         const conn = yield (0, db_1.getConnection)();
-        yield conn.query('UPDATE membership_packages SET name = ?, description = ?, price = ?, durationDays = ?, includedVisits = ?, isActive = ?, icon = ?, commissionType = ?, commissionValue = ? WHERE id = ?', [name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, commissionType || 'PERCENT', commissionValue || 0, id]);
+        yield conn.query('UPDATE membership_packages SET name = ?, description = ?, price = ?, durationDays = ?, includedVisits = ?, isActive = ?, icon = ?, commissionType = ?, commissionValue = ?, billingType = ?, recurringInterval = ? WHERE id = ?', [name, description || null, price, finalDuration, finalVisits, finalIsActive, icon || null, commissionType || 'PERCENT', commissionValue || 0, billingType || 'ONE_TIME', recurringInterval || 'monthly', id]);
         yield (0, membershipBenefitsSync_1.syncPackageBenefits)(conn, id, benefits || [], userName);
         conn.release();
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'membership_packages', updatedBy: 'System' });
@@ -302,9 +302,26 @@ const getMemberships = (req, res) => __awaiter(void 0, void 0, void 0, function*
                 }
             }
         }
+        // Fetch membership settings for grace period mapping
+        const [settingsRows] = yield conn.query('SELECT gracePeriodDays, attendanceAllowedFor FROM membership_settings WHERE id = 1');
+        const settings = settingsRows.length > 0 ? settingsRows[0] : { gracePeriodDays: 0, attendanceAllowedFor: 'active_only' };
+        const graceDays = Number(settings.gracePeriodDays || 0);
+        const allowGrace = settings.attendanceAllowedFor === 'active_and_grace';
+        const now = new Date();
         conn.release();
-        // Normalize status to UPPERCASE across all rows before sending to client
-        const normalizedRows = rows.map((m) => (Object.assign(Object.assign({}, m), { status: m.status ? m.status.toUpperCase() : m.status })));
+        // Normalize status to UPPERCASE across all rows before sending to client, mapping PENDING_PAYMENT to GRACE_PERIOD if within grace period
+        const normalizedRows = rows.map((m) => {
+            let status = m.status ? m.status.toUpperCase() : m.status;
+            if (status === 'PENDING_PAYMENT' && allowGrace && m.lastBillingDate && graceDays > 0) {
+                const lastBilling = new Date(m.lastBillingDate);
+                lastBilling.setDate(lastBilling.getDate() + graceDays);
+                lastBilling.setHours(23, 59, 59, 999);
+                if (now <= lastBilling) {
+                    status = 'GRACE_PERIOD';
+                }
+            }
+            return Object.assign(Object.assign({}, m), { status });
+        });
         res.json({
             memberships: normalizedRows,
             pagination: {
@@ -368,8 +385,24 @@ const getMembershipById = (req, res) => __awaiter(void 0, void 0, void 0, functi
         const [freezePeriods] = yield conn.query('SELECT * FROM membership_freeze_periods WHERE membershipId = ? ORDER BY freezeStart ASC', [id]);
         membership.freezePeriods = freezePeriods;
         // Normalize status to UPPERCASE — DB ENUM has mixed casing ('active', 'pending' vs 'FROZEN', 'PENDING_PAYMENT')
-        if (membership.status)
+        if (membership.status) {
             membership.status = membership.status.toUpperCase();
+            if (membership.status === 'PENDING_PAYMENT' && membership.lastBillingDate) {
+                const [settingsRows] = yield conn.query('SELECT gracePeriodDays, attendanceAllowedFor FROM membership_settings WHERE id = 1');
+                const settings = settingsRows.length > 0 ? settingsRows[0] : { gracePeriodDays: 0, attendanceAllowedFor: 'active_only' };
+                if (settings.attendanceAllowedFor === 'active_and_grace') {
+                    const graceDays = Number(settings.gracePeriodDays || 0);
+                    if (graceDays > 0) {
+                        const lastBilling = new Date(membership.lastBillingDate);
+                        lastBilling.setDate(lastBilling.getDate() + graceDays);
+                        lastBilling.setHours(23, 59, 59, 999);
+                        if (new Date() <= lastBilling) {
+                            membership.status = 'GRACE_PERIOD';
+                        }
+                    }
+                }
+            }
+        }
         conn.release();
         res.json(membership);
     }
@@ -406,10 +439,14 @@ const createMembership = (req, res) => __awaiter(void 0, void 0, void 0, functio
                 }
                 commissionAmount = Math.round(commissionAmount * 100) / 100;
             }
+            const billingType = pkg.billingType || 'ONE_TIME';
+            const recurringInterval = pkg.recurringInterval || 'monthly';
+            const nextBillingDate = billingType === 'RECURRING' ? endDate : null;
+            const lastBillingDate = billingType === 'RECURRING' ? joinDate : null;
             yield conn.query(`
-                INSERT INTO memberships (id, customerId, packageId, description, joinDate, endDate, status, includedVisits, remainingVisits, salesmanId, commissionAmount)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `, [id, customerId, packageId, description || null, joinDate, endDate, initialStatus, pkg.includedVisits, pkg.includedVisits, salesmanId || null, commissionAmount]);
+                INSERT INTO memberships (id, customerId, packageId, description, joinDate, endDate, status, includedVisits, remainingVisits, salesmanId, commissionAmount, billingType, recurringInterval, nextBillingDate, lastBillingDate)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `, [id, customerId, packageId, description || null, joinDate, endDate, initialStatus, pkg.includedVisits, pkg.includedVisits, salesmanId || null, commissionAmount, billingType, recurringInterval, nextBillingDate, lastBillingDate]);
             // Get customer name for invoice
             const [customers] = yield conn.query('SELECT name FROM partners WHERE id = ?', [customerId]);
             const customerName = customers.length > 0 ? customers[0].name : 'Unknown';
@@ -592,6 +629,92 @@ const toggleMembershipSuspension = (req, res) => __awaiter(void 0, void 0, void 
     }
 });
 exports.toggleMembershipSuspension = toggleMembershipSuspension;
+const getSubscriptionAnalytics = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
+    try {
+        const conn = yield (0, db_1.getConnection)();
+        // 1. Fetch active recurring memberships for MRR
+        const [mrrRows] = yield conn.query(`SELECT m.recurringInterval, pk.price, m.status, m.lastBillingDate, m.nextBillingDate
+             FROM memberships m
+             JOIN membership_packages pk ON m.packageId = pk.id
+             WHERE m.billingType = 'RECURRING' AND m.status IN ('ACTIVE', 'PENDING_PAYMENT')`);
+        let mrr = 0;
+        let activeCount = 0;
+        for (const row of mrrRows) {
+            activeCount++;
+            const price = Number(row.price || 0);
+            const interval = row.recurringInterval || 'monthly';
+            if (interval === 'weekly') {
+                mrr += (price / 7) * 30;
+            }
+            else if (interval === 'monthly') {
+                mrr += price;
+            }
+            else if (interval === 'quarterly') {
+                mrr += (price / 90) * 30;
+            }
+            else if (interval === 'yearly') {
+                mrr += (price / 365) * 30;
+            }
+            else {
+                mrr += price;
+            }
+        }
+        mrr = Math.round(mrr * 100) / 100;
+        // 2. Fetch expected collections based on nextBillingDate
+        const [expectedRows] = yield conn.query(`SELECT m.nextBillingDate, pk.price
+             FROM memberships m
+             JOIN membership_packages pk ON m.packageId = pk.id
+             WHERE m.billingType = 'RECURRING'
+               AND m.status IN ('ACTIVE', 'PENDING_PAYMENT')
+               AND m.nextBillingDate IS NOT NULL
+               AND m.nextBillingDate >= CURRENT_DATE()`);
+        const expectedCollectionsMap = {};
+        for (const row of expectedRows) {
+            const dateStr = row.nextBillingDate;
+            const date = new Date(dateStr);
+            if (isNaN(date.getTime()))
+                continue;
+            // Format YYYY-MM in Egypt local timezone
+            const year = date.getFullYear();
+            const month = String(date.getMonth() + 1).padStart(2, '0');
+            const monthStr = `${year}-${month}`;
+            if (!expectedCollectionsMap[monthStr]) {
+                expectedCollectionsMap[monthStr] = { month: monthStr, amount: 0, count: 0 };
+            }
+            expectedCollectionsMap[monthStr].amount += Number(row.price || 0);
+            expectedCollectionsMap[monthStr].count += 1;
+        }
+        const expectedCollections = Object.values(expectedCollectionsMap)
+            .sort((a, b) => a.month.localeCompare(b.month))
+            .slice(0, 12);
+        // 3. Fetch expired / cancelled in last 30 days for churn
+        const [churnRows] = yield conn.query(`SELECT status, COUNT(*) AS count
+             FROM memberships
+             WHERE billingType = 'RECURRING'
+               AND status IN ('EXPIRED', 'CANCELLED')
+               AND endDate >= DATE_SUB(CURRENT_DATE(), INTERVAL 30 DAY)
+             GROUP BY status`);
+        let churnedCount = 0;
+        for (const row of churnRows) {
+            churnedCount += Number(row.count || 0);
+        }
+        const churnRate = activeCount + churnedCount > 0
+            ? Math.round((churnedCount / (activeCount + churnedCount)) * 10000) / 100
+            : 0;
+        conn.release();
+        res.json({
+            mrr,
+            activeSubscriptions: activeCount,
+            churnedSubscriptions: churnedCount,
+            churnRate,
+            expectedCollections
+        });
+    }
+    catch (error) {
+        return (0, errorHandler_1.handleControllerError)(res, error, 'calculating subscription analytics');
+    }
+});
+exports.getSubscriptionAnalytics = getSubscriptionAnalytics;
 // --- SETTINGS ---
 const getMembershipSettings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
@@ -599,10 +722,10 @@ const getMembershipSettings = (req, res) => __awaiter(void 0, void 0, void 0, fu
         const [rows] = yield conn.query('SELECT * FROM membership_settings WHERE id = 1');
         conn.release();
         if (rows.length === 0) {
-            return res.json({ gracePeriodDays: 0, attendanceAllowedFor: 'active_only', createDraftInvoices: false });
+            return res.json({ gracePeriodDays: 0, attendanceAllowedFor: 'active_only', createDraftInvoices: false, requireInvoicePayment: true, notifyBeforeExpiryDays: 7 });
         }
         // ensure boolean conversion
-        const settings = Object.assign(Object.assign({}, rows[0]), { createDraftInvoices: !!rows[0].createDraftInvoices });
+        const settings = Object.assign(Object.assign({}, rows[0]), { createDraftInvoices: !!rows[0].createDraftInvoices, requireInvoicePayment: rows[0].requireInvoicePayment === undefined ? true : !!rows[0].requireInvoicePayment, notifyBeforeExpiryDays: rows[0].notifyBeforeExpiryDays !== null && rows[0].notifyBeforeExpiryDays !== undefined ? Number(rows[0].notifyBeforeExpiryDays) : 7, gracePeriodDays: rows[0].gracePeriodDays !== null && rows[0].gracePeriodDays !== undefined ? Number(rows[0].gracePeriodDays) : 0 });
         res.json(settings);
     }
     catch (error) {
@@ -612,16 +735,29 @@ const getMembershipSettings = (req, res) => __awaiter(void 0, void 0, void 0, fu
 exports.getMembershipSettings = getMembershipSettings;
 const updateMembershipSettings = (req, res) => __awaiter(void 0, void 0, void 0, function* () {
     try {
-        const { gracePeriodDays, attendanceAllowedFor, createDraftInvoices } = req.body;
+        const { gracePeriodDays, attendanceAllowedFor, createDraftInvoices, requireInvoicePayment, notifyBeforeExpiryDays } = req.body;
+        const graceDaysSanitized = Math.max(0, parseInt(gracePeriodDays) || 0);
+        const notifyDaysSanitized = Math.max(0, parseInt(notifyBeforeExpiryDays) || 0);
+        const attendanceAllowedSanitized = attendanceAllowedFor === 'active_and_grace' ? 'active_and_grace' : 'active_only';
+        const createDraftSanitized = createDraftInvoices ? 1 : 0;
+        const requirePaymentSanitized = requireInvoicePayment === undefined ? 1 : (requireInvoicePayment ? 1 : 0);
         const conn = yield (0, db_1.getConnection)();
-        yield conn.query(`INSERT INTO membership_settings (id, gracePeriodDays, attendanceAllowedFor, createDraftInvoices) 
-             VALUES (1, ?, ?, ?)
+        yield conn.query(`INSERT INTO membership_settings (id, gracePeriodDays, attendanceAllowedFor, createDraftInvoices, requireInvoicePayment, notifyBeforeExpiryDays) 
+             VALUES (1, ?, ?, ?, ?, ?)
              ON DUPLICATE KEY UPDATE gracePeriodDays = VALUES(gracePeriodDays), 
                                      attendanceAllowedFor = VALUES(attendanceAllowedFor), 
-                                     createDraftInvoices = VALUES(createDraftInvoices)`, [gracePeriodDays, attendanceAllowedFor, createDraftInvoices]);
+                                     createDraftInvoices = VALUES(createDraftInvoices),
+                                     requireInvoicePayment = VALUES(requireInvoicePayment),
+                                     notifyBeforeExpiryDays = VALUES(notifyBeforeExpiryDays)`, [graceDaysSanitized, attendanceAllowedSanitized, createDraftSanitized, requirePaymentSanitized, notifyDaysSanitized]);
         conn.release();
         eventBus_1.eventBus.broadcast('entity:changed', { entityType: 'membership_settings', updatedBy: 'System' });
-        res.json({ gracePeriodDays, attendanceAllowedFor, createDraftInvoices });
+        res.json({
+            gracePeriodDays: graceDaysSanitized,
+            attendanceAllowedFor: attendanceAllowedSanitized,
+            createDraftInvoices: !!createDraftSanitized,
+            requireInvoicePayment: !!requirePaymentSanitized,
+            notifyBeforeExpiryDays: notifyDaysSanitized
+        });
     }
     catch (error) {
         return (0, errorHandler_1.handleControllerError)(res, error, 'updating membership settings');
@@ -668,10 +804,8 @@ const getPublicMembershipCard = (req, res) => __awaiter(void 0, void 0, void 0, 
                     packageIcon: 'Star'
                 };
             }
-        }
-        else {
             const [rows] = yield conn.query(`
-                SELECT m.id, m.customerId, m.packageId, m.description, m.joinDate, m.endDate, m.status, 
+                SELECT m.id, m.customerId, m.packageId, m.description, m.joinDate, m.endDate, m.status, m.lastBillingDate,
                        m.includedVisits, m.remainingVisits, m.createdAt, m.updatedAt,
                        p.name as customerName, p.phone as customerPhone, p.email as customerEmail,
                        pk.name as packageName, pk.durationDays, pk.price as packagePrice, pk.icon as packageIcon
@@ -682,8 +816,24 @@ const getPublicMembershipCard = (req, res) => __awaiter(void 0, void 0, void 0, 
             `, [id]);
             if (rows.length > 0) {
                 membership = rows[0];
-                if (membership.status)
+                if (membership.status) {
                     membership.status = membership.status.toUpperCase();
+                    if (membership.status === 'PENDING_PAYMENT' && membership.lastBillingDate) {
+                        const [settingsRows] = yield conn.query('SELECT gracePeriodDays, attendanceAllowedFor FROM membership_settings WHERE id = 1');
+                        const settings = settingsRows.length > 0 ? settingsRows[0] : { gracePeriodDays: 0, attendanceAllowedFor: 'active_only' };
+                        if (settings.attendanceAllowedFor === 'active_and_grace') {
+                            const graceDays = Number(settings.gracePeriodDays || 0);
+                            if (graceDays > 0) {
+                                const lastBilling = new Date(membership.lastBillingDate);
+                                lastBilling.setDate(lastBilling.getDate() + graceDays);
+                                lastBilling.setHours(23, 59, 59, 999);
+                                if (new Date() <= lastBilling) {
+                                    membership.status = 'GRACE_PERIOD';
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         if (!membership) {

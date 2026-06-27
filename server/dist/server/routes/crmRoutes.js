@@ -9,6 +9,8 @@ const crmController_1 = require("../controllers/crmController");
 const crmTicketController_1 = require("../controllers/crmTicketController");
 const crmComplaintController_1 = require("../controllers/crmComplaintController");
 const slaController_1 = require("../controllers/slaController");
+const crmWorkOrderController_1 = require("../controllers/crmWorkOrderController");
+const crmUpgradeController_1 = require("../controllers/crmUpgradeController");
 const router = express_1.default.Router();
 // Pipeline Stats (dashboard widget)
 router.get('/stats', (0, authMiddleware_1.requirePermission)('crm.view'), crmController_1.getPipelineStats);
@@ -53,20 +55,32 @@ router.put('/tickets/:id', (0, authMiddleware_1.requirePermission)('crm.edit'), 
 router.post('/tickets/:id/comments', (0, authMiddleware_1.requirePermission)('crm.create'), crmTicketController_1.addTicketComment);
 router.get('/tickets/:id/comments', (0, authMiddleware_1.requirePermission)('crm.view'), crmTicketController_1.getTicketComments);
 // Complaints (قسم الشكاوى)
-router.get('/complaints', (0, authMiddleware_1.requirePermission)('crm.view'), crmComplaintController_1.getComplaints);
+router.get('/complaints', (0, authMiddleware_1.requirePermission)('crm.complaints.view'), crmComplaintController_1.getComplaints);
 router.get('/complaints/stats/summary', (0, authMiddleware_1.requirePermission)('crm.view'), crmComplaintController_1.getComplaintsStats);
 router.get('/complaints/compensations', (0, authMiddleware_1.requirePermission)('crm.view'), crmComplaintController_1.getCompensations);
 router.post('/complaints/compensations/:id/approve', (0, authMiddleware_1.requirePermission)('crm.manage'), crmComplaintController_1.approveCompensation);
 router.post('/complaints/compensations/:id/reject', (0, authMiddleware_1.requirePermission)('crm.manage'), crmComplaintController_1.rejectCompensation);
-router.get('/complaints/:id', (0, authMiddleware_1.requirePermission)('crm.view'), crmComplaintController_1.getComplaintById);
-router.post('/complaints', (0, authMiddleware_1.requirePermission)('crm.create'), crmComplaintController_1.createComplaint);
+router.get('/complaints/:id', (0, authMiddleware_1.requirePermission)('crm.complaints.view'), crmComplaintController_1.getComplaintById);
+router.post('/complaints', (0, authMiddleware_1.requirePermission)('crm.complaints.create'), crmComplaintController_1.createComplaint);
 router.put('/complaints/:id', (0, authMiddleware_1.requirePermission)('crm.edit'), crmComplaintController_1.updateComplaint);
-router.post('/complaints/:id/comments', (0, authMiddleware_1.requirePermission)('crm.create'), crmComplaintController_1.addComplaintComment);
-router.get('/complaints/:id/comments', (0, authMiddleware_1.requirePermission)('crm.view'), crmComplaintController_1.getComplaintComments);
+router.post('/complaints/:id/comments', (0, authMiddleware_1.requirePermission)('crm.complaints.create'), crmComplaintController_1.addComplaintComment);
+router.get('/complaints/:id/comments', (0, authMiddleware_1.requirePermission)('crm.complaints.view'), crmComplaintController_1.getComplaintComments);
 // SLA Policies
 router.get('/sla-policies', (0, authMiddleware_1.requirePermission)('crm.view'), slaController_1.getSLAPolicies);
 router.get('/sla-policies/:id', (0, authMiddleware_1.requirePermission)('crm.view'), slaController_1.getSLAPolicy);
 router.post('/sla-policies', (0, authMiddleware_1.requirePermission)('crm.manage'), slaController_1.createSLAPolicy);
 router.put('/sla-policies/:id', (0, authMiddleware_1.requirePermission)('crm.manage'), slaController_1.updateSLAPolicy);
 router.delete('/sla-policies/:id', (0, authMiddleware_1.requirePermission)('crm.manage'), slaController_1.deleteSLAPolicy);
+// Employee Work Orders (أوامر العمل الأسبوعية)
+router.get('/work-orders', (0, authMiddleware_1.requirePermission)('crm.view'), crmWorkOrderController_1.getWorkOrders);
+router.get('/work-orders/employees', (0, authMiddleware_1.requirePermission)('crm.view'), crmWorkOrderController_1.getWorkOrderEmployees);
+router.post('/work-orders', (0, authMiddleware_1.requirePermission)('crm.create'), crmWorkOrderController_1.createWorkOrder);
+router.post('/work-orders/batch', (0, authMiddleware_1.requirePermission)('crm.create'), crmWorkOrderController_1.batchCreateWorkOrders);
+router.put('/work-orders/:id', (0, authMiddleware_1.requirePermission)('crm.edit'), crmWorkOrderController_1.updateWorkOrder);
+router.post('/work-orders/:id/rate', (0, authMiddleware_1.requirePermission)('crm.edit'), crmWorkOrderController_1.rateWorkOrder);
+router.delete('/work-orders/:id', (0, authMiddleware_1.requirePermission)('crm.delete'), crmWorkOrderController_1.deleteWorkOrder);
+// Upgrades (360 Activity Feed, Satisfaction Reports, Escalation)
+router.get('/partners/:partnerId/activity-feed', (0, authMiddleware_1.requirePermission)('crm.view'), crmUpgradeController_1.getCustomerActivityFeed);
+router.get('/reports/satisfaction', (0, authMiddleware_1.requirePermission)('crm.view'), crmUpgradeController_1.getSatisfactionReports);
+router.post('/tickets/:id/escalate', (0, authMiddleware_1.requirePermission)('crm.edit'), crmUpgradeController_1.escalateTicket);
 exports.default = router;

@@ -175,6 +175,8 @@ const getPaginatedProducts = (req, res) => __awaiter(void 0, void 0, void 0, fun
         const offset = (page - 1) * limit;
         // Skip price tiers for bulk reads (e.g. Stock Balance Report doesn't need them)
         const skipPrices = req.query.skipPrices === 'true';
+        const sortBy = req.query.sortBy;
+        const sortOrder = (req.query.sortOrder || 'ASC').toUpperCase() === 'DESC' ? 'DESC' : 'ASC';
         const conn = yield (0, db_1.getConnection)();
         // Safely check if product_variants table exists for embeddedVariantCount subquery
         let embeddedVariantSelect = '';
@@ -271,16 +273,40 @@ const getPaginatedProducts = (req, res) => __awaiter(void 0, void 0, void 0, fun
             query += whereClause;
             countQuery += countJoin + whereClause;
         }
-        // Prioritize exact sku/barcode matches at the top of results
-        if (search && !exactBarcode) {
-            const exactParam = search.trim();
-            query += ' ORDER BY CASE WHEN p.sku = ? OR p.barcode = ? THEN 0 ELSE 1 END, CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ? OFFSET ?';
-            params.push(exactParam, exactParam, limit, offset);
+        // Sort whitelist to prevent SQL injection
+        const allowedSortCols = {
+            name: 'p.name',
+            sku: 'p.sku',
+            barcode: 'p.barcode',
+            price: 'p.price',
+            cost: 'p.cost',
+            stock: 'stock',
+            categoryName: 'c.name',
+            isActive: 'p.isActive'
+        };
+        const sortSql = allowedSortCols[sortBy] || null;
+        let orderClause = '';
+        if (sortSql) {
+            if (sortBy === 'sku') {
+                orderClause = ` ORDER BY CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ${sortOrder}, p.sku ${sortOrder}`;
+            }
+            else {
+                orderClause = ` ORDER BY ${sortSql} ${sortOrder}`;
+            }
         }
         else {
-            query += ' ORDER BY CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name LIMIT ? OFFSET ?';
-            params.push(limit, offset);
+            // Prioritize exact sku/barcode matches at the top of results if searching
+            if (search && !exactBarcode) {
+                const exactParam = search.trim();
+                orderClause = ' ORDER BY CASE WHEN p.sku = ? OR p.barcode = ? THEN 0 ELSE 1 END, CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name';
+                params.push(exactParam, exactParam);
+            }
+            else {
+                orderClause = ' ORDER BY CASE WHEN p.sku COLLATE utf8mb4_unicode_ci REGEXP "^[0-9]+$" THEN 0 ELSE 1 END ASC, CAST(p.sku AS UNSIGNED) ASC, p.name';
+            }
         }
+        query += orderClause + ' LIMIT ? OFFSET ?';
+        params.push(limit, offset);
         let [[rows], [countResult]] = yield Promise.all([
             conn.query(query, params),
             conn.query(countQuery, countParams),
@@ -329,6 +355,36 @@ const getPaginatedProducts = (req, res) => __awaiter(void 0, void 0, void 0, fun
             });
             products.forEach(p => {
                 p.pricingTiers = priceMap.get(p.id) || [];
+            });
+            // B2B Wholesale Portal Support: Override standard price with contract price list
+            const priceListId = req.query.priceListId;
+            if (priceListId) {
+                products.forEach(p => {
+                    const matchedPrice = p.pricingTiers.find((t) => t.id === priceListId);
+                    if (matchedPrice && Number(matchedPrice.price) > 0) {
+                        p.originalPrice = p.price; // Keep retail price as originalPrice
+                        p.price = Number(matchedPrice.price);
+                    }
+                });
+            }
+        }
+        // Attach product units if requested
+        const includeUnits = req.query.includeUnits === 'true';
+        if (includeUnits && products.length > 0 && products.length <= 1000) {
+            const productIds = products.map(p => p.id);
+            const [unitsRows] = yield conn.query(`
+                SELECT * FROM product_units 
+                WHERE productId IN (?) AND isActive = TRUE
+                ORDER BY isBaseUnit DESC, sortOrder ASC, conversionFactor ASC
+            `, [productIds]);
+            const unitsMap = new Map();
+            unitsRows.forEach(unit => {
+                const list = unitsMap.get(unit.productId) || [];
+                list.push(unit);
+                unitsMap.set(unit.productId, list);
+            });
+            products.forEach(p => {
+                p.units = unitsMap.get(p.id) || [];
             });
         }
         // Convert MySQL boolean values (0/1) to JavaScript booleans
@@ -440,6 +496,41 @@ const createProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
             const values = pricingTiers.map(tier => [id, tier.id, tier.price]);
             yield conn.query(`INSERT INTO product_prices (productId, priceListId, price) VALUES ? ON DUPLICATE KEY UPDATE price = VALUES(price)`, [values]);
         }
+        // Insert product units if provided in payload (Atomic inline units saving)
+        const { units } = req.body;
+        if (units && Array.isArray(units) && units.length > 0) {
+            let baseUnitName = unit || 'piece';
+            let hasBase = false;
+            for (const u of units) {
+                if (u.isBaseUnit) {
+                    baseUnitName = u.unitName;
+                    hasBase = true;
+                    break;
+                }
+            }
+            if (!hasBase && units.length > 0) {
+                units[0].isBaseUnit = true;
+                baseUnitName = units[0].unitName;
+            }
+            // Update product baseUnit and hasMultipleUnits
+            yield conn.query('UPDATE products SET baseUnit = ?, hasMultipleUnits = TRUE WHERE id = ?', [baseUnitName, id]);
+            for (const u of units) {
+                const uId = u.id || (0, crypto_1.randomUUID)();
+                yield conn.query(`
+                    INSERT INTO product_units (
+                        id, productId, unitName, unitNameEn, conversionFactor, 
+                        isBaseUnit, barcode, purchasePrice, salePrice, 
+                        wholesalePrice, minSaleQty, sortOrder, isActive
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                `, [
+                    uId, id, u.unitName, u.unitNameEn || null,
+                    u.conversionFactor || 1, u.isBaseUnit ? 1 : 0,
+                    u.barcode || null, u.purchasePrice || null, u.salePrice || null,
+                    u.wholesalePrice || null, u.minSaleQty || 1, u.sortOrder || 0,
+                    u.isActive !== false ? 1 : 0
+                ]);
+            }
+        }
         // Create product_stocks entry if product has opening balance and assigned warehouse
         if (warehouseId && stock && Number(stock) > 0) {
             const stockId = (0, crypto_1.randomUUID)();
@@ -543,6 +634,49 @@ const updateProduct = (req, res) => __awaiter(void 0, void 0, void 0, function* 
         if (pricingTiers && Array.isArray(pricingTiers) && pricingTiers.length > 0) {
             const values = pricingTiers.map(tier => [id, tier.id, tier.price]);
             yield conn.query(`INSERT INTO product_prices (productId, priceListId, price) VALUES ? ON DUPLICATE KEY UPDATE price = VALUES(price)`, [values]);
+        }
+        // Update product units if provided in payload (Atomic inline units saving)
+        const { units } = req.body;
+        if (units && Array.isArray(units)) {
+            // Delete existing units first
+            yield conn.query('DELETE FROM product_units WHERE productId = ?', [id]);
+            if (units.length > 0) {
+                let baseUnitName = unit || 'piece';
+                let hasBase = false;
+                for (const u of units) {
+                    if (u.isBaseUnit) {
+                        baseUnitName = u.unitName;
+                        hasBase = true;
+                        break;
+                    }
+                }
+                if (!hasBase && units.length > 0) {
+                    units[0].isBaseUnit = true;
+                    baseUnitName = units[0].unitName;
+                }
+                // Update product baseUnit and hasMultipleUnits
+                yield conn.query('UPDATE products SET baseUnit = ?, hasMultipleUnits = TRUE WHERE id = ?', [baseUnitName, id]);
+                for (const u of units) {
+                    const uId = u.id || (0, crypto_1.randomUUID)();
+                    yield conn.query(`
+                        INSERT INTO product_units (
+                            id, productId, unitName, unitNameEn, conversionFactor, 
+                            isBaseUnit, barcode, purchasePrice, salePrice, 
+                            wholesalePrice, minSaleQty, sortOrder, isActive
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    `, [
+                        uId, id, u.unitName, u.unitNameEn || null,
+                        u.conversionFactor || 1, u.isBaseUnit ? 1 : 0,
+                        u.barcode || null, u.purchasePrice || null, u.salePrice || null,
+                        u.wholesalePrice || null, u.minSaleQty || 1, u.sortOrder || 0,
+                        u.isActive !== false ? 1 : 0
+                    ]);
+                }
+            }
+            else {
+                // Mark hasMultipleUnits as FALSE
+                yield conn.query('UPDATE products SET hasMultipleUnits = FALSE WHERE id = ?', [id]);
+            }
         }
         yield conn.commit();
         conn.release();

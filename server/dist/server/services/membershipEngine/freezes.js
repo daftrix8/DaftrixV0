@@ -69,6 +69,11 @@ class MembershipFreezes {
                 // Extend end date
                 const currentEndDate = membership.endDate;
                 const newEndDate = dateEngine_1.DateEngine.addDays(currentEndDate, daysFrozen).format('YYYY-MM-DD');
+                // If it is a subscription/recurring membership, also extend nextBillingDate
+                let newNextBillingDate = null;
+                if (membership.billingType === 'RECURRING' && membership.nextBillingDate) {
+                    newNextBillingDate = dateEngine_1.DateEngine.addDays(membership.nextBillingDate, daysFrozen).format('YYYY-MM-DD');
+                }
                 const todayStr = dateEngine_1.DateEngine.todayStr();
                 // Close the freeze period record
                 yield conn.query(`
@@ -77,11 +82,20 @@ class MembershipFreezes {
                 WHERE membershipId = ? AND actualUnfreezeDate IS NULL
             `, [todayStr, todayStr, id]);
                 // Update membership
-                yield conn.query(`
-                UPDATE memberships 
-                SET endDate = ?
-                WHERE id = ?
-            `, [newEndDate, id]);
+                if (newNextBillingDate) {
+                    yield conn.query(`
+                    UPDATE memberships 
+                    SET endDate = ?, nextBillingDate = ?
+                    WHERE id = ?
+                `, [newEndDate, newNextBillingDate, id]);
+                }
+                else {
+                    yield conn.query(`
+                    UPDATE memberships 
+                    SET endDate = ?
+                    WHERE id = ?
+                `, [newEndDate, id]);
+                }
                 // Change status
                 yield lifecycle_1.MembershipLifecycle.changeStatus(id, 'ACTIVE', 'Unfreeze Membership', `Extended end date by ${daysFrozen} days`, userId, conn);
                 if (!providedConn)

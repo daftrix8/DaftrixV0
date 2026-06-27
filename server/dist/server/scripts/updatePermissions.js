@@ -165,6 +165,9 @@ const DEFAULT_PERMISSIONS = [
     { id: 'crm.activities.delete', label: 'حذف نشاط أو متابعة', module: 'إدارة العملاء المحتملين' },
     { id: 'crm.convert', label: 'تحويل عميل محتمل إلى عميل فعلي', module: 'إدارة العملاء المحتملين' },
     { id: 'crm.complaints.view', label: 'عرض الشكاوى', module: 'إدارة العملاء المحتملين' },
+    { id: 'crm.complaints.create', label: 'إضافة شكوى جديدة', module: 'إدارة العملاء المحتملين' },
+    { id: 'crm.complaints.edit', label: 'تعديل الشكاوى', module: 'إدارة العملاء المحتملين' },
+    { id: 'crm.complaints.delete', label: 'حذف الشكاوى', module: 'إدارة العملاء المحتملين' },
     // ======== الاشتراكات والعضويات (Memberships) ========
     { id: 'memberships.view', label: 'عرض الاشتراكات', module: 'الاشتراكات والعضويات' },
     { id: 'memberships.manage', label: 'إدارة الاشتراكات والباقات', module: 'الاشتراكات والعضويات' },

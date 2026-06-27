@@ -42,7 +42,7 @@ exports.isLicenseValid = isLicenseValid;
 exports.getEnabledModules = getEnabledModules;
 const crypto = __importStar(require("crypto"));
 // IMPORTANT: This must match the SECRET_KEY in license_generator.py
-const SECRET_KEY = 'DaftriX2024!';
+const SECRET_KEY = process.env.LICENSE_SECRET || process.env.LICENSE_SECRET_KEY || 'DaftriX2024!';
 // Reference date for calculating days
 const REF_DATE = new Date('2024-01-01');
 // Module bit positions (must match Python)

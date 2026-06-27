@@ -28,7 +28,7 @@ class MembershipRenewals {
             try {
                 const oldMembership = yield lifecycle_1.MembershipLifecycle.getMembership(id, conn);
                 // Fetch package
-                const [packages] = yield conn.query('SELECT id, name, durationDays, includedVisits, price, commissionType, commissionValue FROM membership_packages WHERE id = ?', [packageId]);
+                const [packages] = yield conn.query('SELECT id, name, durationDays, includedVisits, price, commissionType, commissionValue, billingType, recurringInterval FROM membership_packages WHERE id = ?', [packageId]);
                 if (packages.length === 0)
                     throw new Error('Package not found');
                 const pkg = packages[0];
@@ -59,12 +59,17 @@ class MembershipRenewals {
                     }
                     commissionAmount = Math.round(commissionAmount * 100) / 100;
                 }
+                const billingType = pkg.billingType || 'ONE_TIME';
+                const recurringInterval = pkg.recurringInterval || 'monthly';
+                const nextBillingDate = billingType === 'RECURRING' ? endDate : null;
+                const lastBillingDate = billingType === 'RECURRING' ? joinDate : null;
                 // Insert new membership
                 yield conn.query(`
                 INSERT INTO memberships (
                     id, customerId, packageId, description, joinDate, endDate, 
-                    status, invoiceId, includedVisits, remainingVisits, salesmanId, commissionAmount
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, invoiceId, includedVisits, remainingVisits, salesmanId, commissionAmount,
+                    billingType, recurringInterval, nextBillingDate, lastBillingDate
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `, [
                     newMembershipId,
                     oldMembership.customerId,
@@ -77,7 +82,11 @@ class MembershipRenewals {
                     pkg.includedVisits,
                     pkg.includedVisits,
                     salesmanId || null,
-                    commissionAmount
+                    commissionAmount,
+                    billingType,
+                    recurringInterval,
+                    nextBillingDate,
+                    lastBillingDate
                 ]);
                 // Add Log
                 yield lifecycle_1.MembershipLifecycle.addLog(newMembershipId, 'Created', 'Membership renewed from previous cycle', userId, null, conn);

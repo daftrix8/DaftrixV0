@@ -17,7 +17,7 @@ class MembershipLifecycle {
         return __awaiter(this, arguments, void 0, function* (id, conn, lockForUpdate = false) {
             const connection = conn || (yield (0, db_1.getConnection)());
             try {
-                const query = `SELECT id, customerId, packageId, status, joinDate, endDate, includedVisits, remainingVisits, invoiceId FROM memberships WHERE id = ? ${lockForUpdate ? 'FOR UPDATE' : ''}`;
+                const query = `SELECT id, customerId, packageId, status, joinDate, endDate, includedVisits, remainingVisits, invoiceId, billingType, recurringInterval, nextBillingDate, lastBillingDate FROM memberships WHERE id = ? ${lockForUpdate ? 'FOR UPDATE' : ''}`;
                 const [rows] = yield connection.query(query, [id]);
                 if (rows.length === 0)
                     throw new Error('Membership not found');
@@ -66,7 +66,7 @@ class MembershipLifecycle {
         const ns = newStatus.toUpperCase();
         const allowedTransitions = {
             ['PENDING_PAYMENT']: ['ACTIVE', 'CANCELLED'],
-            ['ACTIVE']: ['FROZEN', 'SUSPENDED', 'EXPIRED', 'CANCELLED'],
+            ['ACTIVE']: ['FROZEN', 'SUSPENDED', 'EXPIRED', 'CANCELLED', 'PENDING_PAYMENT'],
             ['FROZEN']: ['ACTIVE', 'CANCELLED'],
             ['SUSPENDED']: ['ACTIVE', 'CANCELLED'],
             ['EXPIRED']: ['ACTIVE', 'CANCELLED'], // Renewals create a new membership or reactivate
